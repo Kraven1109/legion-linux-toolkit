@@ -1,54 +1,151 @@
 #!/usr/bin/env python3
-import os, sys, glob, struct, select, time, fcntl
+"""
+Lenovo Legion Hotkey Event Detector & Sniffer
+Part of legion-linux-toolkit
+"""
 
-print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-print("🔍 LENOVO HOTKEY EVENT DETECTOR")
-print("👉 Please press [Fn + R] now on your keyboard (press it 2-3 times)...")
-print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+import os
+import sys
+import glob
+import struct
+import select
+import time
+import fcntl
+import argparse
 
-fds = []
-names = {}
-for path in sorted(glob.glob("/dev/input/event*")):
-    try:
-        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
-        buf = bytearray(256)
+# Common Linux evdev key mappings for laptop vendor keys
+KEY_NAMES = {
+    142: "KEY_SLEEP",
+    148: "KEY_PROG1",
+    149: "KEY_PROG2",
+    190: "KEY_F16",
+    191: "KEY_F17",
+    192: "KEY_F18",
+    193: "KEY_F19",
+    194: "KEY_F20",
+    224: "KEY_BRIGHTNESSDOWN",
+    225: "KEY_BRIGHTNESSUP",
+    240: "KEY_UNKNOWN_VPC",
+    248: "KEY_MICMUTE",
+    562: "KEY_REFRESH_RATE_TOGGLE (Fn + R)",
+}
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Lenovo Legion Hardware Hotkey Sniffer & Event Discovery Tool"
+    )
+    parser.add_argument(
+        "-t", "--timeout",
+        type=int,
+        default=10,
+        help="Listening timeout in seconds (default: 10s, use 0 for infinite until Ctrl+C)"
+    )
+    parser.add_argument(
+        "-d", "--device",
+        type=str,
+        default=None,
+        help="Filter device name or path (e.g., 'Ideapad' or '/dev/input/event9')"
+    )
+    parser.add_argument(
+        "--only-press",
+        action="store_true",
+        help="Only display key PRESS events (ignore release & repeat)"
+    )
+    args = parser.parse_args()
+
+    # Discover accessible input devices
+    fds = []
+    names = {}
+    
+    # Check by-path first for clean hardware naming
+    for path in sorted(glob.glob("/dev/input/event*")):
         try:
-            fcntl.ioctl(fd, 0x82004506, buf)
-            name = buf.split(b'\x00')[0].decode("utf-8", "ignore")
-        except Exception:
-            name = "Unknown"
-        fds.append(fd)
-        names[fd] = f"{os.path.basename(path)}: {name}"
-    except Exception:
-        pass
-
-if not fds:
-    print("\n❌ Permission denied: Cannot read /dev/input/event*.")
-    print("👉 Please run in your terminal: sudo test-hotkey\n")
-    sys.exit(1)
-
-start = time.time()
-found = False
-while time.time() - start < 8:
-    r, _, _ = select.select(fds, [], [], 0.5)
-    for fd in r:
-        while True:
+            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            buf = bytearray(256)
             try:
-                data = os.read(fd, 24)
-                if len(data) < 24:
-                    break
-                sec, usec, etype, code, value = struct.unpack("qqHHI", data)
-                if etype == 1: # EV_KEY
-                    state = "PRESS" if value == 1 else ("RELEASE" if value == 0 else "REPEAT")
-                    print(f"  [KEY EVENT] {names[fd]} -> Code: {code} (0x{code:04x}) | Action: {state}")
-                    found = True
-                elif etype == 4: # EV_MSC
-                    print(f"  [RAW SCAN]  {names[fd]} -> Scancode: 0x{value:04x}")
-                    found = True
-            except BlockingIOError:
-                break
+                fcntl.ioctl(fd, 0x82004506, buf)
+                dev_name = buf.split(b'\x00')[0].decode("utf-8", "ignore")
+            except Exception:
+                dev_name = "Unknown"
 
-if not found:
-    print("\n⏱️ 8s elapsed: No hardware input event received from Fn+R.")
-else:
-    print("\n✅ Events successfully captured!")
+            if args.device:
+                if args.device.lower() not in dev_name.lower() and args.device not in path:
+                    os.close(fd)
+                    continue
+
+            fds.append(fd)
+            names[fd] = f"{os.path.basename(path)}: {dev_name}"
+        except PermissionError:
+            pass
+        except Exception:
+            pass
+
+    if not fds:
+        print("\n❌ Permission denied: Cannot read accessible /dev/input/event* devices.")
+        print("👉 Run with sudo to scan all raw devices: sudo test-hotkey")
+        print("👉 Note: Lenovo VPC2004 extra buttons are accessible without sudo if tmpfiles.d is loaded.\n")
+        sys.exit(1)
+
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print("🔍 LENOVO HARDWARE HOTKEY EVENT DETECTOR")
+    if args.timeout > 0:
+        print(f"⏱️  Listening for {args.timeout} seconds (press Ctrl+C to cancel)...")
+    else:
+        print("⏱️  Listening indefinitely (press Ctrl+C to exit)...")
+    print("👉 Press any Fn hotkeys now (e.g. Fn+R, Fn+F9, Copilot, etc.)...")
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+    start_time = time.time()
+    events_found = 0
+
+    try:
+        while True:
+            if args.timeout > 0:
+                elapsed = time.time() - start_time
+                remaining = args.timeout - elapsed
+                if remaining <= 0:
+                    break
+                timeout_select = min(0.5, remaining)
+            else:
+                timeout_select = 0.5
+
+            r, _, _ = select.select(fds, [], [], timeout_select)
+            for fd in r:
+                while True:
+                    try:
+                        data = os.read(fd, 24)
+                        if len(data) < 24:
+                            break
+                        sec, usec, etype, code, value = struct.unpack("qqHHI", data)
+                        
+                        if etype == 1:  # EV_KEY
+                            if args.only_press and value != 1:
+                                continue
+                            state = "PRESS" if value == 1 else ("RELEASE" if value == 0 else "REPEAT")
+                            key_sym = KEY_NAMES.get(code, f"CODE_{code}")
+                            print(f"  [KEY EVENT] {names[fd]} ➔ Code: {code:3d} (0x{code:04x}) [{key_sym}] | Action: {state}")
+                            events_found += 1
+                        elif etype == 4:  # EV_MSC
+                            print(f"  [RAW SCAN]  {names[fd]} ➔ Scancode: 0x{value:04x}")
+                            events_found += 1
+                    except BlockingIOError:
+                        break
+    except KeyboardInterrupt:
+        print("\n🛑 Stopped by user.")
+
+    # Cleanup
+    for fd in fds:
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    if events_found > 0:
+        print(f"✅ Capture finished: {events_found} hardware events captured.")
+    else:
+        print("⏱️  Timeout reached: No hardware events captured.")
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+if __name__ == "__main__":
+    main()
