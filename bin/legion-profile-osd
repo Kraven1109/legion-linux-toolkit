@@ -21,6 +21,7 @@ import glob
 import fcntl
 import json
 import shlex
+import shutil
 
 NODE = "/sys/firmware/acpi/platform_profile"
 HOTKEY_NODE = "/dev/input/by-path/pci-0000:00:1f.0-platform-VPC2004:00-event"
@@ -73,17 +74,38 @@ PROFILES = {
 }
 
 def get_copilot_command():
-    """Reads configured copilot action dynamically from config.json."""
-    if os.path.isfile(CONFIG_PATH):
-        try:
-            with open(CONFIG_PATH, "r") as f:
-                cfg = json.load(f)
-                cmd = cfg.get("copilot_command", DEFAULT_COPILOT_CMD)
-                if cmd:
-                    return cmd
-        except Exception:
-            pass
-    return DEFAULT_COPILOT_CMD
+    """Reads configured copilot action dynamically from config.json.
+    Returns (cmd_string, error_message_or_None)."""
+    if not os.path.isfile(CONFIG_PATH):
+        return DEFAULT_COPILOT_CMD, None
+    try:
+        with open(CONFIG_PATH, "r") as f:
+            cfg = json.load(f)
+        cmd = cfg.get("copilot_command", "").strip()
+        if not cmd:
+            return DEFAULT_COPILOT_CMD, f"'copilot_command' is empty in config — using default"
+        return cmd, None
+    except json.JSONDecodeError as e:
+        return DEFAULT_COPILOT_CMD, f"config.json parse error: {e}"
+    except Exception as e:
+        return DEFAULT_COPILOT_CMD, f"config.json read error: {e}"
+
+def send_error_osd(title, msg):
+    """Shows a persistent desktop error notification for user-visible failures."""
+    cmd = [
+        "notify-send",
+        "-a", "Legion Toolkit",
+        "-i", "dialog-error",
+        "-h", "string:x-canonical-private-synchronous:legion-error-osd",
+        "-u", "critical",
+        "-t", "5000",
+        title,
+        msg
+    ]
+    try:
+        subprocess.run(cmd, check=False)
+    except Exception:
+        pass
 
 def send_profile_osd(state):
     info = PROFILES.get(state, {
@@ -258,13 +280,32 @@ def main():
                                 now = time.time()
                                 if now - last_copilot_time > 0.4:  # Debounce
                                     last_copilot_time = now
-                                    copilot_cmd = get_copilot_command()
+                                    copilot_cmd, cfg_err = get_copilot_command()
+                                    if cfg_err:
+                                        print(f"[COPILOT] Config warning: {cfg_err}", flush=True)
+                                        send_error_osd("Copilot Key — Config Warning", cfg_err)
+                                    # Validate & launch
                                     try:
                                         args = shlex.split(copilot_cmd)
-                                        subprocess.Popen(args, start_new_session=True)
-                                        print(f"[COPILOT] Keycode 193 ➔ Executed: {copilot_cmd}", flush=True)
-                                    except Exception as e:
-                                        print(f"[COPILOT] Error executing {copilot_cmd}: {e}", flush=True)
+                                    except ValueError as e:
+                                        errmsg = f"Invalid command syntax: {copilot_cmd!r}\n{e}"
+                                        print(f"[COPILOT] {errmsg}", flush=True)
+                                        send_error_osd("Copilot Key — Config Error", errmsg)
+                                        args = None
+                                    if args:
+                                        exe = shutil.which(args[0]) or (args[0] if os.path.isfile(args[0]) else None)
+                                        if not exe:
+                                            errmsg = f"App not found: {args[0]!r}\nEdit ~/.config/legion/config.json"
+                                            print(f"[COPILOT] {errmsg}", flush=True)
+                                            send_error_osd("Copilot Key — App Not Found", errmsg)
+                                        else:
+                                            try:
+                                                subprocess.Popen(args, start_new_session=True)
+                                                print(f"[COPILOT] Keycode 193 ➔ Executed: {copilot_cmd}", flush=True)
+                                            except Exception as e:
+                                                errmsg = f"Launch failed: {e}\nCommand: {copilot_cmd}"
+                                                print(f"[COPILOT] {errmsg}", flush=True)
+                                                send_error_osd("Copilot Key — Launch Error", errmsg)
 
                         except BlockingIOError:
                             break
