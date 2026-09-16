@@ -38,10 +38,12 @@ ICON_DIR = os.path.expanduser("~/.local/share/icons/legion")
 KEY_REFRESH_RATE_TOGGLE = 562
 KEY_UNKNOWN_VPC = 240
 KEY_COPILOT = 193  # KEY_F23 emitted exclusively by Copilot key
+KEY_FN_N = 618     # Fn+N (scancode 0x012a) — default: "device info" (useless), repurposed
 
 # Scancodes on VPC2004 for Logo Light Toggle (Fn+L)
 SCANCODE_LOGO_ON = 0x012c
 SCANCODE_LOGO_OFF = 0x012b
+SCANCODE_FN_N    = 0x012a  # Fn+N scancode on VPC2004
 
 DEFAULT_CANDIDATES = [
     {"key": "1", "name": "Alacritty Terminal", "exec": "/usr/bin/alacritty"},
@@ -395,6 +397,7 @@ def main():
 
     last_toggle_time = 0
     last_logo_time = 0
+    last_fn_n_time = 0
     last_tap_time = 0
     copilot_is_hold = False
     last_scancode = 0
@@ -444,6 +447,18 @@ def main():
                                             send_logo_osd(True)
                                         elif last_scancode == SCANCODE_LOGO_OFF:
                                             send_logo_osd(False)
+
+                                # Fn + N: Configurable app launcher (default: nvtop in Alacritty)
+                                elif code == KEY_FN_N:
+                                    if now - last_fn_n_time > 0.4:
+                                        last_fn_n_time = now
+                                        try:
+                                            with open(CONFIG_PATH) as _f:
+                                                _cfg = json.load(_f)
+                                            fn_n_cmd = _cfg.get("fn_n_command", "alacritty -e nvtop")
+                                        except Exception:
+                                            fn_n_cmd = "alacritty -e nvtop"
+                                        run_executable(fn_n_cmd, "Fn+N")
 
                         except BlockingIOError:
                             break
