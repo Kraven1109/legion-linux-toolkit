@@ -1,30 +1,66 @@
 <svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
   <defs>
+    <!-- Deep Cyber Cyan Background -->
     <linearGradient id="bgOn" x1="0%" y1="0%" x2="0%" y2="100%">
       <stop offset="0%" stop-color="#00b4d8"/>
-      <stop offset="100%" stop-color="#03045e"/>
+      <stop offset="100%" stop-color="#023e8a"/>
     </linearGradient>
-    <linearGradient id="glowOn" x1="0%" y1="0%" x2="0%" y2="100%">
-      <stop offset="0%" stop-color="#caf0f8"/>
-      <stop offset="100%" stop-color="#90e0ef"/>
+    
+    <!-- Neon Illuminated Core -->
+    <linearGradient id="legionYGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="40%" stop-color="#90e0ef"/>
+      <stop offset="100%" stop-color="#00e5ff"/>
     </linearGradient>
-    <filter id="neonGlow" x="-20%" y="-20%" width="140%" height="140%">
-      <feGaussianBlur stdDeviation="2" result="blur" />
-      <feComposite in="SourceGraphic" in2="blur" operator="over" />
+
+    <!-- Beveled Facet Shading -->
+    <linearGradient id="legionYBevel" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.35"/>
+      <stop offset="100%" stop-color="#000000" stop-opacity="0.2"/>
+    </linearGradient>
+
+    <filter id="cyanGlow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="2.5" result="blur"/>
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
     </filter>
   </defs>
 
   <!-- Outer Disc -->
   <rect x="6" y="6" width="52" height="52" rx="26" fill="url(#bgOn)"/>
   
-  <!-- Subtle 3D Rim -->
+  <!-- Metallic 3D Rim -->
   <path d="M 32 6 A 26 26 0 0 1 58 32 A 26 26 0 0 0 32 7 A 26 26 0 0 0 6 32 A 26 26 0 0 1 32 6 Z" fill="#ffffff" opacity="0.3"/>
-  <path d="M 6 32 A 26 26 0 0 0 32 58 A 26 26 0 0 0 58 32 A 26 26 0 0 1 32 57 A 26 26 0 0 1 6 32 Z" fill="#000000" opacity="0.3"/>
+  <path d="M 6 32 A 26 26 0 0 0 32 58 A 26 26 0 0 0 58 32 A 26 26 0 0 1 32 57 A 26 26 0 0 1 6 32 Z" fill="#000000" opacity="0.35"/>
 
-  <!-- Legion Stylized Y-Star / Bulb Glow Icon -->
-  <g filter="url(#neonGlow)">
-    <!-- Legion 3-way Star Logo -->
-    <path d="M 32 17 L 35 29 L 45 35 L 34 37 L 32 49 L 30 37 L 19 35 L 29 29 Z" fill="url(#glowOn)"/>
-    <circle cx="32" cy="33" r="4" fill="#ffffff"/>
+  <!-- Authentic Lenovo Legion "Y" Emblem -->
+  <g filter="url(#cyanGlow)">
+    <!-- Base Sharp Legion "Y" Shape -->
+    <!-- Left Arm: (18,14) -> (23,12) -> (32,26) -> (41,12) -> (46,14) -> (34.5,29.5) -> (34.5,49) -> (29.5,49) -> (29.5,29.5) -> Z -->
+    <path d="M 29.5 49 
+             L 29.5 29.5 
+             L 17.5 15.5 
+             L 22.5 12 
+             L 32 25 
+             L 41.5 12 
+             L 46.5 15.5 
+             L 34.5 29.5 
+             L 34.5 49 
+             Z" 
+          fill="url(#legionYGrad)"/>
+    
+    <!-- Central Crease & Left-side Facet for 3D metallic chiseled look -->
+    <path d="M 29.5 49 
+             L 29.5 29.5 
+             L 17.5 15.5 
+             L 22.5 12 
+             L 32 25 
+             L 32 49 
+             Z" 
+          fill="url(#legionYBevel)"/>
+    
+    <!-- Central illuminated spine line -->
+    <path d="M 32 25 L 32 49" stroke="#ffffff" stroke-width="1" stroke-linecap="round" opacity="0.7"/>
+    <path d="M 32 25 L 20 13.5" stroke="#ffffff" stroke-width="1" stroke-linecap="round" opacity="0.6"/>
+    <path d="M 32 25 L 44 13.5" stroke="#ffffff" stroke-width="1" stroke-linecap="round" opacity="0.6"/>
   </g>
 </svg>
