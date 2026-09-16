@@ -111,3 +111,15 @@ sudo cp /DATA1/quang_dev/legion-linux-toolkit/udev/99-lenovo-keyboard.rules /etc
 sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=input
 ```
 Kể từ giờ, mỗi khi bạn bật máy, Linux kernel sẽ tự động cấp quyền `0666` cho bàn phím và phím Copilot luôn sẵn sàng hoạt động!
+
+---
+
+## 6. Cơ Chế Báo Lỗi Trực Quan (OSD Error Feedback)
+
+Hệ thống đã được bổ sung cơ chế kiểm định lỗi đa tầng và cảnh báo trực tiếp bằng thông báo OSD trên màn hình (`notify-send` mức độ `critical`):
+
+1. **Lỗi cú pháp JSON trong `config.json`:** Hiện cảnh báo ⚠️ **"Config Warning: Invalid JSON syntax"** và tự động fallback về Alacritty.
+2. **Cấu hình rỗng hoặc null:** Hiện cảnh báo ⚠️ **"Config Warning: copilot_command is empty"** và fallback về Alacritty.
+3. **Cú pháp lệnh shell không hợp lệ (e.g. thiếu dấu ngoặc kép):** Hiện lỗi ❌ **"Config Error: Invalid command syntax"**.
+4. **Ứng dụng không tồn tại trên máy (Binary Not Found):** Hiện thông báo ❌ **"App Not Found: Command not found in PATH"** kèm tên lệnh lỗi để bạn dễ dàng sửa lại config.
+5. **Lỗi khởi chạy tiến trình (Launch Error):** Hiện thông báo ❌ **"Launch Error: Failed to execute process"**.
