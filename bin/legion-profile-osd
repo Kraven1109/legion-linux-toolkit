@@ -6,6 +6,8 @@ Listens to:
   2. /dev/input/by-path/*-VPC2004:00-event:
      - Keycode 562 (Fn+R ➔ Refresh Rate 240Hz/60Hz)
      - Scancodes 0x012c / 0x012b (Fn+L ➔ Logo Light ON/OFF OSD)
+  3. /dev/input/event* (ITE Device 8258 Keyboard):
+     - Keycode 193 (Copilot Key ➔ Configurable action in ~/.config/legion/config.json)
 Zero polling, sleeps indefinitely in kernel wait queues via select.poll().
 """
 
@@ -15,15 +17,23 @@ import sys
 import os
 import struct
 import time
+import glob
+import fcntl
+import json
+import shlex
 
 NODE = "/sys/firmware/acpi/platform_profile"
 HOTKEY_NODE = "/dev/input/by-path/pci-0000:00:1f.0-platform-VPC2004:00-event"
+KBD_SYMLINK = "/dev/input/by-path/pci-0000:80:14.0-usb-0:4:1.0-event-kbd"
+CONFIG_PATH = os.path.expanduser("~/.config/legion/config.json")
+DEFAULT_COPILOT_CMD = "/usr/bin/alacritty"
 LHZ_BIN = os.path.expanduser("~/.local/bin/lhz")
 ICON_DIR = os.path.expanduser("~/.local/share/icons/legion")
 
 # Linux Input Event Codes
 KEY_REFRESH_RATE_TOGGLE = 562
 KEY_UNKNOWN_VPC = 240
+KEY_COPILOT = 193  # KEY_F23 emitted exclusively by Copilot key
 
 # Scancodes on VPC2004 for Logo Light Toggle (Fn+L)
 SCANCODE_LOGO_ON = 0x012c
@@ -61,6 +71,19 @@ PROFILES = {
         "fallback": "preferences-system"
     }
 }
+
+def get_copilot_command():
+    """Reads configured copilot action dynamically from config.json."""
+    if os.path.isfile(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, "r") as f:
+                cfg = json.load(f)
+                cmd = cfg.get("copilot_command", DEFAULT_COPILOT_CMD)
+                if cmd:
+                    return cmd
+        except Exception:
+            pass
+    return DEFAULT_COPILOT_CMD
 
 def send_profile_osd(state):
     info = PROFILES.get(state, {
@@ -110,6 +133,30 @@ def send_logo_osd(is_on):
     except Exception:
         pass
 
+def find_keyboard_fd():
+    """Find and open the ITE keyboard event node."""
+    # 1. Try by-path canonical target first
+    if os.path.exists(KBD_SYMLINK):
+        target = os.path.realpath(KBD_SYMLINK)
+        try:
+            fd = os.open(target, os.O_RDONLY | os.O_NONBLOCK)
+            return fd, target
+        except Exception:
+            pass
+    # 2. Try scanning all event nodes for ITE Device(8258)
+    for p in sorted(glob.glob("/dev/input/event*")):
+        try:
+            fd = os.open(p, os.O_RDONLY | os.O_NONBLOCK)
+            buf = bytearray(256)
+            fcntl.ioctl(fd, 0x82004506, buf)
+            name = buf.split(b"\x00")[0].decode("utf-8", "ignore")
+            if "ITE" in name and "Keyboard" in name:
+                return fd, p
+            os.close(fd)
+        except Exception:
+            pass
+    return None, None
+
 def main():
     poller = select.poll()
 
@@ -133,8 +180,17 @@ def main():
         except Exception:
             pass
 
+    # 3. Register ITE Keyboard node for Copilot Key
+    kbd_fd, kbd_path = find_keyboard_fd()
+    if kbd_fd:
+        poller.register(kbd_fd, select.POLLIN | select.POLLERR)
+        print(f"[INIT] Successfully hooked keyboard on {kbd_path}", flush=True)
+    else:
+        print("[INIT] Notice: ITE Keyboard node not accessible without read permissions.", flush=True)
+
     last_toggle_time = 0
     last_logo_time = 0
+    last_copilot_time = 0
     last_scancode = 0
 
     try:
@@ -187,6 +243,34 @@ def main():
                             break
                         except Exception:
                             break
+
+                # Handle Copilot Key (Keycode 193) on ITE Keyboard
+                elif kbd_fd and fd == kbd_fd:
+                    while True:
+                        try:
+                            data = os.read(kbd_fd, 24)
+                            if len(data) < 24:
+                                break
+                            sec, usec, etype, code, value = struct.unpack("qqHHI", data)
+                            
+                            # EV_KEY (etype 1), code 193 (KEY_F23 / Copilot), value 1 = PRESS
+                            if etype == 1 and code == KEY_COPILOT and value == 1:
+                                now = time.time()
+                                if now - last_copilot_time > 0.4:  # Debounce
+                                    last_copilot_time = now
+                                    copilot_cmd = get_copilot_command()
+                                    try:
+                                        args = shlex.split(copilot_cmd)
+                                        subprocess.Popen(args, start_new_session=True)
+                                        print(f"[COPILOT] Keycode 193 ➔ Executed: {copilot_cmd}", flush=True)
+                                    except Exception as e:
+                                        print(f"[COPILOT] Error executing {copilot_cmd}: {e}", flush=True)
+
+                        except BlockingIOError:
+                            break
+                        except Exception:
+                            break
+
     except KeyboardInterrupt:
         sys.exit(0)
 

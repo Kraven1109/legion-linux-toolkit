@@ -42,7 +42,7 @@ Every AI developer, agent, or automated workflow operating in this workspace **M
    - Physical <kbd>Fn</kbd> + <kbd>Q</kbd> cycles strictly 3 modes: **Quiet ➔ Balanced ➔ Performance**.
    - Physical <kbd>Fn</kbd> + <kbd>R</kbd> emits **Keycode `562` (`KEY_REFRESH_RATE_TOGGLE`)**.
    - Physical <kbd>Fn</kbd> + <kbd>L</kbd> toggles logo light (scancodes `0x012c` ON / `0x012b` OFF on VPC2004) with native OSD.
-   - Physical Copilot key emits `Meta + Shift + F23` on `event4`; bind natively in KDE Shortcuts (no third-party bloat).
+   - Physical Copilot key emits Keycode `193` on ITE Keyboard; hooked natively by `legion-profile-osd` (config-driven in `~/.config/legion/config.json`).
 
 ---
 
