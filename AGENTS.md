@@ -14,12 +14,9 @@ Every AI developer, agent, or automated workflow operating in this workspace **M
    - Do NOT install or suggest third-party RGB/Vantage tools.
    - Use Linux in-kernel drivers, ACPI/sysfs interfaces, and native desktop compositors (`kscreen-doctor`, `notify-send`).
 
-2. **Unified Sudo-less Strategy via `/etc/tmpfiles.d/`:**
-   - ALL hardware permissions reside in `/etc/tmpfiles.d/*.conf`:
-     - `lenovo_conservation.conf` $\rightarrow$ `conservation_mode` (`lbat`)
-     - `lenovo_platform_profile.conf` $\rightarrow$ `platform_profile` (`lmode` / Fn+Q)
-     - `lenovo_hotkeys.conf` $\rightarrow$ `pci-0000:00:1f.0-platform-VPC2004:00-event` (`lhz` / Fn+R)
-   - Never use ad-hoc root scripts or polling wrappers.
+2. **Strict Permission Architecture (`/etc/tmpfiles.d/` for `/sys/`, udev for `/dev/input/`):**
+   - **`/sys/` nodes $\rightarrow$ `/etc/tmpfiles.d/*.conf`:** `lenovo_conservation.conf` (`lbat`), `lenovo_platform_profile.conf` (`lmode` / Fn+Q).
+   - **`/dev/input/` nodes $\rightarrow$ `/etc/udev/rules.d/99-lenovo-input.rules`:** DO NOT use tmpfiles.d for evdev (symlink trap). Udev matches `ATTRS{name}` for ITE Keyboard (Copilot) & Ideapad extra buttons (Fn+R, Fn+L) at `0666`.
 
 3. **Zero-Overhead Event-Driven Architecture (NO Polling Loops):**
    - NEVER write `while sleep` loops. All background services must sleep inside kernel wait queues via `select.poll()`.

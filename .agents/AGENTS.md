@@ -23,12 +23,16 @@ Every AI agent working on this repository or operating system **MUST strictly ad
 * **NO Third-Party Helper Apps or Bloat:** Never suggest or install third-party GUI or CLI bloat (e.g. OpenRGB, Vantage clones, third-party background pollers) unless explicitly demanded by the user.
 * **Kernel & Native First:** Always exploit existing in-kernel platform drivers (`ideapad_laptop`, `lenovo_wmi`, in-kernel `ntfs`), native sysfs interfaces, and native desktop compositors (`kscreen-doctor`, `notify-send`, `qdbus6`).
 
-### Rule 2: Unified Sudo-less Permission Strategy via `/etc/tmpfiles.d/`
-* To avoid typing `sudo` in everyday workflows without compromising system security, ALL hardware node permissions MUST be managed consistently via `/etc/tmpfiles.d/*.conf`:
-  1. `/etc/tmpfiles.d/lenovo_conservation.conf` $\rightarrow$ Battery charge cap (`0666` on `conservation_mode`).
-  2. `/etc/tmpfiles.d/lenovo_platform_profile.conf` $\rightarrow$ Power & thermal profiles (`0666` on `platform_profile`).
-  3. `/etc/tmpfiles.d/lenovo_hotkeys.conf` $\rightarrow$ Hardware hotkeys (`0666` on `pci-0000:00:1f.0-platform-VPC2004:00-event`).
-* **Why `tmpfiles.d`?** Nodes in `/sys` and `/dev` reside in RAM (virtual filesystems) and reset permissions on reboot. `systemd-tmpfiles-setup.service` and `systemd-tmpfiles-setup-dev.service` ensure these permissions are applied idempotently at boot. Never use ad-hoc root scripts or fragmented rules.
+### Rule 2: Strict Permission Architecture (`/etc/tmpfiles.d/` for `/sys/`, `/etc/udev/rules.d/` for `/dev/input/`)
+To ensure 100% sudo-less operation that persists across reboots without breaking, permissions MUST strictly adhere to this architectural boundary:
+1. **`/sys/` Static Sysfs Nodes $\rightarrow$ Managed by `/etc/tmpfiles.d/*.conf`:**
+   - `/etc/tmpfiles.d/lenovo_conservation.conf` $\rightarrow$ Battery charge cap (`0666` on `conservation_mode` for `lbat`).
+   - `/etc/tmpfiles.d/lenovo_platform_profile.conf` $\rightarrow$ Power & thermal profiles (`0666` on `platform_profile` for `lmode` & Fn+Q).
+2. **`/dev/input/` Dynamic Character Devices $\rightarrow$ Managed by `/etc/udev/rules.d/99-lenovo-input.rules`:**
+   - **CRITICAL ARCHITECTURAL RULE:** NEVER use `tmpfiles.d` for `/dev/input/` nodes! Linux `systemd-tmpfiles` type `z` **does not follow symlinks** (`/dev/input/by-path/*` are symlinks; `tmpfiles.d` skips the underlying `/dev/input/eventX` targets).
+   - `/etc/udev/rules.d/99-lenovo-input.rules` matches hardware by `ATTRS{name}` at kernel probe time, setting mode `0666` on the actual character devices:
+     - `ITE Tech. Inc. ITE Device(8258) Keyboard` $\rightarrow$ Copilot key (`0666`).
+     - `Ideapad extra buttons` $\rightarrow$ Fn+R (240Hz/60Hz) & Fn+L (Logo LED) (`0666`).
 
 ### Rule 3: Zero-Overhead, Event-Driven Architecture (Never Poll with Sleep)
 * **Zero Polling Loops:** NEVER write `while true; do sleep ...; done` loops in background services or user scripts. Polling drains laptop battery and wastes CPU cycles.
