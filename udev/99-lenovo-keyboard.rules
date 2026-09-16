@@ -1,2 +1,0 @@
-# Lenovo Legion Pro 7 (16IAX10H) - ITE Keyboard evdev permissions for Copilot key
-KERNEL=="event*", SUBSYSTEM=="input", ATTRS{name}=="ITE Tech. Inc. ITE Device(8258) Keyboard", MODE="0666"
