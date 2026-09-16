@@ -123,3 +123,30 @@ Hệ thống đã được bổ sung cơ chế kiểm định lỗi đa tầng v
 3. **Cú pháp lệnh shell không hợp lệ (e.g. thiếu dấu ngoặc kép):** Hiện lỗi ❌ **"Config Error: Invalid command syntax"**.
 4. **Ứng dụng không tồn tại trên máy (Binary Not Found):** Hiện thông báo ❌ **"App Not Found: Command not found in PATH"** kèm tên lệnh lỗi để bạn dễ dàng sửa lại config.
 5. **Lỗi khởi chạy tiến trình (Launch Error):** Hiện thông báo ❌ **"Launch Error: Failed to execute process"**.
+
+---
+
+## 7. Tính Năng Kép: Bấm Nhanh (Tap) vs Nhấn Giữ (Hold Candidate Menu)
+
+Phím Copilot hiện hỗ trợ **2 chế độ kích hoạt thông minh**:
+
+1. **Bấm nhả nhanh (Tap < 0.3s):** Khởi chạy ngay ứng dụng mặc định (`copilot_tap`, ví dụ: Alacritty).
+2. **Nhấn giữ lâu (Hold >= 0.3s):** Tự động bật **Popup Menu ứng viên (KDE kdialog)** liệt kê danh sách các ứng dụng để bạn chọn nhanh!
+
+### Cấu hình trong `~/.config/legion/config.json`:
+
+```json
+{
+  "copilot_tap": "/usr/bin/alacritty",
+  "copilot_candidates": [
+    { "key": "1", "name": "Alacritty Terminal", "exec": "/usr/bin/alacritty" },
+    { "key": "2", "name": "Konsole Terminal", "exec": "konsole" },
+    { "key": "3", "name": "KRunner Spotlight Search", "exec": "krunner" },
+    { "key": "4", "name": "Chụp ảnh màn hình (Spectacle)", "exec": "spectacle -r" },
+    { "key": "5", "name": "Antigravity IDE", "exec": "antigravity" }
+  ]
+}
+```
+
+- Khi giữ phím Copilot, một hộp thoại menu KDE xuất hiện: Bạn chỉ cần gõ phím số `1`, `2`, `3`... hoặc dùng phím mũi tên rồi nhấn `Enter`.
+- Bấm `Esc` hoặc click ra ngoài để đóng menu mà không chạy app nào.
