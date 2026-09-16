@@ -7,7 +7,9 @@ Listens to:
      - Keycode 562 (Fn+R ➔ Refresh Rate 240Hz/60Hz)
      - Scancodes 0x012c / 0x012b (Fn+L ➔ Logo Light ON/OFF OSD)
   3. /dev/input/event* (ITE Device 8258 Keyboard):
-     - Keycode 193 (Copilot Key ➔ Configurable action in ~/.config/legion/config.json)
+     - Keycode 193 (Copilot Key):
+       * Tap (< 0.3s)   ➔ Launch copilot_tap (Alacritty)
+       * Hold (>= 0.3s) ➔ Popup Candidate Menu (kdialog 1-2-3 picker)
 Zero polling, sleeps indefinitely in kernel wait queues via select.poll().
 """
 
@@ -22,6 +24,7 @@ import fcntl
 import json
 import shlex
 import shutil
+import threading
 
 NODE = "/sys/firmware/acpi/platform_profile"
 HOTKEY_NODE = "/dev/input/by-path/pci-0000:00:1f.0-platform-VPC2004:00-event"
@@ -39,6 +42,14 @@ KEY_COPILOT = 193  # KEY_F23 emitted exclusively by Copilot key
 # Scancodes on VPC2004 for Logo Light Toggle (Fn+L)
 SCANCODE_LOGO_ON = 0x012c
 SCANCODE_LOGO_OFF = 0x012b
+
+DEFAULT_CANDIDATES = [
+    {"key": "1", "name": "Alacritty Terminal", "exec": "/usr/bin/alacritty"},
+    {"key": "2", "name": "Konsole Terminal", "exec": "konsole"},
+    {"key": "3", "name": "KRunner Spotlight Search", "exec": "krunner"},
+    {"key": "4", "name": "Chụp ảnh màn hình (Spectacle)", "exec": "spectacle -r"},
+    {"key": "5", "name": "Antigravity IDE", "exec": "antigravity"}
+]
 
 PROFILES = {
     "low-power": {
@@ -73,30 +84,12 @@ PROFILES = {
     }
 }
 
-def get_copilot_command():
-    """Reads configured copilot action dynamically from config.json.
-    Returns (cmd_string, error_message_or_None)."""
-    if not os.path.isfile(CONFIG_PATH):
-        return DEFAULT_COPILOT_CMD, None
-    try:
-        with open(CONFIG_PATH, "r") as f:
-            cfg = json.load(f)
-        cmd = cfg.get("copilot_command", "").strip()
-        if not cmd:
-            return DEFAULT_COPILOT_CMD, f"'copilot_command' is empty in config — using default"
-        return cmd, None
-    except json.JSONDecodeError as e:
-        return DEFAULT_COPILOT_CMD, f"config.json parse error: {e}"
-    except Exception as e:
-        return DEFAULT_COPILOT_CMD, f"config.json read error: {e}"
-
 def send_error_osd(title, msg):
     """Shows a persistent desktop error notification for user-visible failures."""
     cmd = [
         "notify-send",
         "-a", "Legion Toolkit",
         "-i", "dialog-error",
-        "-h", "string:x-canonical-private-synchronous:legion-error-osd",
         "-u", "critical",
         "-t", "5000",
         title,
@@ -106,6 +99,90 @@ def send_error_osd(title, msg):
         subprocess.run(cmd, check=False)
     except Exception:
         pass
+
+def get_copilot_config():
+    """
+    Reads copilot config dynamically from ~/.config/legion/config.json.
+    Returns (config_dict, error_or_None).
+    """
+    if not os.path.isfile(CONFIG_PATH):
+        return {
+            "tap": DEFAULT_COPILOT_CMD,
+            "candidates": DEFAULT_CANDIDATES
+        }, None
+    try:
+        with open(CONFIG_PATH, "r") as f:
+            cfg = json.load(f)
+        tap_cmd = cfg.get("copilot_tap") or cfg.get("copilot_command") or DEFAULT_COPILOT_CMD
+        candidates = cfg.get("copilot_candidates", DEFAULT_CANDIDATES)
+        return {
+            "tap": tap_cmd,
+            "candidates": candidates
+        }, None
+    except json.JSONDecodeError as e:
+        return {"tap": DEFAULT_COPILOT_CMD, "candidates": DEFAULT_CANDIDATES}, f"config.json parse error: {e}"
+    except Exception as e:
+        return {"tap": DEFAULT_COPILOT_CMD, "candidates": DEFAULT_CANDIDATES}, f"config.json read error: {e}"
+
+def run_executable(cmd_str, source_name="Copilot"):
+    """Validates and launches an application or command string."""
+    try:
+        args = shlex.split(cmd_str)
+    except ValueError as e:
+        errmsg = f"Invalid command syntax: {cmd_str!r}\n{e}"
+        print(f"[{source_name}] {errmsg}", flush=True)
+        send_error_osd(f"{source_name} — Config Error", errmsg)
+        return False
+
+    if not args:
+        errmsg = f"Command is empty string\nEdit ~/.config/legion/config.json"
+        print(f"[{source_name}] {errmsg}", flush=True)
+        send_error_osd(f"{source_name} — Empty Command", errmsg)
+        return False
+
+    exe = shutil.which(args[0]) or (args[0] if os.path.isfile(args[0]) else None)
+    if not exe:
+        errmsg = f"App not found: {args[0]!r}\nEdit ~/.config/legion/config.json"
+        print(f"[{source_name}] {errmsg}", flush=True)
+        send_error_osd(f"{source_name} — App Not Found", errmsg)
+        return False
+
+    try:
+        subprocess.Popen(args, start_new_session=True)
+        print(f"[{source_name}] Executed successfully: {cmd_str}", flush=True)
+        return True
+    except Exception as e:
+        errmsg = f"Launch failed: {e}\nCommand: {cmd_str}"
+        print(f"[{source_name}] {errmsg}", flush=True)
+        send_error_osd(f"{source_name} — Launch Error", errmsg)
+        return False
+
+def launch_copilot_menu():
+    """Spawns kdialog candidate selection menu in a background thread."""
+    def _menu_worker():
+        cfg, err = get_copilot_config()
+        if err:
+            send_error_osd("Copilot Menu — Config Warning", err)
+
+        candidates = cfg.get("candidates", DEFAULT_CANDIDATES)
+        cmd = ["/usr/bin/kdialog", "--title", "Legion Quick Launcher", "--menu", "Select Application (1-9):"]
+        lookup = {}
+        for item in candidates:
+            tag = str(item.get("key", item.get("tag", len(lookup) + 1)))
+            name = item.get("name", "Application")
+            lookup[tag] = item.get("exec", "")
+            cmd.extend([tag, name])
+
+        try:
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+            tag = res.stdout.strip()
+            if tag and tag in lookup:
+                exec_cmd = lookup[tag]
+                run_executable(exec_cmd, f"Candidate [{tag}]")
+        except Exception as e:
+            print(f"[COPILOT MENU] Error: {e}", flush=True)
+
+    threading.Thread(target=_menu_worker, daemon=True).start()
 
 def send_profile_osd(state):
     info = PROFILES.get(state, {
@@ -157,7 +234,6 @@ def send_logo_osd(is_on):
 
 def find_keyboard_fd():
     """Find and open the ITE keyboard event node."""
-    # 1. Try by-path canonical target first
     if os.path.exists(KBD_SYMLINK):
         target = os.path.realpath(KBD_SYMLINK)
         try:
@@ -165,7 +241,6 @@ def find_keyboard_fd():
             return fd, target
         except Exception:
             pass
-    # 2. Try scanning all event nodes for ITE Device(8258)
     for p in sorted(glob.glob("/dev/input/event*")):
         try:
             fd = os.open(p, os.O_RDONLY | os.O_NONBLOCK)
@@ -212,7 +287,8 @@ def main():
 
     last_toggle_time = 0
     last_logo_time = 0
-    last_copilot_time = 0
+    last_tap_time = 0
+    copilot_is_hold = False
     last_scancode = 0
 
     try:
@@ -266,7 +342,7 @@ def main():
                         except Exception:
                             break
 
-                # Handle Copilot Key (Keycode 193) on ITE Keyboard
+                # Handle Copilot Key (Keycode 193) on ITE Keyboard: Tap vs Hold
                 elif kbd_fd and fd == kbd_fd:
                     while True:
                         try:
@@ -275,37 +351,27 @@ def main():
                                 break
                             sec, usec, etype, code, value = struct.unpack("qqHHI", data)
                             
-                            # EV_KEY (etype 1), code 193 (KEY_F23 / Copilot), value 1 = PRESS
-                            if etype == 1 and code == KEY_COPILOT and value == 1:
-                                now = time.time()
-                                if now - last_copilot_time > 0.4:  # Debounce
-                                    last_copilot_time = now
-                                    copilot_cmd, cfg_err = get_copilot_command()
-                                    if cfg_err:
-                                        print(f"[COPILOT] Config warning: {cfg_err}", flush=True)
-                                        send_error_osd("Copilot Key — Config Warning", cfg_err)
-                                    # Validate & launch
-                                    try:
-                                        args = shlex.split(copilot_cmd)
-                                    except ValueError as e:
-                                        errmsg = f"Invalid command syntax: {copilot_cmd!r}\n{e}"
-                                        print(f"[COPILOT] {errmsg}", flush=True)
-                                        send_error_osd("Copilot Key — Config Error", errmsg)
-                                        args = None
-                                    if args:
-                                        exe = shutil.which(args[0]) or (args[0] if os.path.isfile(args[0]) else None)
-                                        if not exe:
-                                            errmsg = f"App not found: {args[0]!r}\nEdit ~/.config/legion/config.json"
-                                            print(f"[COPILOT] {errmsg}", flush=True)
-                                            send_error_osd("Copilot Key — App Not Found", errmsg)
-                                        else:
-                                            try:
-                                                subprocess.Popen(args, start_new_session=True)
-                                                print(f"[COPILOT] Keycode 193 ➔ Executed: {copilot_cmd}", flush=True)
-                                            except Exception as e:
-                                                errmsg = f"Launch failed: {e}\nCommand: {copilot_cmd}"
-                                                print(f"[COPILOT] {errmsg}", flush=True)
-                                                send_error_osd("Copilot Key — Launch Error", errmsg)
+                            # EV_KEY (etype 1), code 193 (KEY_F23 / Copilot)
+                            if etype == 1 and code == KEY_COPILOT:
+                                if value == 1:  # PRESS
+                                    copilot_is_hold = False
+                                elif value == 2:  # REPEAT (Held down >= 250ms)
+                                    if not copilot_is_hold:
+                                        copilot_is_hold = True
+                                        print("[COPILOT] Long press detected ➔ Opening Candidates Menu", flush=True)
+                                        launch_copilot_menu()
+                                elif value == 0:  # RELEASE
+                                    if not copilot_is_hold:
+                                        # Short tap
+                                        now = time.time()
+                                        if now - last_tap_time > 0.3:
+                                            last_tap_time = now
+                                            print("[COPILOT] Short tap detected ➔ Launching Default App", flush=True)
+                                            cfg, err = get_copilot_config()
+                                            if err:
+                                                send_error_osd("Copilot Key — Config Warning", err)
+                                            run_executable(cfg.get("tap", DEFAULT_COPILOT_CMD), "Copilot Tap")
+                                    copilot_is_hold = False
 
                         except BlockingIOError:
                             break
