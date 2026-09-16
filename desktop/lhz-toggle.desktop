@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Toggle Display Refresh Rate
+Comment=Toggle between 240Hz and 60Hz refresh rate on Legion Pro 7
+Exec=/home/quangtm/.local/bin/lhz toggle
+Icon=video-display
+Type=Application
+Categories=System;Utility;
+StartupNotify=false

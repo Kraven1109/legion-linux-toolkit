@@ -1,0 +1,38 @@
+<svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bgRed" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#ef5350"/>
+      <stop offset="100%" stop-color="#b71c1c"/>
+    </linearGradient>
+    <linearGradient id="needleRed" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="100%" stop-color="#ffcdd2"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Outer Circular Disc (Matches 64x64 Breeze Device Badges) -->
+  <rect x="6" y="6" width="52" height="52" rx="26" fill="url(#bgRed)"/>
+  
+  <!-- Subtle 3D Rim Highlight -->
+  <path d="M 32 6 A 26 26 0 0 1 58 32 A 26 26 0 0 0 32 7 A 26 26 0 0 0 6 32 A 26 26 0 0 1 32 6 Z" fill="#ffffff" opacity="0.15"/>
+  <path d="M 6 32 A 26 26 0 0 0 32 58 A 26 26 0 0 0 58 32 A 26 26 0 0 1 32 57 A 26 26 0 0 1 6 32 Z" fill="#000000" opacity="0.25"/>
+
+  <!-- Speedometer / Tachometer Dial -->
+  <!-- Arc background -->
+  <path d="M 19 41 A 16 16 0 1 1 45 41" fill="none" stroke="#ffffff" stroke-width="3" stroke-linecap="round" opacity="0.35"/>
+  <!-- High Performance Active Zone (Redline Boost) -->
+  <path d="M 32 16 A 16 16 0 0 1 45 41" fill="none" stroke="#ffffff" stroke-width="3.5" stroke-linecap="round" opacity="0.95"/>
+  
+  <!-- Speed Ticks -->
+  <circle cx="21" cy="36" r="1.2" fill="#ffffff" opacity="0.7"/>
+  <circle cx="23" cy="25" r="1.2" fill="#ffffff" opacity="0.7"/>
+  <circle cx="32" cy="21" r="1.5" fill="#ffffff" opacity="0.9"/>
+  <circle cx="41" cy="25" r="1.5" fill="#ffffff" opacity="0.9"/>
+  <circle cx="43" cy="36" r="1.5" fill="#ffffff" opacity="0.9"/>
+
+  <!-- Needle Pointing to Max / High Boost -->
+  <line x1="32" y1="34" x2="43" y2="23" stroke="url(#needleRed)" stroke-width="2.5" stroke-linecap="round"/>
+  <!-- Needle Center Cap -->
+  <circle cx="32" cy="34" r="3.5" fill="#ffffff"/>
+  <circle cx="32" cy="34" r="1.5" fill="#b71c1c"/>
+</svg>

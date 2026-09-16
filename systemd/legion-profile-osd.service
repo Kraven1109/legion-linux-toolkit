@@ -1,0 +1,11 @@
+[Unit]
+Description=Legion Fn+Q & lmode Profile OSD (Kernel Event Hook)
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/legion-profile-osd
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+import os, sys, glob, struct, select, time, fcntl
+
+print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+print("🔍 LENOVO HOTKEY EVENT DETECTOR")
+print("👉 Please press [Fn + R] now on your keyboard (press it 2-3 times)...")
+print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+fds = []
+names = {}
+for path in sorted(glob.glob("/dev/input/event*")):
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        buf = bytearray(256)
+        try:
+            fcntl.ioctl(fd, 0x82004506, buf)
+            name = buf.split(b'\x00')[0].decode("utf-8", "ignore")
+        except Exception:
+            name = "Unknown"
+        fds.append(fd)
+        names[fd] = f"{os.path.basename(path)}: {name}"
+    except Exception:
+        pass
+
+if not fds:
+    print("\n❌ Permission denied: Cannot read /dev/input/event*.")
+    print("👉 Please run in your terminal: sudo test-hotkey\n")
+    sys.exit(1)
+
+start = time.time()
+found = False
+while time.time() - start < 8:
+    r, _, _ = select.select(fds, [], [], 0.5)
+    for fd in r:
+        while True:
+            try:
+                data = os.read(fd, 24)
+                if len(data) < 24:
+                    break
+                sec, usec, etype, code, value = struct.unpack("qqHHI", data)
+                if etype == 1: # EV_KEY
+                    state = "PRESS" if value == 1 else ("RELEASE" if value == 0 else "REPEAT")
+                    print(f"  [KEY EVENT] {names[fd]} -> Code: {code} (0x{code:04x}) | Action: {state}")
+                    found = True
+                elif etype == 4: # EV_MSC
+                    print(f"  [RAW SCAN]  {names[fd]} -> Scancode: 0x{value:04x}")
+                    found = True
+            except BlockingIOError:
+                break
+
+if not found:
+    print("\n⏱️ 8s elapsed: No hardware input event received from Fn+R.")
+else:
+    print("\n✅ Events successfully captured!")
