@@ -160,33 +160,51 @@ def run_executable(cmd_str, source_name="Copilot"):
 # Guard: prevent multiple picker windows stacking if user holds repeatedly
 _menu_open = threading.Event()
 _menu_proc = None                    # live Popen handle for the current picker
-_menu_proc_lock = threading.Lock()   # protects _menu_proc across threads
+_menu_proc_lock = threading.Lock()   # protects _menu_proc and _abort_requested
+_abort_requested = False             # dismiss was requested before proc was spawned
 
 LEGION_THEME = os.path.expanduser("~/.config/rofi/legion-launcher.rasi")
 
 def _run_picker_proc(cmd, stdin_data=None):
     """Launch a picker subprocess, store its handle, block until done.
-    Returns (stdout, returncode). Handles external termination gracefully."""
-    global _menu_proc
-    proc = subprocess.Popen(
-        cmd,
-        stdin=subprocess.PIPE if stdin_data is not None else None,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
+    Returns (stdout, returncode). Deadlock-free and handles external termination.
+
+    Fix 1 — deadlock: stderr=DEVNULL prevents the 64 KB OS pipe buffer from
+    filling up and blocking the child while Python is stuck on stdout.read().
+    communicate() reads stdout/stderr concurrently via internal threads and
+    calls wait() — safe even if proc.terminate() is called from another thread.
+
+    Fix 2 — race condition: if a dismiss was requested before we reached Popen
+    (i.e. during JSON/config loading), _abort_requested is True and we
+    terminate the process immediately after registering it under the lock.
+    """
+    global _menu_proc, _abort_requested
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE if stdin_data is not None else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,  # avoid 64 KB pipe-buffer deadlock
+            text=True,
+        )
+    except Exception as e:
+        print(f"[PICKER] Failed to spawn {cmd[0]}: {e}", flush=True)
+        return "", -1
+
     with _menu_proc_lock:
         _menu_proc = proc
+        if _abort_requested:
+            proc.terminate()
+            _abort_requested = False
+
     try:
-        if stdin_data is not None:
-            try:
-                proc.stdin.write(stdin_data)
-                proc.stdin.close()
-            except BrokenPipeError:
-                pass  # process was killed before we could write
-        stdout = proc.stdout.read()
-        proc.wait()
+        # communicate() handles stdin write + stdout read + wait atomically;
+        # returns even if proc was terminated externally mid-flight.
+        stdout, _ = proc.communicate(input=stdin_data)
         return stdout, proc.returncode
+    except Exception:
+        return "", -1
     finally:
         with _menu_proc_lock:
             _menu_proc = None
@@ -227,14 +245,20 @@ def launch_copilot_menu():
     """Spawns picker menu in a background thread.
     - Uses rofi if available (with Legion theme if present, else rofi defaults)
     - Falls back to kdialog if rofi is not installed
-    - Second hold while menu is open → dismisses (terminates) the picker."""
+    - Second hold while menu is open → dismisses (terminates) the picker.
+      Works even during the brief window before the subprocess is spawned."""
+    global _abort_requested
     if _menu_open.is_set():
-        # Toggle: kill the visible picker instead of ignoring
         with _menu_proc_lock:
             proc = _menu_proc
-        if proc and proc.poll() is None:
-            proc.terminate()
-            print("[COPILOT MENU] Dismissed by second hold", flush=True)
+            if proc and proc.poll() is None:
+                # Proc is live — kill it directly
+                proc.terminate()
+                print("[COPILOT MENU] Dismissed by second hold", flush=True)
+            else:
+                # Proc not yet spawned (still in config-read window) — mark abort
+                _abort_requested = True
+                print("[COPILOT MENU] Abort queued (proc not yet live)", flush=True)
         return
 
     def _menu_worker():
