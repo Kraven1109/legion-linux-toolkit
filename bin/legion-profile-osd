@@ -157,30 +157,61 @@ def run_executable(cmd_str, source_name="Copilot"):
         send_error_osd(f"{source_name} — Launch Error", errmsg)
         return False
 
+# Guard: prevent multiple rofi windows stacking if user holds repeatedly
+_menu_open = threading.Event()
+
 def launch_copilot_menu():
-    """Spawns kdialog candidate selection menu in a background thread."""
+    """Spawns rofi -dmenu candidate picker in a background thread.
+    Silently ignores the call if a menu is already visible."""
+    if _menu_open.is_set():
+        print("[COPILOT MENU] Already open, ignoring duplicate hold", flush=True)
+        return
+
     def _menu_worker():
-        cfg, err = get_copilot_config()
-        if err:
-            send_error_osd("Copilot Menu — Config Warning", err)
-
-        candidates = cfg.get("candidates", DEFAULT_CANDIDATES)
-        cmd = ["/usr/bin/kdialog", "--title", "Legion Quick Launcher", "--menu", "Select Application (1-9):"]
-        lookup = {}
-        for item in candidates:
-            tag = str(item.get("key", item.get("tag", len(lookup) + 1)))
-            name = item.get("name", "Application")
-            lookup[tag] = item.get("exec", "")
-            cmd.extend([tag, name])
-
+        _menu_open.set()
         try:
-            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
-            tag = res.stdout.strip()
-            if tag and tag in lookup:
-                exec_cmd = lookup[tag]
-                run_executable(exec_cmd, f"Candidate [{tag}]")
-        except Exception as e:
-            print(f"[COPILOT MENU] Error: {e}", flush=True)
+            cfg, err = get_copilot_config()
+            if err:
+                send_error_osd("Copilot Menu — Config Warning", err)
+
+            candidates = cfg.get("candidates", DEFAULT_CANDIDATES)
+
+            # Build name→exec lookup; names are the rofi display lines
+            lookup = {}   # name → exec_str
+            names = []
+            for item in candidates:
+                name = item.get("name", "Application")
+                exec_cmd = item.get("exec", "")
+                lookup[name] = exec_cmd
+                names.append(name)
+
+            menu_input = "\n".join(names)
+            rofi_cmd = [
+                "/usr/bin/rofi",
+                "-dmenu",
+                "-i",                           # case-insensitive filter
+                "-p", "🚀 Legion",              # prompt label
+                "-theme-str", "window {width: 420px;} listview {lines: 6;}",
+                "-no-custom",                   # reject free-text not in list
+            ]
+
+            try:
+                res = subprocess.run(
+                    rofi_cmd,
+                    input=menu_input,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=False,
+                )
+                selected = res.stdout.strip()
+                # returncode 1 = user pressed Esc / closed without selecting
+                if res.returncode == 0 and selected and selected in lookup:
+                    run_executable(lookup[selected], f"Candidate [{selected}]")
+            except Exception as e:
+                print(f"[COPILOT MENU] rofi error: {e}", flush=True)
+        finally:
+            _menu_open.clear()
 
     threading.Thread(target=_menu_worker, daemon=True).start()
 
@@ -339,7 +370,8 @@ def main():
 
                         except BlockingIOError:
                             break
-                        except Exception:
+                        except Exception as e:
+                            print(f"[HOTKEY] Unexpected read error: {e}", flush=True)
                             break
 
                 # Handle Copilot Key (Keycode 193) on ITE Keyboard: Tap vs Hold
@@ -375,7 +407,8 @@ def main():
 
                         except BlockingIOError:
                             break
-                        except Exception:
+                        except Exception as e:
+                            print(f"[COPILOT] Unexpected read error: {e}", flush=True)
                             break
 
     except KeyboardInterrupt:
