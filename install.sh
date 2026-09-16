@@ -38,14 +38,18 @@ cp -v "$DIR"/systemd/*.service "$HOME/.config/systemd/user/"
 systemctl --user daemon-reload
 systemctl --user enable --now legion-profile-osd.service
 
-# 6. Deploy tmpfiles.d & udev rules (requires sudo)
+# 6. Deploy hardware permissions (requires sudo)
+# Architecture:
+#   /etc/tmpfiles.d/ → ONLY for static /sys/ sysfs nodes (lbat, lmode)
+#   /etc/udev/rules.d/ → ALL /dev/input/ devices (tmpfiles 'z' does NOT follow symlinks)
 echo "🔒 Configuring hardware permissions (/etc/tmpfiles.d/ and /etc/udev/rules.d/)..."
 if [[ $EUID -ne 0 ]]; then
+    # sysfs nodes: battery conservation & platform profile
     sudo cp -v "$DIR"/tmpfiles.d/*.conf /etc/tmpfiles.d/
     sudo systemd-tmpfiles --create /etc/tmpfiles.d/lenovo_conservation.conf
     sudo systemd-tmpfiles --create /etc/tmpfiles.d/lenovo_platform_profile.conf
-    sudo systemd-tmpfiles --create /etc/tmpfiles.d/lenovo_hotkeys.conf
-    
+
+    # /dev/input/ devices: ITE Keyboard (Copilot) + Ideapad Hotkeys (Fn+R, Fn+L)
     if [[ -d "$DIR/udev" ]]; then
         sudo cp -v "$DIR"/udev/*.rules /etc/udev/rules.d/
         sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=input
@@ -54,8 +58,7 @@ else
     cp -v "$DIR"/tmpfiles.d/*.conf /etc/tmpfiles.d/
     systemd-tmpfiles --create /etc/tmpfiles.d/lenovo_conservation.conf
     systemd-tmpfiles --create /etc/tmpfiles.d/lenovo_platform_profile.conf
-    systemd-tmpfiles --create /etc/tmpfiles.d/lenovo_hotkeys.conf
-    
+
     if [[ -d "$DIR/udev" ]]; then
         cp -v "$DIR"/udev/*.rules /etc/udev/rules.d/
         udevadm control --reload-rules && udevadm trigger --subsystem-match=input
