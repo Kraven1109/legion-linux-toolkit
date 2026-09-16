@@ -900,10 +900,24 @@ echo 1 | sudo tee /sys/bus/platform/devices/VPC2004:00/fn_lock   # F1-F12 primar
 echo 0 | sudo tee /sys/bus/platform/devices/VPC2004:00/fn_lock   # Media keys primary
 ```
 
-### D. Chassis & Logo Lighting (`Fn + L` & USB Controller Status)
-On the Lenovo Legion Pro 7 (16IAX10H), the exterior "LEGION" logo light on the lid and rear port illuminations are controlled via an internal ITE USB HID microcontroller:
-* **Hardware ID:** `048d:c193` (*Integrated Technology Express, Inc. Lenovo Lighting*)
-* **Current Linux Status:** Unlike earlier generations where the logo was hardwired to an EC analog switch, Gen 10 routes all decorative lighting via USB HID. On Windows, Lenovo Vantage sends proprietary HID feature reports. On Linux, the kernel does not currently have an in-tree driver for `048d:c193`, so <kbd>Fn</kbd> + <kbd>L</kbd> remains dormant at the BIOS default state. To keep the system 100% clean and stable, no unverified third-party software is installed.
+### D. Chassis & Logo Lighting (`Fn + L` & Hardware Event Verification)
+On the Lenovo Legion Pro 7 (16IAX10H), the exterior "LEGION" logo light on the lid is actively toggled at the hardware EC level:
+* **Hardware ID:** `048d:c193` (*Integrated Technology Express, Inc. Lenovo Lighting* for complex per-key RGB) alongside the Embedded Controller (EC).
+* **Current Linux Status & Hotkey Discovery:**
+  - Physical <kbd>Fn</kbd> + <kbd>L</kbd> **is fully operational**! The hardware EC directly toggles the lid logo lighting circuit on and off.
+  - Furthermore, every physical press of <kbd>Fn</kbd> + <kbd>L</kbd> triggers an ACPI notification to `/dev/input/by-path/pci-0000:00:1f.0-platform-VPC2004:00-event` with alternating raw scancodes:
+    - `Scancode 0x012c` $\rightarrow$ **Logo Light ON**
+    - `Scancode 0x012b` $\rightarrow$ **Logo Light OFF**
+  - **Native OSD Integration:** The unified daemon `legion-profile-osd` catches these scancodes via `select.poll()` and pops an on-screen notification (`Legion Logo: ON / OFF`) with matching SVG circular badges (`logo-on.svg`, `logo-off.svg`), completely replicating the Lenovo Vantage experience with 0% CPU overhead!
+
+### E. Microsoft Copilot Hardware Key (`LeftMeta + LeftShift + F23`)
+* **Hardware Device:** `event4: ITE Tech. Inc. ITE Device(8258) Keyboard` (USB HID `0003:048D:C197`).
+* **Firmware Macro Analysis:** When pressed, the keyboard controller simultaneously transmits:
+  1. `KEY_LEFTMETA` (Keycode 125, Scancode `0x700e3`)
+  2. `KEY_LEFTSHIFT` (Keycode 42, Scancode `0x700e1`)
+  3. `KEY_F23` (Keycode 193, Scancode `0x70072`)
+* **Native Mapping on Linux (No third-party bloat needed):**
+  - In **KDE Plasma 6 (Wayland)**: Open **System Settings ➔ Shortcuts ➔ Add New Command/Application** and press the physical Copilot key. KWin natively captures `Meta+Shift+F23`, allowing 100% native 1-click binding to any application (terminal, AI assistant, scripts) without installing `keyd` or third-party background pollers.
 
 ---
 

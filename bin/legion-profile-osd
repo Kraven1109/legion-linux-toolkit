@@ -1,4 +1,14 @@
 #!/usr/bin/env python3
+"""
+Unified Legion Background Event Daemon
+Listens to:
+  1. /sys/firmware/acpi/platform_profile (Fn+Q & lmode)
+  2. /dev/input/by-path/*-VPC2004:00-event:
+     - Keycode 562 (Fn+R ➔ Refresh Rate 240Hz/60Hz)
+     - Scancodes 0x012c / 0x012b (Fn+L ➔ Logo Light ON/OFF OSD)
+Zero polling, sleeps indefinitely in kernel wait queues via select.poll().
+"""
+
 import select
 import subprocess
 import sys
@@ -11,8 +21,13 @@ HOTKEY_NODE = "/dev/input/by-path/pci-0000:00:1f.0-platform-VPC2004:00-event"
 LHZ_BIN = os.path.expanduser("~/.local/bin/lhz")
 ICON_DIR = os.path.expanduser("~/.local/share/icons/legion")
 
-# Linux Input Event Code for Display Refresh Rate Toggle (Fn+R)
+# Linux Input Event Codes
 KEY_REFRESH_RATE_TOGGLE = 562
+KEY_UNKNOWN_VPC = 240
+
+# Scancodes on VPC2004 for Logo Light Toggle (Fn+L)
+SCANCODE_LOGO_ON = 0x012c
+SCANCODE_LOGO_OFF = 0x012b
 
 PROFILES = {
     "low-power": {
@@ -47,7 +62,7 @@ PROFILES = {
     }
 }
 
-def send_osd(state):
+def send_profile_osd(state):
     info = PROFILES.get(state, {
         "title": f"Profile: {state}",
         "msg": "ACPI platform_profile changed",
@@ -72,6 +87,29 @@ def send_osd(state):
     except Exception:
         pass
 
+def send_logo_osd(is_on):
+    icon_file = "logo-on.svg" if is_on else "logo-off.svg"
+    icon_path = os.path.join(ICON_DIR, icon_file)
+    fallback = "lightbulb" if is_on else "lightbulb-off"
+    icon = icon_path if os.path.isfile(icon_path) else fallback
+
+    title = "Legion Logo Light"
+    msg = "💡 Lid Logo: ON" if is_on else "🌑 Lid Logo: OFF"
+
+    cmd = [
+        "notify-send",
+        "-a", "Legion Hardware",
+        "-i", icon,
+        "-h", "string:x-canonical-private-synchronous:legion-logo-osd",
+        "-t", "1800",
+        title,
+        msg
+    ]
+    try:
+        subprocess.run(cmd, check=False)
+    except Exception:
+        pass
+
 def main():
     poller = select.poll()
 
@@ -86,7 +124,7 @@ def main():
         except Exception:
             pass
 
-    # 2. Register Ideapad extra buttons node for Fn+R (KEY_REFRESH_RATE_TOGGLE)
+    # 2. Register Ideapad extra buttons node for Fn+R & Fn+L
     hotkey_fd = None
     if os.path.exists(HOTKEY_NODE):
         try:
@@ -96,6 +134,8 @@ def main():
             pass
 
     last_toggle_time = 0
+    last_logo_time = 0
+    last_scancode = 0
 
     try:
         while True:
@@ -107,10 +147,10 @@ def main():
                     profile_file.seek(0)
                     curr = profile_file.read().strip()
                     if curr and curr != last_profile_state:
-                        send_osd(curr)
+                        send_profile_osd(curr)
                         last_profile_state = curr
 
-                # Handle Refresh Rate toggle (Fn+R)
+                # Handle Hotkeys (Fn+R & Fn+L)
                 elif hotkey_fd and fd == hotkey_fd:
                     while True:
                         try:
@@ -118,13 +158,31 @@ def main():
                             if len(data) < 24:
                                 break
                             sec, usec, etype, code, value = struct.unpack("qqHHI", data)
-                            # etype 1 = EV_KEY, value 1 = PRESS
-                            if etype == 1 and code == KEY_REFRESH_RATE_TOGGLE and value == 1:
+                            
+                            # EV_MSC (etype 4) captures raw hardware scancode
+                            if etype == 4:
+                                last_scancode = value
+
+                            # EV_KEY (etype 1), value 1 = PRESS
+                            elif etype == 1 and value == 1:
                                 now = time.time()
-                                if now - last_toggle_time > 0.4: # Debounce
-                                    last_toggle_time = now
-                                    if os.path.isfile(LHZ_BIN):
-                                        subprocess.run([LHZ_BIN, "toggle"], check=False)
+                                
+                                # Fn + R: Refresh Rate Toggle (Keycode 562)
+                                if code == KEY_REFRESH_RATE_TOGGLE:
+                                    if now - last_toggle_time > 0.4:
+                                        last_toggle_time = now
+                                        if os.path.isfile(LHZ_BIN):
+                                            subprocess.run([LHZ_BIN, "toggle"], check=False)
+
+                                # Fn + L: Logo Light Toggle (Keycode 240 / Scancodes 0x012c, 0x012b)
+                                elif code == KEY_UNKNOWN_VPC or last_scancode in (SCANCODE_LOGO_ON, SCANCODE_LOGO_OFF):
+                                    if now - last_logo_time > 0.3:
+                                        last_logo_time = now
+                                        if last_scancode == SCANCODE_LOGO_ON:
+                                            send_logo_osd(True)
+                                        elif last_scancode == SCANCODE_LOGO_OFF:
+                                            send_logo_osd(False)
+
                         except BlockingIOError:
                             break
                         except Exception:

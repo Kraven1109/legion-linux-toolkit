@@ -1,0 +1,30 @@
+<svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bgOn" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#00b4d8"/>
+      <stop offset="100%" stop-color="#03045e"/>
+    </linearGradient>
+    <linearGradient id="glowOn" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#caf0f8"/>
+      <stop offset="100%" stop-color="#90e0ef"/>
+    </linearGradient>
+    <filter id="neonGlow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="2" result="blur" />
+      <feComposite in="SourceGraphic" in2="blur" operator="over" />
+    </filter>
+  </defs>
+
+  <!-- Outer Disc -->
+  <rect x="6" y="6" width="52" height="52" rx="26" fill="url(#bgOn)"/>
+  
+  <!-- Subtle 3D Rim -->
+  <path d="M 32 6 A 26 26 0 0 1 58 32 A 26 26 0 0 0 32 7 A 26 26 0 0 0 6 32 A 26 26 0 0 1 32 6 Z" fill="#ffffff" opacity="0.3"/>
+  <path d="M 6 32 A 26 26 0 0 0 32 58 A 26 26 0 0 0 58 32 A 26 26 0 0 1 32 57 A 26 26 0 0 1 6 32 Z" fill="#000000" opacity="0.3"/>
+
+  <!-- Legion Stylized Y-Star / Bulb Glow Icon -->
+  <g filter="url(#neonGlow)">
+    <!-- Legion 3-way Star Logo -->
+    <path d="M 32 17 L 35 29 L 45 35 L 34 37 L 32 49 L 30 37 L 19 35 L 29 29 Z" fill="url(#glowOn)"/>
+    <circle cx="32" cy="33" r="4" fill="#ffffff"/>
+  </g>
+</svg>

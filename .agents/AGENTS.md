@@ -70,7 +70,8 @@ Every AI agent working on this repository or operating system **MUST strictly ad
 * **`custom` Mode Protection:** The EC rejects switching to `custom` with `-EINVAL 22` unless custom fan/power tables are preloaded. `lmode` must disable `custom` and display an English hint.
 * **Fn + Q 3-Mode Loop:** The physical <kbd>Fn</kbd> + <kbd>Q</kbd> hardware key in firmware strictly cycles through 3 modes: **Quiet ➔ Balanced ➔ Performance**. `max-power` (Extreme) is an extended profile switched directly via `lmode extreme`.
 * **Fn + R Keycode:** The physical <kbd>Fn</kbd> + <kbd>R</kbd> shortcut emits scancode `0x0110`, translated by `ideapad_laptop` to **Keycode `562` (`KEY_REFRESH_RATE_TOGGLE`)** on `/dev/input/by-path/pci-0000:00:1f.0-platform-VPC2004:00-event`.
-* **Fn + L (Logo Light):** On Gen 10, the logo light is wired over USB HID (`ID 048d:c193`) rather than an EC analog switch. It currently remains in its BIOS default state on Linux; no unverified third-party software should be installed.
+* **Fn + L (Logo Light):** The physical <kbd>Fn</kbd> + <kbd>L</kbd> hardware key is fully operational on Gen 10! The EC toggles the back lid logo light and reports alternating scancodes `0x012c` (ON) and `0x012b` (OFF) on `VPC2004:00-event`. Integrated into `legion-profile-osd` for visual OSD feedback.
+* **Copilot Key:** Emits hardware macro `LeftMeta (125) + LeftShift (42) + F23 (193)` via `ITE Device(8258)` (`event4`). Bindable natively in KDE Plasma Shortcuts as `Meta+Shift+F23` without installing `keyd` or third-party remappers.
 
 ---
 

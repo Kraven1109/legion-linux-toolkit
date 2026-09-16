@@ -21,7 +21,7 @@ KEY_NAMES = {
     190: "KEY_F16",
     191: "KEY_F17",
     192: "KEY_F18",
-    193: "KEY_F19",
+    193: "KEY_F23 (Copilot Key)",
     194: "KEY_F20",
     224: "KEY_BRIGHTNESSDOWN",
     225: "KEY_BRIGHTNESSUP",
