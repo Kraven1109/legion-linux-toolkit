@@ -190,8 +190,8 @@ def launch_copilot_menu():
                 "/usr/bin/rofi",
                 "-dmenu",
                 "-i",                           # case-insensitive filter
-                "-p", "🚀 Legion",              # prompt label
-                "-theme-str", "window {width: 420px;} listview {lines: 6;}",
+                "-p", "⚡ Legion",              # prompt label
+                "-theme", os.path.expanduser("~/.config/rofi/legion-launcher.rasi"),
                 "-no-custom",                   # reject free-text not in list
             ]
 

@@ -1,0 +1,170 @@
+/**
+ * Legion Quick Launcher — Rofi Theme
+ * Lenovo Legion Pro 7 (16IAX10H) / CachyOS KDE Plasma 6 Wayland
+ *
+ * Design language: Dark glass panel, Legion purple accent, Fira Sans.
+ * Inspired by the machine's hardware aesthetic: deep blacks, vivid accent LEDs.
+ */
+
+/* ── Palette ────────────────────────────────────────────────────────────── */
+* {
+    bg0:        #0d0b12f5;   /* near-black, 96% opaque glass */
+    bg1:        #18142280;   /* slightly lifted surface */
+    bg2:        #231c3099;   /* hover / alternate row tint */
+    accent:     #9d4edd;     /* Legion purple (matches Extreme mode LED) */
+    accent-dim: #6a2fa066;   /* accent at 40% for borders/glow */
+    accent-glow:#9d4eddcc;   /* accent at 80% for selected border */
+    fg0:        #f0eafb;     /* primary text — warm white */
+    fg1:        #b8a8d4;     /* secondary text — muted lavender */
+    fg2:        #6b5c8a;     /* placeholder / disabled */
+    urgent:     #e63946cc;   /* error red */
+
+    /* Reset globals */
+    background-color:   transparent;
+    text-color:         @fg0;
+    border-color:       @accent-dim;
+}
+
+/* ── Window ─────────────────────────────────────────────────────────────── */
+window {
+    font:               "Fira Sans 12";
+    background-color:   @bg0;
+    border:             1px solid @accent-dim;
+    border-radius:      18px;
+    width:              480px;
+    padding:            0px;
+    /* Wayland compositor will handle actual blur/transparency */
+}
+
+/* ── Layout ─────────────────────────────────────────────────────────────── */
+mainbox {
+    padding:    20px 20px 16px 20px;
+    spacing:    12px;
+    children:   [inputbar, message, listview];
+    background-color: transparent;
+}
+
+/* ── Search bar ─────────────────────────────────────────────────────────── */
+inputbar {
+    background-color:   @bg1;
+    border:             1px solid @accent-dim;
+    border-radius:      12px;
+    padding:            10px 14px;
+    spacing:            10px;
+    children:           [prompt, textbox-prompt-colon, entry];
+}
+
+prompt {
+    font:               "Fira Sans SemiBold 12";
+    text-color:         @accent;
+    vertical-align:     0.5;
+}
+
+textbox-prompt-colon {
+    str:                "  │";
+    text-color:         @fg2;
+    vertical-align:     0.5;
+    margin:             0px -4px 0px 0px;
+}
+
+entry {
+    font:               "Fira Sans 12";
+    text-color:         @fg0;
+    placeholder:        "type to filter…";
+    placeholder-color:  @fg2;
+    vertical-align:     0.5;
+    cursor:             text;
+}
+
+/* ── Optional message bar (shows on config error) ──────────────────────── */
+message {
+    enabled:            false;
+    background-color:   @bg1;
+    border:             1px solid @urgent;
+    border-radius:      8px;
+    padding:            8px 12px;
+}
+
+textbox {
+    text-color:         @fg1;
+    font:               "Fira Sans 11";
+}
+
+/* ── Item list ──────────────────────────────────────────────────────────── */
+listview {
+    lines:              6;
+    columns:            1;
+    spacing:            3px;
+    padding:            2px 0px;
+    background-color:   transparent;
+    scrollbar:          false;
+    dynamic:            true;
+}
+
+/* ── Individual entry ───────────────────────────────────────────────────── */
+element {
+    background-color:   transparent;
+    border-radius:      10px;
+    padding:            10px 14px;
+    spacing:            10px;
+    orientation:        horizontal;
+    children:           [element-icon, element-text];
+}
+
+element-icon {
+    size:               18px;
+    vertical-align:     0.5;
+}
+
+element-text {
+    font:               "Fira Sans 12";
+    text-color:         @fg1;
+    vertical-align:     0.5;
+    highlight:          bold @fg0;
+}
+
+/* Normal rows */
+element.normal.normal {
+    background-color:   transparent;
+    text-color:         @fg1;
+}
+
+/* Alternate rows — very subtle zebra */
+element.alternate.normal {
+    background-color:   @bg1;
+    border-radius:      10px;
+}
+
+/* Selected row — the star of the show */
+element.selected.normal {
+    background-color:   @bg2;
+    border:             1px solid @accent-glow;
+    border-radius:      10px;
+    text-color:         @fg0;
+}
+
+element.selected.normal element-text {
+    text-color:         @fg0;
+    font:               "Fira Sans SemiBold 12";
+}
+
+/* Urgent (error) row */
+element.normal.urgent,
+element.alternate.urgent {
+    background-color:   #e6394622;
+    border-color:       @urgent;
+    text-color:         @urgent;
+}
+
+element.selected.urgent {
+    background-color:   #e6394644;
+    border:             1px solid @urgent;
+    text-color:         #ffffff;
+}
+
+/* ── No-results state ───────────────────────────────────────────────────── */
+error-message {
+    padding:        20px;
+    text-color:     @urgent;
+    background-color: transparent;
+}

@@ -25,7 +25,10 @@ echo "🎨 Installing circular SVG badges to ~/.local/share/icons/legion/..."
 mkdir -p "$HOME/.local/share/icons/legion"
 cp -v "$DIR"/icons/*.svg "$HOME/.local/share/icons/legion/"
 
-# 4. Deploy desktop shortcut
+# 4. Deploy rofi theme
+echo "🎨 Installing Legion Quick Launcher rofi theme..."
+mkdir -p "$HOME/.config/rofi"
+cp -v "$DIR"/config/rofi/legion-launcher.rasi "$HOME/.config/rofi/"
 echo "🖥️  Installing desktop shortcut for KDE Plasma..."
 mkdir -p "$HOME/.local/share/applications"
 cp -v "$DIR"/desktop/*.desktop "$HOME/.local/share/applications/"
