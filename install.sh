@@ -25,10 +25,14 @@ echo "🎨 Installing circular SVG badges to ~/.local/share/icons/legion/..."
 mkdir -p "$HOME/.local/share/icons/legion"
 cp -v "$DIR"/icons/*.svg "$HOME/.local/share/icons/legion/"
 
-# 4. Deploy rofi theme
+# 4. Deploy rofi theme (only if not already present — never override user's customization)
 echo "🎨 Installing Legion Quick Launcher rofi theme..."
 mkdir -p "$HOME/.config/rofi"
-cp -v "$DIR"/config/rofi/legion-launcher.rasi "$HOME/.config/rofi/"
+if [[ ! -f "$HOME/.config/rofi/legion-launcher.rasi" ]]; then
+    cp -v "$DIR"/config/rofi/legion-launcher.rasi "$HOME/.config/rofi/"
+else
+    echo "   Skipped: ~/.config/rofi/legion-launcher.rasi already exists (user-customized)"
+fi
 echo "🖥️  Installing desktop shortcut for KDE Plasma..."
 mkdir -p "$HOME/.local/share/applications"
 cp -v "$DIR"/desktop/*.desktop "$HOME/.local/share/applications/"
