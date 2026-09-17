@@ -50,7 +50,7 @@ DEFAULT_CANDIDATES = [
     {"key": "2", "name": "Konsole Terminal", "exec": "konsole"},
     {"key": "3", "name": "KRunner Spotlight Search", "exec": "krunner"},
     {"key": "4", "name": "Chụp ảnh màn hình (Spectacle)", "exec": "spectacle -r"},
-    {"key": "5", "name": "Antigravity IDE", "exec": "antigravity"}
+    {"key": "5", "name": "Antigravity IDE", "exec": "antigravity-ide"}
 ]
 
 PROFILES = {
@@ -448,7 +448,8 @@ def main():
                                         elif last_scancode == SCANCODE_LOGO_OFF:
                                             send_logo_osd(False)
 
-                                # Fn + N: Configurable app launcher (default: nvtop in Alacritty)
+                                # Fn + N: Toggle app (default: nvtop in Alacritty)
+                                # Press once → open; press again → kill (toggle off)
                                 elif code == KEY_FN_N:
                                     if now - last_fn_n_time > 0.4:
                                         last_fn_n_time = now
@@ -458,7 +459,19 @@ def main():
                                             fn_n_cmd = _cfg.get("fn_n_command", "alacritty -e nvtop")
                                         except Exception:
                                             fn_n_cmd = "alacritty -e nvtop"
-                                        run_executable(fn_n_cmd, "Fn+N")
+                                        # Extract the TUI binary name (last word of command)
+                                        # e.g. "alacritty -e nvtop" → kill target = "nvtop"
+                                        kill_target = shlex.split(fn_n_cmd)[-1]
+                                        kill_target = os.path.basename(kill_target)
+                                        already_running = subprocess.run(
+                                            ["pgrep", "-x", kill_target],
+                                            capture_output=True
+                                        ).returncode == 0
+                                        if already_running:
+                                            subprocess.run(["pkill", "-x", kill_target], check=False)
+                                            print(f"[Fn+N] Toggled OFF: killed {kill_target!r}", flush=True)
+                                        else:
+                                            run_executable(fn_n_cmd, "Fn+N")
 
                         except BlockingIOError:
                             break
