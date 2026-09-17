@@ -74,6 +74,24 @@ legion-linux-toolkit/
 
 ---
 
+## ⚠️ Disclaimer & Limitation of Liability
+
+> **PLEASE READ CAREFULLY BEFORE USING THIS SOFTWARE**
+
+* **Independent Project:** This software is an independent, open-source project and is **NOT** affiliated with, authorized, maintained, sponsored, or endorsed by Lenovo Group Limited or any of its affiliates.
+* **Target Hardware:** This toolkit is specifically engineered and tested for the **Lenovo Legion Pro 7i Gen 10 (16IAX10H, Type `83F5`)**. Using this toolkit on other models or architectures may result in unexpected behavior.
+* **Hardware Interaction Warning:** This toolkit interacts directly with low-level kernel drivers, ACPI subsystem nodes (`platform_profile`), Embedded Controller (EC) interfaces, and display frequencies. While designed defensively with safety checks, improper use or modification may cause system instability or thermal throttling.
+* **No Warranty / "AS IS":** THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+* **Limitation of Liability:** IN NO EVENT SHALL THE AUTHORS, COPYRIGHT HOLDERS, OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, HARDWARE DAMAGE, SYSTEM CRASHES, DATA LOSS, LOSS OF USE, OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE.
+
+---
+
+## 📄 License
+
+This project is licensed under the [MIT License](LICENSE) — see the [LICENSE](LICENSE) file for full details.
+
+---
+
 ## 📜 Architectural Directives for AI Agents
 
 For guidelines on coding style, hardware constraints, safety rules, and filesystem integrity, consult [.agents/AGENTS.md](.agents/AGENTS.md).

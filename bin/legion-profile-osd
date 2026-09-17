@@ -25,6 +25,7 @@ import json
 import shlex
 import shutil
 import threading
+import re
 
 NODE = "/sys/firmware/acpi/platform_profile"
 HOTKEY_NODE = "/dev/input/by-path/pci-0000:00:1f.0-platform-VPC2004:00-event"
@@ -164,10 +165,10 @@ def get_copilot_config():
     try:
         with open(CONFIG_PATH, "r") as f:
             cfg = json.load(f)
-        tap_cmd = cfg.get("copilot_tap") or cfg.get("copilot_command") or DEFAULT_COPILOT_CMD
+        tap_entry = cfg.get("copilot_tap") if "copilot_tap" in cfg else cfg.get("copilot_command", DEFAULT_COPILOT_CMD)
         candidates = cfg.get("copilot_candidates", DEFAULT_CANDIDATES)
         return {
-            "tap": tap_cmd,
+            "tap": tap_entry,
             "candidates": candidates
         }, None
     except json.JSONDecodeError as e:
@@ -176,7 +177,7 @@ def get_copilot_config():
         return {"tap": DEFAULT_COPILOT_CMD, "candidates": DEFAULT_CANDIDATES}, f"config.json read error: {e}"
 
 def run_executable(cmd_str, source_name="Copilot"):
-    """Validates and launches an application or command string."""
+    """Validates and launches an application outside the daemon's cgroup."""
     ensure_gui_environment()
     try:
         args = shlex.split(cmd_str)
@@ -200,7 +201,19 @@ def run_executable(cmd_str, source_name="Copilot"):
         return False
 
     try:
-        subprocess.Popen(args, start_new_session=True)
+        # A direct child inherits this service's cgroup, inflating the daemon's
+        # resource accounting and making systemctl restart kill the app. A user
+        # scope gives each interactive launch an independent lifecycle instead.
+        launcher = shutil.which("systemd-run")
+        if launcher:
+            subprocess.Popen(
+                [launcher, "--user", "--scope", "--collect", "--quiet", "--", *args],
+                start_new_session=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        else:
+            subprocess.Popen(args, start_new_session=True)
         print(f"[{source_name}] Executed successfully: {cmd_str}", flush=True)
         return True
     except Exception as e:
@@ -218,7 +231,9 @@ def dispatch_hotkey(hotkey_label, cfg_entry, default_entry):
                             If running -> kills it via pkill.
                             If not running -> launches 'exec'.
     cfg_entry can be:
-      - A dict: {"action": "toggle", "exec": "...", "process": "..."}
+      - A dict: {"action": "toggle", "exec": "...", "process": "...", "match": "full"|"exact"}
+        `full` matches a literal substring of the command line; `exact` matches
+        the executable name. Auto selects `full` for a long ID or a spaced value.
       - A string: "lcolor cycle" or "alacritty -e nvtop"
       - None: falls back to default_entry
     """
@@ -229,10 +244,12 @@ def dispatch_hotkey(hotkey_label, cfg_entry, default_entry):
         action = entry.get("action", "exec").strip().lower()
         cmd = entry.get("exec", "").strip()
         proc_name = entry.get("process", "").strip() or None
+        match_type = entry.get("match", "auto").strip().lower()
     elif isinstance(entry, str):
         cmd = entry.strip()
         action = "exec"
         proc_name = None
+        match_type = "auto"
     else:
         return
 
@@ -253,15 +270,22 @@ def dispatch_hotkey(hotkey_label, cfg_entry, default_entry):
                 proc_name = os.path.basename(args[-1])
 
         already_running = False
+        use_full = False
         if proc_name:
+            # pgrep/pkill interpret their pattern as an ERE. Escape user config so
+            # matching an app identifier cannot kill an unrelated process.
+            pattern = re.escape(proc_name)
+            use_full = (match_type == "full") or (match_type != "exact" and (len(proc_name) > 15 or " " in proc_name))
+            flag = "-f" if use_full else "-x"
             already_running = subprocess.run(
-                ["pgrep", "-x", proc_name],
+                ["pgrep", flag, "--", pattern],
                 capture_output=True
             ).returncode == 0
 
         if already_running:
-            subprocess.run(["pkill", "-x", proc_name], check=False)
-            print(f"[{hotkey_label}] Toggled OFF: killed {proc_name!r}", flush=True)
+            flag = "-f" if use_full else "-x"
+            subprocess.run(["pkill", flag, "--", pattern], check=False)
+            print(f"[{hotkey_label}] Toggled OFF: killed {proc_name!r} (mode: {flag})", flush=True)
         else:
             run_executable(cmd, hotkey_label)
     else:
@@ -586,11 +610,11 @@ def main():
                                         now = time.time()
                                         if now - last_tap_time > 0.3:
                                             last_tap_time = now
-                                            print("[COPILOT] Short tap detected ➔ Launching Default App", flush=True)
+                                            print("[COPILOT] Short tap detected ➔ Dispatching Default Action", flush=True)
                                             cfg, err = get_copilot_config()
                                             if err:
                                                 send_error_osd("Copilot Key — Config Warning", err)
-                                            run_executable(cfg.get("tap", DEFAULT_COPILOT_CMD), "Copilot Tap")
+                                            dispatch_hotkey("Copilot Tap", cfg.get("tap"), DEFAULT_COPILOT_CMD)
                                     copilot_is_hold = False
 
                         except BlockingIOError:

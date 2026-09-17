@@ -14,5 +14,5 @@ docs/
 COPILOT_KEY_REPORT.md
 
 # Deprecated / Unused
-desktop/
-
+# Temporary / scratch media
+*.png
