@@ -121,4 +121,5 @@ To ensure 100% sudo-less operation that persists across reboots without breaking
    - Step 1: Grant permissions via `/etc/tmpfiles.d/*.conf` (sysfs) or `udev` (input devices).
    - Step 2: Implement CLI script in `~/.local/bin/l<name>`.
    - Step 3: Wire into `legion-profile-osd` if hardware event hooks or OSD banners are required.
-3. **Always preserve documentation integrity:** Any modifications made to scripts, configs, or services must be synchronously documented in `AGENTS.md`.
+3. **Always preserve documentation integrity:** Any modifications made to scripts, configs, or services must be synchronously documented in this `AGENTS.md`.
+4. **Root AGENTS.md Wrapper Protection:** The root `AGENTS.md` file serves strictly as an immutable pointer/gateway to this file (`.agents/AGENTS.md`). AI agents MUST NEVER modify `/DATA1/quang_dev/legion-linux-toolkit/AGENTS.md` unless explicitly requested by the user.
