@@ -24,6 +24,7 @@ Native, zero-overhead hardware control suite and event-driven OSD daemon for the
 | **`lbat`** | Battery Conservation Mode | `status`, `on` (~80% cap), `off` (100% full), `toggle` |
 | **`lmode`** | Power & Thermal Manager | `status`, `next` (Fn+Q loop), `quiet`, `balanced`, `perf`, `extreme` |
 | **`lhz`** | Display Refresh Rate | `status`, `toggle` (240Hz $\leftrightarrow$ 60Hz), `240`, `60` |
+| **`lcolor`** | Display Color Profile Manager | `status`, `cycle` (Fn+L), `set <name>`, `list` |
 | **`test-hotkey`** | Hardware Event Sniffer | Real-time evdev scancode & keycode diagnostic tool |
 
 ---
@@ -42,36 +43,33 @@ To deploy or update all tools, services, icons, and permissions on your system:
 
 ```text
 legion-linux-toolkit/
-├── .agents/
-│   └── AGENTS.md            # Comprehensive AI developer directives & hardware rules
-├── AGENTS.md                # Universal root wrapper for Copilot, KiloCode, Cursor, etc.
-├── GEMINI.md -> AGENTS.md   # Compatibility link
-├── .cursorrules -> AGENTS.md
+├── AGENTS.md                # Universal AI developer entrypoint
 ├── bin/                     # Standalone CLI tools (deployed to ~/.local/bin/)
 │   ├── lbat
-│   ├── lmode
+│   ├── lcolor
 │   ├── lhz
+│   ├── lmode
 │   ├── legion-profile-osd
 │   └── test-hotkey
+├── color-profiles/          # Factory-calibrated ICC profiles & Dolby Vision PQ config
+├── config/                  # Launcher themes (Rofi)
+│   └── rofi/
+│       └── legion-launcher.rasi
+├── icons/                   # Custom circular SVG badges (deployed to ~/.local/share/icons/legion/)
+│   ├── balanced.svg
+│   ├── color-profile.svg
+│   ├── custom.svg
+│   ├── extreme.svg
+│   ├── performance.svg
+│   └── quiet.svg
 ├── systemd/                 # User service unit
 │   └── legion-profile-osd.service
-├── tmpfiles.d/              # Boot-time permission configurations
+├── tmpfiles.d/              # Boot-time permission configurations (/etc/tmpfiles.d/)
 │   ├── lenovo_conservation.conf
-│   ├── lenovo_platform_profile.conf
-│   └── lenovo_hotkeys.conf
-├── icons/                   # Custom circular SVG badges
-│   ├── quiet.svg
-│   ├── balanced.svg
-│   ├── performance.svg
-│   ├── extreme.svg
-│   └── custom.svg
-├── desktop/                 # KDE desktop entry for global shortcut binding
-│   └── lhz-toggle.desktop
-├── docs/                    # Reference guides & mount documentation
-│   ├── Legion_Pro_7_16IAX10H_Hardware_Guide.md
-│   ├── Legion_16IAX10H_Battery_Conservation_CachyOS.md
-│   └── CachyOS_NTFS_Mount_Guide.md
-└── install.sh               # 1-click installer and synchronizer
+│   └── lenovo_platform_profile.conf
+├── udev/                    # Udev rules for sudo-less hardware evdev access (/etc/udev/rules.d/)
+│   └── 99-lenovo-input.rules
+└── install.sh               # 1-click installer and deployer
 ```
 
 ---

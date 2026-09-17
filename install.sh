@@ -11,7 +11,7 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo "📦 Installing CLI tools to ~/.local/bin/..."
 mkdir -p "$HOME/.local/bin"
 cp -v "$DIR"/bin/* "$HOME/.local/bin/"
-chmod +x "$HOME"/.local/bin/{lbat,lmode,lhz,legion-profile-osd,test-hotkey}
+chmod +x "$HOME"/.local/bin/{lbat,lmode,lhz,lcolor,legion-profile-osd,test-hotkey}
 
 # 2. Deploy default configuration (only if not already present)
 echo "⚙️  Ensuring ~/.config/legion/config.json exists..."
@@ -57,10 +57,6 @@ if [[ ! -f "$HOME/.config/rofi/legion-launcher.rasi" ]]; then
 else
     echo "   Skipped: ~/.config/rofi/legion-launcher.rasi already exists (user-customized)"
 fi
-echo "🖥️  Installing desktop shortcut for KDE Plasma..."
-mkdir -p "$HOME/.local/share/applications"
-cp -v "$DIR"/desktop/*.desktop "$HOME/.local/share/applications/"
-kbuildsycoca6 2>/dev/null || true
 
 # 5. Deploy systemd user service
 echo "⚙️  Deploying legion-profile-osd user service..."

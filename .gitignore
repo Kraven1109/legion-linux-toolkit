@@ -1,4 +1,18 @@
+# System & Bytecode
 __pycache__/
 *.pyc
 *.pyo
 .DS_Store
+
+# Local AI agent configurations & directives (local only)
+.agents/
+.cursorrules
+GEMINI.md
+
+# Local documentation & research reports (local only)
+docs/
+COPILOT_KEY_REPORT.md
+
+# Deprecated / Unused
+desktop/
+
