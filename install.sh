@@ -13,11 +13,23 @@ mkdir -p "$HOME/.local/bin"
 cp -v "$DIR"/bin/* "$HOME/.local/bin/"
 chmod +x "$HOME"/.local/bin/{lbat,lmode,lhz,legion-profile-osd,test-hotkey}
 
-# 2. Deploy default configuration
+# 2. Deploy default configuration (only if not already present)
 echo "⚙️  Ensuring ~/.config/legion/config.json exists..."
 mkdir -p "$HOME/.config/legion"
 if [[ ! -f "$HOME/.config/legion/config.json" ]]; then
-    echo '{"copilot_command": "/usr/bin/alacritty"}' > "$HOME/.config/legion/config.json"
+    cat > "$HOME/.config/legion/config.json" << 'JSONEOF'
+{
+  "copilot_tap": "/usr/bin/alacritty",
+  "copilot_candidates": [
+    { "key": "1", "name": "Alacritty Terminal",         "exec": "/usr/bin/alacritty" },
+    { "key": "2", "name": "Konsole Terminal",            "exec": "konsole" },
+    { "key": "3", "name": "KRunner Spotlight Search",    "exec": "krunner" },
+    { "key": "4", "name": "Screenshot (Spectacle)",      "exec": "spectacle -r" },
+    { "key": "5", "name": "Antigravity IDE",             "exec": "antigravity" }
+  ],
+  "fn_n_command": "alacritty -e nvtop"
+}
+JSONEOF
 fi
 
 # 3. Deploy SVG badges

@@ -143,7 +143,7 @@ Phím Copilot hiện hỗ trợ **2 chế độ kích hoạt thông minh**:
     { "key": "2", "name": "Konsole Terminal", "exec": "konsole" },
     { "key": "3", "name": "KRunner Spotlight Search", "exec": "krunner" },
     { "key": "4", "name": "Chụp ảnh màn hình (Spectacle)", "exec": "spectacle -r" },
-    { "key": "5", "name": "Antigravity IDE", "exec": "antigravity" }
+    { "key": "5", "name": "Antigravity IDE", "exec": "antigravity-ide" }
   ]
 }
 ```

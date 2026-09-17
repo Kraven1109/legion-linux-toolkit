@@ -40,6 +40,7 @@ Every AI developer, agent, or automated workflow operating in this workspace **M
    - Physical <kbd>Fn</kbd> + <kbd>R</kbd> emits **Keycode `562` (`KEY_REFRESH_RATE_TOGGLE`)**.
    - Physical <kbd>Fn</kbd> + <kbd>L</kbd> toggles logo light (scancodes `0x012c` ON / `0x012b` OFF on VPC2004) with native OSD.
    - Physical Copilot key emits Keycode `193` on ITE Keyboard; hooked natively by `legion-profile-osd` (config-driven in `~/.config/legion/config.json`).
+   - Physical <kbd>Fn</kbd> + <kbd>N</kbd> emits Keycode `618` (scancode `0x012a`) on VPC2004; default "device info" action repurposed as configurable toggle launcher (`fn_n_command` in config, default: `alacritty -e nvtop`).
 
 ---
 
