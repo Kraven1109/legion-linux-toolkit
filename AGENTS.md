@@ -2,6 +2,8 @@
 
 > ⚠️ **MANDATORY DIRECTIVE FOR ALL AI AGENTS & DEVELOPERS:**
 >
+> This file is strictly read-only; you are NOT ALLOWED to modify it under any circumstances. If the user asks you to modify project rules or architecture, edit [.agents/AGENTS.md](file:///.agents/AGENTS.md) instead.
+>
 > This root document serves strictly as a pointer and gateway. The single authoritative source of truth for all hardware specifications, architectural commandments, and operational rules in this project is located at:
 >
 > 👉 **[.agents/AGENTS.md](file:///.agents/AGENTS.md)**
