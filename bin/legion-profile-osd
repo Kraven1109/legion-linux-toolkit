@@ -47,11 +47,9 @@ SCANCODE_FN_L_B = 0x012b
 SCANCODE_FN_N    = 0x012a  # Fn+N scancode on VPC2004
 
 DEFAULT_CANDIDATES = [
-    {"key": "1", "name": "Alacritty Terminal", "exec": "/usr/bin/alacritty"},
-    {"key": "2", "name": "Konsole Terminal", "exec": "konsole"},
-    {"key": "3", "name": "KRunner Spotlight Search", "exec": "krunner"},
-    {"key": "4", "name": "Chụp ảnh màn hình (Spectacle)", "exec": "spectacle -r"},
-    {"key": "5", "name": "Antigravity IDE", "exec": "antigravity-ide"}
+    {"key": "1", "name": "Terminal (Konsole)", "exec": "konsole"},
+    {"key": "2", "name": "KRunner Search", "exec": "krunner"},
+    {"key": "3", "name": "Screenshot (Spectacle)", "exec": "spectacle -r"},
 ]
 
 PROFILES = {
@@ -160,6 +158,63 @@ def run_executable(cmd_str, source_name="Copilot"):
         send_error_osd(f"{source_name} — Launch Error", errmsg)
         return False
 
+def dispatch_hotkey(hotkey_label, cfg_entry, default_entry):
+    """
+    Executes a configurable hotkey action based on ~/.config/legion/config.json.
+    Supports two clean modes:
+      1. 'exec' / 'cycle' : Directly runs the command (e.g. lcolor cycle, lhz toggle, spectacle).
+      2. 'toggle'         : Process toggle. Checks if 'process' is running via pgrep.
+                            If running -> kills it via pkill.
+                            If not running -> launches 'exec'.
+    cfg_entry can be:
+      - A dict: {"action": "toggle", "exec": "...", "process": "..."}
+      - A string: "lcolor cycle" or "alacritty -e nvtop"
+      - None: falls back to default_entry
+    """
+    entry = cfg_entry if cfg_entry is not None else default_entry
+
+    if isinstance(entry, dict):
+        action = entry.get("action", "exec").strip().lower()
+        cmd = entry.get("exec", "").strip()
+        proc_name = entry.get("process", "").strip() or None
+    elif isinstance(entry, str):
+        cmd = entry.strip()
+        action = "exec"
+        proc_name = None
+    else:
+        return
+
+    if not cmd or cmd.lower() in ("disabled", "none", "off", "false"):
+        return
+
+    if cmd.startswith("lcolor") and os.path.isfile(LCOLOR_BIN):
+        cmd = cmd.replace("lcolor", LCOLOR_BIN, 1)
+    elif cmd.startswith("lhz") and os.path.isfile(LHZ_BIN):
+        cmd = cmd.replace("lhz", LHZ_BIN, 1)
+
+    if action == "toggle":
+        if not proc_name:
+            args = shlex.split(cmd)
+            if len(args) >= 3 and args[1] in ("-e", "-x", "--command"):
+                proc_name = os.path.basename(args[2])
+            else:
+                proc_name = os.path.basename(args[-1])
+
+        already_running = False
+        if proc_name:
+            already_running = subprocess.run(
+                ["pgrep", "-x", proc_name],
+                capture_output=True
+            ).returncode == 0
+
+        if already_running:
+            subprocess.run(["pkill", "-x", proc_name], check=False)
+            print(f"[{hotkey_label}] Toggled OFF: killed {proc_name!r}", flush=True)
+        else:
+            run_executable(cmd, hotkey_label)
+    else:
+        run_executable(cmd, hotkey_label)
+
 # Guard: prevent multiple picker windows stacking if user holds repeatedly
 _menu_open = threading.Event()
 _menu_proc = None                    # live Popen handle for the current picker
@@ -217,7 +272,7 @@ def _show_rofi(names, lookup):
     rofi_cmd = [
         shutil.which("rofi"), "-dmenu",
         "-i",                   # case-insensitive filter
-        "-p", "⚡ Legion",
+        "-p", "✦ Quick Launch",
         "-no-custom",           # reject free-text not in list
     ]
     # Only inject our theme if it exists — never silently override a user's own theme
@@ -232,7 +287,7 @@ def _show_rofi(names, lookup):
 def _show_kdialog(names, lookup):
     """Fallback menu using kdialog when rofi is not installed."""
     cmd = [shutil.which("kdialog") or "kdialog",
-           "--title", "⚡ Legion Quick Launcher",
+           "--title", "✦ Quick Launch",
            "--menu", "Select Application:"]
     for i, name in enumerate(names, 1):
         cmd += [str(i), name]
@@ -421,42 +476,29 @@ def main():
                                 elif code == KEY_UNKNOWN_VPC or last_scancode in (SCANCODE_FN_L_A, SCANCODE_FN_L_B):
                                     if now - last_fn_l_time > 0.4:
                                         last_fn_l_time = now
+                                        cfg = {}
                                         try:
                                             with open(CONFIG_PATH) as _f:
-                                                _cfg = json.load(_f)
-                                            fn_l_cmd = _cfg.get("fn_l_command", "lcolor cycle")
+                                                cfg = json.load(_f)
                                         except Exception:
-                                            fn_l_cmd = "lcolor cycle"
+                                            pass
+                                        cfg_l = cfg.get("fn_l") if "fn_l" in cfg else cfg.get("fn_l_command")
+                                        default_l = {"action": "cycle", "exec": "lcolor cycle"}
+                                        dispatch_hotkey("Fn+L", cfg_l, default_l)
 
-                                        if fn_l_cmd and fn_l_cmd.strip().lower() not in ("disabled", "none", "off"):
-                                            if fn_l_cmd.startswith("lcolor") and os.path.isfile(LCOLOR_BIN):
-                                                fn_l_cmd = fn_l_cmd.replace("lcolor", LCOLOR_BIN, 1)
-                                            run_executable(fn_l_cmd, "Fn+L")
-
-                                # Fn + N: Toggle app (default: nvtop in Alacritty)
-                                # Press once → open; press again → kill (toggle off)
+                                # Fn + N: Configurable Launcher / Utility
                                 elif code == KEY_FN_N:
                                     if now - last_fn_n_time > 0.4:
                                         last_fn_n_time = now
+                                        cfg = {}
                                         try:
                                             with open(CONFIG_PATH) as _f:
-                                                _cfg = json.load(_f)
-                                            fn_n_cmd = _cfg.get("fn_n_command", "alacritty -e nvtop")
+                                                cfg = json.load(_f)
                                         except Exception:
-                                            fn_n_cmd = "alacritty -e nvtop"
-                                        # Extract the TUI binary name (last word of command)
-                                        # e.g. "alacritty -e nvtop" → kill target = "nvtop"
-                                        kill_target = shlex.split(fn_n_cmd)[-1]
-                                        kill_target = os.path.basename(kill_target)
-                                        already_running = subprocess.run(
-                                            ["pgrep", "-x", kill_target],
-                                            capture_output=True
-                                        ).returncode == 0
-                                        if already_running:
-                                            subprocess.run(["pkill", "-x", kill_target], check=False)
-                                            print(f"[Fn+N] Toggled OFF: killed {kill_target!r}", flush=True)
-                                        else:
-                                            run_executable(fn_n_cmd, "Fn+N")
+                                            pass
+                                        cfg_n = cfg.get("fn_n") if "fn_n" in cfg else cfg.get("fn_n_command")
+                                        default_n = {"action": "toggle", "exec": "alacritty -e nvtop", "process": "nvtop"}
+                                        dispatch_hotkey("Fn+N", cfg_n, default_n)
 
                         except BlockingIOError:
                             break

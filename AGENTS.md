@@ -39,9 +39,9 @@ Every AI developer, agent, or automated workflow operating in this workspace **M
    - `custom` profile is disabled on Linux (EC returns `-EINVAL 22`).
    - Physical <kbd>Fn</kbd> + <kbd>Q</kbd> cycles strictly 3 modes: **Quiet ➔ Balanced ➔ Performance**.
    - Physical <kbd>Fn</kbd> + <kbd>R</kbd> emits **Keycode `562` (`KEY_REFRESH_RATE_TOGGLE`)**.
-   - Physical <kbd>Fn</kbd> + <kbd>L</kbd> emits scancodes `0x012c` / `0x012b` (Keycode `240`) on `VPC2004`. Because Gen 10 lacks a mainline sysfs interface for the logo LED and third-party DKMS modules introduce severe throttling risks (issues #491, #585), fake logo OSD is eliminated. Repurposed to **Display Color Profile Cycler** via `lcolor cycle` (configurable via `fn_l_command` in `~/.config/legion/config.json`).
-   - Physical Copilot key emits Keycode `193` on ITE Keyboard; hooked natively by `legion-profile-osd` (config-driven in `~/.config/legion/config.json`).
-   - Physical <kbd>Fn</kbd> + <kbd>N</kbd> emits Keycode `618` (scancode `0x012a`) on VPC2004; default "device info" action repurposed as configurable toggle launcher (`fn_n_command` in config, default: `alacritty -e nvtop`).
+   - Physical <kbd>Fn</kbd> + <kbd>L</kbd> emits scancodes `0x012c` / `0x012b` (Keycode `240`) on `VPC2004`. Because Gen 10 lacks a mainline sysfs interface for the logo LED and third-party DKMS modules introduce severe throttling risks (issues #491, #585), fake logo OSD is eliminated. Repurposed to **Display Color Profile Cycler** via `lcolor cycle` (configurable via `fn_l` in `~/.config/legion/config.json`).
+   - Physical Copilot key emits Keycode `193` on ITE Keyboard; hooked natively by `legion-profile-osd` (config-driven in `~/.config/legion/config.json`). Tap (<0.3s) launches default terminal; Hold (≥0.3s) opens Rofi menu (`✦ Quick Launch`); Hold again dismisses menu.
+   - Physical <kbd>Fn</kbd> + <kbd>N</kbd> emits Keycode `618` (scancode `0x012a`) on VPC2004; default "device info" action repurposed as configurable action launcher (Action Dispatcher supporting `toggle` via `process` or `exec` in `fn_n`, default: toggle `alacritty -e nvtop`).
 
 ---
 

@@ -19,16 +19,21 @@ mkdir -p "$HOME/.config/legion"
 if [[ ! -f "$HOME/.config/legion/config.json" ]]; then
     cat > "$HOME/.config/legion/config.json" << 'JSONEOF'
 {
-  "copilot_tap": "/usr/bin/alacritty",
+  "copilot_tap": "alacritty",
   "copilot_candidates": [
-    { "key": "1", "name": "Alacritty Terminal",         "exec": "/usr/bin/alacritty" },
-    { "key": "2", "name": "Konsole Terminal",            "exec": "konsole" },
-    { "key": "3", "name": "KRunner Spotlight Search",    "exec": "krunner" },
-    { "key": "4", "name": "Screenshot (Spectacle)",      "exec": "spectacle -r" },
-    { "key": "5", "name": "Antigravity IDE",             "exec": "antigravity" }
+    { "key": "1", "name": "Terminal (Konsole)",      "exec": "konsole" },
+    { "key": "2", "name": "KRunner Search",          "exec": "krunner" },
+    { "key": "3", "name": "Screenshot (Spectacle)",  "exec": "spectacle -r" }
   ],
-  "fn_n_command": "alacritty -e nvtop",
-  "fn_l_command": "lcolor cycle"
+  "fn_n": {
+    "action": "toggle",
+    "exec": "alacritty -e nvtop",
+    "process": "nvtop"
+  },
+  "fn_l": {
+    "action": "cycle",
+    "exec": "lcolor cycle"
+  }
 }
 JSONEOF
 fi
