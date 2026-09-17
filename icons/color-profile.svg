@@ -1,0 +1,45 @@
+<svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bgDisc" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1e1b4b"/>
+      <stop offset="100%" stop-color="#0f172a"/>
+    </linearGradient>
+    <linearGradient id="redGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ff4b4b"/>
+      <stop offset="100%" stop-color="#dc2626"/>
+    </linearGradient>
+    <linearGradient id="greenGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#22c55e"/>
+      <stop offset="100%" stop-color="#16a34a"/>
+    </linearGradient>
+    <linearGradient id="blueGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38bdf8"/>
+      <stop offset="100%" stop-color="#2563eb"/>
+    </linearGradient>
+    <linearGradient id="centerGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="100%" stop-color="#f1f5f9"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Outer Disc -->
+  <rect x="6" y="6" width="52" height="52" rx="26" fill="url(#bgDisc)"/>
+  
+  <!-- Subtle 3D Rim -->
+  <path d="M 32 6 A 26 26 0 0 1 58 32 A 26 26 0 0 0 32 7 A 26 26 0 0 0 6 32 A 26 26 0 0 1 32 6 Z" fill="#ffffff" opacity="0.2"/>
+  <path d="M 6 32 A 26 26 0 0 0 32 58 A 26 26 0 0 0 58 32 A 26 26 0 0 1 32 57 A 26 26 0 0 1 6 32 Z" fill="#000000" opacity="0.4"/>
+
+  <!-- CIE Chromaticity Tri-Color Gamut Petals -->
+  <!-- Top: Red Gamut Vertex -->
+  <circle cx="32" cy="21" r="9" fill="url(#redGrad)" opacity="0.85"/>
+  
+  <!-- Bottom-Left: Blue Gamut Vertex -->
+  <circle cx="23" cy="37" r="9" fill="url(#blueGrad)" opacity="0.85"/>
+  
+  <!-- Bottom-Right: Green Gamut Vertex -->
+  <circle cx="41" cy="37" r="9" fill="url(#greenGrad)" opacity="0.85"/>
+
+  <!-- Center Gamut Overlap / Whitepoint Core (D65 Calibration) -->
+  <circle cx="32" cy="32" r="4.5" fill="url(#centerGrad)" opacity="0.95"/>
+  <circle cx="32" cy="32" r="2" fill="#0f172a" opacity="0.4"/>
+</svg>

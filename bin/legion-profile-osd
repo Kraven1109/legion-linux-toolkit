@@ -32,6 +32,7 @@ KBD_SYMLINK = "/dev/input/by-path/pci-0000:80:14.0-usb-0:4:1.0-event-kbd"
 CONFIG_PATH = os.path.expanduser("~/.config/legion/config.json")
 DEFAULT_COPILOT_CMD = "/usr/bin/alacritty"
 LHZ_BIN = os.path.expanduser("~/.local/bin/lhz")
+LCOLOR_BIN = os.path.expanduser("~/.local/bin/lcolor")
 ICON_DIR = os.path.expanduser("~/.local/share/icons/legion")
 
 # Linux Input Event Codes
@@ -40,9 +41,9 @@ KEY_UNKNOWN_VPC = 240
 KEY_COPILOT = 193  # KEY_F23 emitted exclusively by Copilot key
 KEY_FN_N = 618     # Fn+N (scancode 0x012a) — default: "device info" (useless), repurposed
 
-# Scancodes on VPC2004 for Logo Light Toggle (Fn+L)
-SCANCODE_LOGO_ON = 0x012c
-SCANCODE_LOGO_OFF = 0x012b
+# Scancodes on VPC2004 for Fn+L (repurposed to Color Profile Cycling)
+SCANCODE_FN_L_A = 0x012c
+SCANCODE_FN_L_B = 0x012b
 SCANCODE_FN_N    = 0x012a  # Fn+N scancode on VPC2004
 
 DEFAULT_CANDIDATES = [
@@ -319,29 +320,6 @@ def send_profile_osd(state):
     except Exception:
         pass
 
-def send_logo_osd(is_on):
-    icon_file = "logo-on.svg" if is_on else "logo-off.svg"
-    icon_path = os.path.join(ICON_DIR, icon_file)
-    fallback = "lightbulb" if is_on else "lightbulb-off"
-    icon = icon_path if os.path.isfile(icon_path) else fallback
-
-    title = "Legion Logo Light"
-    msg = "💡 Lid Logo: ON" if is_on else "🌑 Lid Logo: OFF"
-
-    cmd = [
-        "notify-send",
-        "-a", "Legion Hardware",
-        "-i", icon,
-        "-h", "string:x-canonical-private-synchronous:legion-logo-osd",
-        "-t", "1800",
-        title,
-        msg
-    ]
-    try:
-        subprocess.run(cmd, check=False)
-    except Exception:
-        pass
-
 def find_keyboard_fd():
     """Find and open the ITE keyboard event node."""
     if os.path.exists(KBD_SYMLINK):
@@ -396,7 +374,7 @@ def main():
         print("[INIT] Notice: ITE Keyboard node not accessible without read permissions.", flush=True)
 
     last_toggle_time = 0
-    last_logo_time = 0
+    last_fn_l_time = 0
     last_fn_n_time = 0
     last_tap_time = 0
     copilot_is_hold = False
@@ -439,14 +417,21 @@ def main():
                                         if os.path.isfile(LHZ_BIN):
                                             subprocess.run([LHZ_BIN, "toggle"], check=False)
 
-                                # Fn + L: Logo Light Toggle (Keycode 240 / Scancodes 0x012c, 0x012b)
-                                elif code == KEY_UNKNOWN_VPC or last_scancode in (SCANCODE_LOGO_ON, SCANCODE_LOGO_OFF):
-                                    if now - last_logo_time > 0.3:
-                                        last_logo_time = now
-                                        if last_scancode == SCANCODE_LOGO_ON:
-                                            send_logo_osd(True)
-                                        elif last_scancode == SCANCODE_LOGO_OFF:
-                                            send_logo_osd(False)
+                                # Fn + L: Display Color Profile Cycle / Configurable Action
+                                elif code == KEY_UNKNOWN_VPC or last_scancode in (SCANCODE_FN_L_A, SCANCODE_FN_L_B):
+                                    if now - last_fn_l_time > 0.4:
+                                        last_fn_l_time = now
+                                        try:
+                                            with open(CONFIG_PATH) as _f:
+                                                _cfg = json.load(_f)
+                                            fn_l_cmd = _cfg.get("fn_l_command", "lcolor cycle")
+                                        except Exception:
+                                            fn_l_cmd = "lcolor cycle"
+
+                                        if fn_l_cmd and fn_l_cmd.strip().lower() not in ("disabled", "none", "off"):
+                                            if fn_l_cmd.startswith("lcolor") and os.path.isfile(LCOLOR_BIN):
+                                                fn_l_cmd = fn_l_cmd.replace("lcolor", LCOLOR_BIN, 1)
+                                            run_executable(fn_l_cmd, "Fn+L")
 
                                 # Fn + N: Toggle app (default: nvtop in Alacritty)
                                 # Press once → open; press again → kill (toggle off)

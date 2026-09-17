@@ -22,13 +22,14 @@ Every AI developer, agent, or automated workflow operating in this workspace **M
    - NEVER write `while sleep` loops. All background services must sleep inside kernel wait queues via `select.poll()`.
    - Unified daemon runs as a user service: `systemctl --user status legion-profile-osd.service` (0% CPU).
 
-4. **Standardized Tooling Convention (`l*` Prefix in `bin/`):**
-   - All custom CLI tools use the **`l*`** prefix (`lbat`, `lmode`, `lhz`, `test-hotkey`).
+4. **Standardized Tooling Convention (`l*` Prefix in `bin/`) & English-Only:**
+   - All custom CLI tools use the **`l*`** prefix (`lbat`, `lmode`, `lhz`, `lcolor`, `test-hotkey`).
    - NEVER shadow system binaries (e.g. `/usr/bin/bat` is an Arch syntax highlighter; custom scripts must use `lbat`).
+   - **English-Only Standardization:** All code, comments, docstrings, commit messages, CLI user-facing output, and documentation MUST be written in English for public readiness.
 
-5. **Visual Consistency & Cloud Backup:**
-   - Notifications use 64x64 circular SVG badges matching exact hardware LED states (`icons/*.svg`).
-   - Synced to OneDrive at `~/OneDrive/CloudSync/Software/16iax10h-power-icons/`.
+5. **Visual Consistency & Feature-First Design:**
+   - **Feature-First & Honest Feedback Directive:** OSD notifications and UI badges MUST strictly represent genuine, verified hardware/system state changes. NEVER implement or praise "phantom" or "simulated" OSD feedback if the underlying hardware action or driver node is non-functional.
+   - Notifications use 64x64 circular SVG badges matching exact hardware/feature states (`icons/*.svg`). Managed via Git/GitHub.
 
 6. **Storage & Network Integrity:**
    - NTFS mounts (`/DATA1`, `/DATA2`) MUST use the modern in-kernel `ntfs` driver. NEVER install `ntfs-3g`.
@@ -38,7 +39,7 @@ Every AI developer, agent, or automated workflow operating in this workspace **M
    - `custom` profile is disabled on Linux (EC returns `-EINVAL 22`).
    - Physical <kbd>Fn</kbd> + <kbd>Q</kbd> cycles strictly 3 modes: **Quiet ➔ Balanced ➔ Performance**.
    - Physical <kbd>Fn</kbd> + <kbd>R</kbd> emits **Keycode `562` (`KEY_REFRESH_RATE_TOGGLE`)**.
-   - Physical <kbd>Fn</kbd> + <kbd>L</kbd> toggles logo light (scancodes `0x012c` ON / `0x012b` OFF on VPC2004) with native OSD.
+   - Physical <kbd>Fn</kbd> + <kbd>L</kbd> emits scancodes `0x012c` / `0x012b` (Keycode `240`) on `VPC2004`. Because Gen 10 lacks a mainline sysfs interface for the logo LED and third-party DKMS modules introduce severe throttling risks (issues #491, #585), fake logo OSD is eliminated. Repurposed to **Display Color Profile Cycler** via `lcolor cycle` (configurable via `fn_l_command` in `~/.config/legion/config.json`).
    - Physical Copilot key emits Keycode `193` on ITE Keyboard; hooked natively by `legion-profile-osd` (config-driven in `~/.config/legion/config.json`).
    - Physical <kbd>Fn</kbd> + <kbd>N</kbd> emits Keycode `618` (scancode `0x012a`) on VPC2004; default "device info" action repurposed as configurable toggle launcher (`fn_n_command` in config, default: `alacritty -e nvtop`).
 
@@ -46,10 +47,11 @@ Every AI developer, agent, or automated workflow operating in this workspace **M
 
 ## 📂 Project Structure
 
-* **`bin/`**: Core CLI tools (`lbat`, `lmode`, `lhz`, `legion-profile-osd`, `test-hotkey`).
+* **`bin/`**: Core CLI tools (`lbat`, `lmode`, `lhz`, `lcolor`, `legion-profile-osd`, `test-hotkey`).
+* **`color-profiles/`**: Factory-calibrated ICC profiles & Dolby Vision config for Samsung OLED (`SDC420B`).
 * **`systemd/`**: User service definition (`legion-profile-osd.service`).
 * **`tmpfiles.d/`**: Boot-time permission configs for `/etc/tmpfiles.d/`.
-* **`icons/`**: 5 high-res circular SVG badges for OSD notifications.
+* **`icons/`**: High-res circular SVG badges for OSD notifications.
 * **`desktop/`**: KDE desktop shortcut entry for `lhz toggle`.
 * **`docs/`**: Comprehensive hardware guides and mount documentation.
 * **`install.sh`**: 1-click installer and deployer.

@@ -46,20 +46,20 @@ To ensure 100% sudo-less operation that persists across reboots without breaking
   * **`lbat`** $\rightarrow$ Battery Conservation Mode toggle (80% / 100%).
   * **`lmode`** $\rightarrow$ Power & Thermal profile manager (`quiet`, `balanced`, `perf`, `extreme`).
   * **`lhz`** $\rightarrow$ Display Refresh Rate toggle (240Hz $\leftrightarrow$ 60Hz).
+  * **`lcolor`** $\rightarrow$ Native Display Color Profile manager with EDID panel matching (`sRGB`, `DisplayP3`, `DCIP3`, `AdobeRGB`, `REC709`, `Native`).
   * **`test-hotkey`** $\rightarrow$ Standalone pure-Python evdev event sniffer.
 * **Naming Safety:** NEVER shadow existing system binaries. (For example, `/usr/bin/bat` on Arch/CachyOS is a well-known `cat` clone with syntax highlighting; naming a script `bat` will break user workflows. Always use `lbat`).
+* **English-Only Standardization:** All codebase assets (code, comments, docstrings, commit messages, CLI user output, help texts, and guides) MUST be strictly in English for public open-source readiness.
 
-### Rule 5: Visual Consistency & Asset Isolation
-* Desktop OSD banners must display dedicated high-resolution circular SVG badges matching exact hardware states:
-  * 🔵 Quiet Mode $\rightarrow$ `quiet.svg` (Blue LED)
-  * ⚪ Balanced Mode $\rightarrow$ `balanced.svg` (White LED)
-  * 🔴 Performance Mode $\rightarrow$ `performance.svg` (Red LED)
-  * 🟣 Extreme Mode $\rightarrow$ `extreme.svg` (Purple LED)
-  * ⚙️ Custom Mode $\rightarrow$ `custom.svg` (Teal)
-* **Asset Location & Cloud Backup:**
+### Rule 5: Visual Consistency, Feature-First Design & Asset Isolation
+* **Feature-First & Honest Feedback Directive:**
+  - OSD notifications and UI badges MUST strictly represent genuine, verified hardware/system state changes.
+  - NEVER implement, retain, or praise "phantom" or "simulated" OSD feedback if the underlying hardware action or driver node is non-functional. Visuals serve real features, not illusions.
+  - If a hardware feature lacks safe kernel driver support (e.g. lid logo LED on Gen 10 lacking mainline sysfs exposure), either cleanly disable the notification or repurpose the hardware event hook to a verified, functional system feature.
+* **Badge Aesthetics & Icons:**
+  * Desktop OSD banners display dedicated high-resolution circular SVG badges matching exact hardware/feature states (`icons/*.svg`).
   * Active assets reside in: `~/.local/share/icons/legion/`
-  * Permanent cloud backups reside in: `~/OneDrive/CloudSync/Software/16iax10h-power-icons/`
-  * Fresh installs can be restored with a single command: `~/OneDrive/CloudSync/Software/16iax10h-power-icons/install.sh`.
+  * Repository assets managed via Git/GitHub.
 
 ### Rule 6: Storage & Network Filesystem Integrity
 * **Dual-boot NTFS Partitions (`/DATA1`, `/DATA2`):**
@@ -74,7 +74,8 @@ To ensure 100% sudo-less operation that persists across reboots without breaking
 * **`custom` Mode Protection:** The EC rejects switching to `custom` with `-EINVAL 22` unless custom fan/power tables are preloaded. `lmode` must disable `custom` and display an English hint.
 * **Fn + Q 3-Mode Loop:** The physical <kbd>Fn</kbd> + <kbd>Q</kbd> hardware key in firmware strictly cycles through 3 modes: **Quiet ➔ Balanced ➔ Performance**. `max-power` (Extreme) is an extended profile switched directly via `lmode extreme`.
 * **Fn + R Keycode:** The physical <kbd>Fn</kbd> + <kbd>R</kbd> shortcut emits scancode `0x0110`, translated by `ideapad_laptop` to **Keycode `562` (`KEY_REFRESH_RATE_TOGGLE`)** on `/dev/input/by-path/pci-0000:00:1f.0-platform-VPC2004:00-event`.
-* **Fn + L (Logo Light):** The physical <kbd>Fn</kbd> + <kbd>L</kbd> hardware key is fully operational on Gen 10! The EC toggles the back lid logo light and reports alternating scancodes `0x012c` (ON) and `0x012b` (OFF) on `VPC2004:00-event`. Integrated into `legion-profile-osd` for visual OSD feedback.
+* **Fn + L (Display Color Profile Cycler — Repurposed):** The physical <kbd>Fn</kbd> + <kbd>L</kbd> shortcut emits scancodes `0x012c` / `0x012b` (Keycode `240`) on `VPC2004`. Because Linux mainline lacks a safe sysfs interface for physical lid logo control on Gen 10 and out-of-tree DKMS modules introduce severe throttling risks (issues #491, #585), fake logo OSD is eliminated. Repurposed to **Display Color Profile Cycler** via `lcolor cycle` (configurable via `fn_l_command` in `~/.config/legion/config.json`).
+  - **Strict Panel Matching Guard:** `lcolor` reads the internal eDP EDID (`/sys/class/drm/*-eDP-*/edid`) and verifies the hardware ID matches `SDC420B` before applying factory-calibrated profiles (`sRGB`, `DisplayP3`, `DCIP3`, `AdobeRGB`, `REC709`, `Native`). If a mismatched panel is detected, it safely halts with an informative warning.
 * **Copilot Key (Native Hotkey Dispatcher):** Emits hardware macro `LeftMeta (125) + LeftShift (42) + F23 (193)` via `ITE Device(8258)`. Hooked natively by `legion-profile-osd` on Keycode `193` with zero polling. Tap (<0.3s) → `copilot_tap` app; Hold (≥0.3s) → rofi candidate picker (kdialog fallback). Configurable via `~/.config/legion/config.json`. Permissions: `/etc/udev/rules.d/99-lenovo-input.rules`.
 * **Fn + N (Configurable Toggle Launcher):** Emits Keycode `618` (scancode `0x012a`) on `VPC2004:00-event`. Original firmware action ("device info") is useless on Linux. Hooked by `legion-profile-osd` as a **toggle**: press once to launch `fn_n_command` (default: `alacritty -e nvtop`), press again to kill the process (`pkill` by binary name). Configurable via `fn_n_command` in `~/.config/legion/config.json`.
 
@@ -89,13 +90,16 @@ To ensure 100% sudo-less operation that persists across reboots without breaking
 │   │   ├── lbat                      # Sudo-less battery conservation CLI (~80% / 100%)
 │   │   ├── lmode                     # Adaptive power & thermal manager with live fan RPMs
 │   │   ├── lhz                       # Display refresh rate toggle (240Hz / 60Hz)
-│   │   ├── legion-profile-osd        # Unified event-driven daemon (Fn+Q, Fn+R, OSD)
+│   │   ├── lcolor                    # Display color profile manager with EDID panel check
+│   │   ├── legion-profile-osd        # Unified event-driven daemon (Fn+Q, Fn+R, Fn+L, Fn+N, Copilot)
 │   │   └── test-hotkey               # Pure-Python hardware hotkey discovery sniffer
 │   └── share/
 │       ├── applications/
 │       │   └── lhz-toggle.desktop    # Desktop entry for KDE shortcut integration
+│       ├── color/
+│       │   └── icc/                  # Factory-calibrated ICC color profiles (SDC420B)
 │       └── icons/
-│           └── legion/               # 5 circular SVG badges (quiet, balanced, perf, extreme, custom)
+│           └── legion/               # High-res circular SVG badges
 ├── .config/
 │   └── systemd/
 │       └── user/
@@ -105,23 +109,16 @@ To ensure 100% sudo-less operation that persists across reboots without breaking
 │       ├── lenovo_conservation.conf       # 0666 on /sys/bus/platform/devices/VPC2004:00/conservation_mode
 │       ├── lenovo_platform_profile.conf   # 0666 on /sys/firmware/acpi/platform_profile
 │       └── lenovo_hotkeys.conf            # 0666 on /dev/input/by-path/pci-0000:00:1f.0-platform-VPC2004:00-event
-└── OneDrive/
-    └── CloudSync/
-        └── Software/
-            ├── AGENTS.md                          # [THIS FILE] Core architectural directives
-            ├── Legion_Pro_7_16IAX10H_Hardware_Guide.md # Comprehensive hardware reference manual
-            ├── Legion_16IAX10H_Battery_Conservation_CachyOS.md # Battery guide
-            ├── CachyOS_NTFS_Mount_Guide.md        # NTFS kernel driver & CIFS mount guide
-            └── 16iax10h-power-icons/              # Permanent cloud backup of all SVG badges + install.sh
+└── docs/                                  # Comprehensive hardware guides & documentation
 ```
 
 ---
 
 ## 4. Operational Directives for Future Agents
 
-1. **Before modifying any hardware script:** Review the respective section in [Legion_Pro_7_16IAX10H_Hardware_Guide.md](file:///home/quangtm/OneDrive/CloudSync/Software/Legion_Pro_7_16IAX10H_Hardware_Guide.md).
+1. **Before modifying any hardware script:** Review the respective hardware section in `docs/` and this `AGENTS.md`.
 2. **When adding a new hardware toggle:** Follow the 3-step pattern:
-   - Step 1: Grant permissions via `/etc/tmpfiles.d/*.conf`.
+   - Step 1: Grant permissions via `/etc/tmpfiles.d/*.conf` (sysfs) or `udev` (input devices).
    - Step 2: Implement CLI script in `~/.local/bin/l<name>`.
    - Step 3: Wire into `legion-profile-osd` if hardware event hooks or OSD banners are required.
-3. **Always preserve documentation integrity:** Any modifications made to scripts, configs, or services must be synchronously documented in both `Legion_Pro_7_16IAX10H_Hardware_Guide.md` and this `AGENTS.md`.
+3. **Always preserve documentation integrity:** Any modifications made to scripts, configs, or services must be synchronously documented in `AGENTS.md`.

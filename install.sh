@@ -27,15 +27,22 @@ if [[ ! -f "$HOME/.config/legion/config.json" ]]; then
     { "key": "4", "name": "Screenshot (Spectacle)",      "exec": "spectacle -r" },
     { "key": "5", "name": "Antigravity IDE",             "exec": "antigravity" }
   ],
-  "fn_n_command": "alacritty -e nvtop"
+  "fn_n_command": "alacritty -e nvtop",
+  "fn_l_command": "lcolor cycle"
 }
 JSONEOF
 fi
 
-# 3. Deploy SVG badges
+# 3. Deploy SVG badges & Color Profiles
 echo "🎨 Installing circular SVG badges to ~/.local/share/icons/legion/..."
 mkdir -p "$HOME/.local/share/icons/legion"
 cp -v "$DIR"/icons/*.svg "$HOME/.local/share/icons/legion/"
+
+echo "🎨 Installing factory-calibrated color profiles to ~/.local/share/color/icc/..."
+mkdir -p "$HOME/.local/share/color/icc"
+if [[ -d "$DIR/color-profiles" ]]; then
+    cp -v "$DIR"/color-profiles/*.icm "$HOME/.local/share/color/icc/" 2>/dev/null || true
+fi
 
 # 4. Deploy rofi theme (only if not already present — never override user's customization)
 echo "🎨 Installing Legion Quick Launcher rofi theme..."
@@ -89,9 +96,11 @@ echo "✅ Installation Complete! All Legion features are active:"
 echo "   - lbat         : Battery Conservation (~80% cap / 100% full)"
 echo "   - lmode        : Power & Thermal Profiles (Quiet, Balanced, Perf, Extreme)"
 echo "   - lhz          : Display Refresh Rate (240Hz / 60Hz)"
+echo "   - lcolor       : Display Color Profile Manager (sRGB, Display P3, DCI-P3...)"
 echo "   - Fn + Q       : Hardware 3-mode power loop + OSD banner"
 echo "   - Fn + R       : Hardware refresh rate toggle + OSD banner"
-echo "   - Fn + L       : Hardware Legion Logo toggle + 3D OSD badge"
+echo "   - Fn + L       : Display color profile cycle (EDID-validated) + OSD banner"
+echo "   - Fn + N       : Configurable app toggle launcher (Default: nvtop)"
 echo "   - Copilot Key  : Configurable hardware key (Default: Alacritty)"
 echo "   - test-hotkey  : Hardware input event discovery sniffer"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
