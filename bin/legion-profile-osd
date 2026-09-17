@@ -85,8 +85,58 @@ PROFILES = {
     }
 }
 
+def ensure_gui_environment():
+    """
+    Ensures that WAYLAND_DISPLAY, DISPLAY, and desktop session variables
+    are properly set in os.environ.
+
+    When the daemon starts before the desktop session (e.g., at system boot via default.target),
+    Wayland variables are not yet present. This dynamically acquires them from
+    `systemctl --user show-environment` or by probing `/run/user/<uid>/wayland-*`.
+    """
+    if os.environ.get("WAYLAND_DISPLAY") and os.environ.get("DISPLAY"):
+        return
+
+    uid = os.getuid()
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{uid}")
+    os.environ["XDG_RUNTIME_DIR"] = runtime_dir
+
+    # 1. Query systemd user environment (authoritative in KDE Plasma 6 Wayland)
+    try:
+        res = subprocess.run(
+            ["systemctl", "--user", "show-environment"],
+            capture_output=True, text=True, timeout=1
+        )
+        if res.returncode == 0:
+            for line in res.stdout.splitlines():
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    if k in (
+                        "WAYLAND_DISPLAY", "DISPLAY", "XDG_CURRENT_DESKTOP",
+                        "XDG_SESSION_TYPE", "XAUTHORITY", "PATH", "QT_WAYLAND_RECONNECT"
+                    ):
+                        os.environ[k] = v
+    except Exception:
+        pass
+
+    # 2. Heuristic fallback: check /run/user/<uid>/wayland-* if WAYLAND_DISPLAY is still missing
+    if not os.environ.get("WAYLAND_DISPLAY"):
+        sockets = [
+            s for s in glob.glob(f"{runtime_dir}/wayland-*")
+            if not s.endswith(".lock")
+        ]
+        if sockets:
+            os.environ["WAYLAND_DISPLAY"] = os.path.basename(sorted(sockets)[0])
+
+    if not os.environ.get("DISPLAY"):
+        os.environ["DISPLAY"] = ":0"
+
+    if not os.environ.get("XDG_CURRENT_DESKTOP"):
+        os.environ["XDG_CURRENT_DESKTOP"] = "KDE"
+
 def send_error_osd(title, msg):
     """Shows a persistent desktop error notification for user-visible failures."""
+    ensure_gui_environment()
     cmd = [
         "notify-send",
         "-a", "Legion Toolkit",
@@ -127,6 +177,7 @@ def get_copilot_config():
 
 def run_executable(cmd_str, source_name="Copilot"):
     """Validates and launches an application or command string."""
+    ensure_gui_environment()
     try:
         args = shlex.split(cmd_str)
     except ValueError as e:
@@ -171,6 +222,7 @@ def dispatch_hotkey(hotkey_label, cfg_entry, default_entry):
       - A string: "lcolor cycle" or "alacritty -e nvtop"
       - None: falls back to default_entry
     """
+    ensure_gui_environment()
     entry = cfg_entry if cfg_entry is not None else default_entry
 
     if isinstance(entry, dict):
@@ -237,6 +289,7 @@ def _run_picker_proc(cmd, stdin_data=None):
     terminate the process immediately after registering it under the lock.
     """
     global _menu_proc, _abort_requested
+    ensure_gui_environment()
 
     try:
         proc = subprocess.Popen(
@@ -351,6 +404,7 @@ def launch_copilot_menu():
     threading.Thread(target=_menu_worker, daemon=True).start()
 
 def send_profile_osd(state):
+    ensure_gui_environment()
     info = PROFILES.get(state, {
         "title": f"Profile: {state}",
         "msg": "ACPI platform_profile changed",
@@ -398,6 +452,7 @@ def find_keyboard_fd():
     return None, None
 
 def main():
+    ensure_gui_environment()
     poller = select.poll()
 
     # 1. Register ACPI platform_profile for Fn+Q & lmode
@@ -469,6 +524,7 @@ def main():
                                 if code == KEY_REFRESH_RATE_TOGGLE:
                                     if now - last_toggle_time > 0.4:
                                         last_toggle_time = now
+                                        ensure_gui_environment()
                                         if os.path.isfile(LHZ_BIN):
                                             subprocess.run([LHZ_BIN, "toggle"], check=False)
 

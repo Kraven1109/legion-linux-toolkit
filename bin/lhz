@@ -1,6 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Auto-discover GUI session if running from minimal environment
+if [[ -z "${WAYLAND_DISPLAY:-}" && -z "${DISPLAY:-}" ]]; then
+    for s in /run/user/"$UID"/wayland-*; do
+        if [[ -S "$s" ]]; then
+            export WAYLAND_DISPLAY="$(basename "$s")"
+            break
+        fi
+    done
+    export DISPLAY="${DISPLAY:-:0}"
+fi
+
 # Query current active rate on primary display
 get_current_rate() {
     kscreen-doctor -o | grep -oE "@[0-9.]+\*" | tr -d '@*' | head -n 1 || true
