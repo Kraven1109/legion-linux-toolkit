@@ -900,15 +900,16 @@ echo 1 | sudo tee /sys/bus/platform/devices/VPC2004:00/fn_lock   # F1-F12 primar
 echo 0 | sudo tee /sys/bus/platform/devices/VPC2004:00/fn_lock   # Media keys primary
 ```
 
-### D. Chassis & Logo Lighting (`Fn + L` & Hardware Event Verification)
-On the Lenovo Legion Pro 7 (16IAX10H), the exterior "LEGION" logo light on the lid is actively toggled at the hardware EC level:
-* **Hardware ID:** `048d:c193` (*Integrated Technology Express, Inc. Lenovo Lighting* for complex per-key RGB) alongside the Embedded Controller (EC).
-* **Current Linux Status & Hotkey Discovery:**
-  - Physical <kbd>Fn</kbd> + <kbd>L</kbd> **is fully operational**! The hardware EC directly toggles the lid logo lighting circuit on and off.
-  - Furthermore, every physical press of <kbd>Fn</kbd> + <kbd>L</kbd> triggers an ACPI notification to `/dev/input/by-path/pci-0000:00:1f.0-platform-VPC2004:00-event` with alternating raw scancodes:
-    - `Scancode 0x012c` $\rightarrow$ **Logo Light ON**
-    - `Scancode 0x012b` $\rightarrow$ **Logo Light OFF**
-  - **Native OSD Integration:** The unified daemon `legion-profile-osd` catches these scancodes via `select.poll()` and pops an on-screen notification (`Legion Logo: ON / OFF`) with matching SVG circular badges (`logo-on.svg`, `logo-off.svg`), completely replicating the Lenovo Vantage experience with 0% CPU overhead!
+### D. Display Color Profiles & Hotkey Repurposing (`Fn + L` ➔ `lcolor cycle`)
+On the Lenovo Legion Pro 7 (16IAX10H), the physical <kbd>Fn</kbd> + <kbd>L</kbd> combination emits hardware ACPI scancodes to `/dev/input/by-path/pci-0000:00:1f.0-platform-VPC2004:00-event`:
+* **Scancodes:** Alternates between `0x012c` and `0x012b` (Keycode `240` `KEY_UNKNOWN_VPC`).
+* **Hardware Reality & Safety:** Mainline Linux kernel currently lacks safe sysfs exposure for the Gen 10 lid logo LED. Out-of-tree DKMS modules (such as `lenovolegionlinux`) introduce severe stability risks (issues #491 and #585: EC lockup, 400 MHz CPU throttling, 12W GPU throttling, and unmerged EC chip 0x5508 incompatibilities).
+* **Elimination of Fake OSD & Feature-First Repurposing:**
+  - In adherence with the Feature-First Directive, fake "Logo ON/OFF" OSD banners have been eliminated.
+  - Repurposed into a **Display Color Profile Cycler** via the `lcolor cycle` command.
+  - Cycles factory-calibrated profiles: `sRGB` ➔ `Display P3` ➔ `DCI-P3` ➔ `Adobe RGB` ➔ `Rec.709` ➔ `Native`.
+  - **Strict Hardware Panel Guard:** Reads `/sys/class/drm/*-eDP-*/edid` and validates the hardware ID matches `SDC420B` (Samsung 2.5K OLED) before applying, protecting color fidelity on other panels.
+  - Fully configurable via `"fn_l"` in `~/.config/legion/config.json`.
 
 ### E. Microsoft Copilot Hardware Key (`LeftMeta + LeftShift + F23`)
 * **Hardware Device:** `event4: ITE Tech. Inc. ITE Device(8258) Keyboard` (USB HID `0003:048D:C197`).
