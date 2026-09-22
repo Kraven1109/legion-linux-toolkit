@@ -403,6 +403,7 @@ def manage_kwin_window(pids, on_active="close"):
 
 _last_terminal_spawn = 0.0
 _pending_spawn_pid = None
+_last_toggle_launch = {}
 
 def get_valid_shells():
     """Reads valid login shells from /etc/shells."""
@@ -755,7 +756,13 @@ def dispatch_hotkey(hotkey_label, cfg_entry, default_entry):
                     pass
             inner_target = os.path.basename(target)
 
-        target_proc = inner_target or proc_name or (entry.get("name", "").strip() if isinstance(entry, dict) else None) or (os.path.basename(args[-1]) if args else "")
+        # Determine process name to track (prioritize explicit process, inner wrapper command, or firefoxpwa site ID)
+        target_proc = proc_name or inner_target
+        if not target_proc:
+            if len(args) >= 4 and args[0] == "firefoxpwa" and args[1] == "site" and args[2] == "launch":
+                target_proc = args[3]
+            elif args:
+                target_proc = os.path.basename(args[0])
 
         pids = find_process_pids(target_proc, match_type=match_type, is_inner_payload=bool(inner_target))
         if not pids and proc_name and proc_name != target_proc:
@@ -774,6 +781,13 @@ def dispatch_hotkey(hotkey_label, cfg_entry, default_entry):
                 subprocess.run(["pkill", flag, "--", re.escape(target_proc)], check=False)
                 print(f"[{hotkey_label}] Toggled OFF: killed {target_proc!r} (mode: {flag})", flush=True)
         else:
+            global _last_toggle_launch
+            now = time.monotonic()
+            last_t = _last_toggle_launch.get(cmd, 0.0)
+            if now - last_t < 1.5:
+                print(f"[{hotkey_label}] Launch in progress (< 1.5s), ignoring duplicate press for {target_proc!r}.", flush=True)
+                return
+            _last_toggle_launch[cmd] = now
             run_executable(cmd, hotkey_label)
     else:
         run_executable(cmd, hotkey_label)
