@@ -806,24 +806,35 @@ def _show_kdialog(names, lookup):
         if name in lookup:
             run_executable(lookup[name], f"Candidate [{name}]")
 
+def dismiss_copilot_menu():
+    """
+    Dismisses the open candidate picker menu if running.
+    Works even during the brief window before the subprocess is spawned.
+    """
+    global _abort_requested
+    if not _menu_open.is_set():
+        return False
+    with _menu_proc_lock:
+        proc = _menu_proc
+        if proc and proc.poll() is None:
+            # Proc is live — kill it directly
+            proc.terminate()
+            print("[COPILOT MENU] Dismissed by Copilot press", flush=True)
+        else:
+            # Proc not yet spawned (still in config-read window) — mark abort
+            _abort_requested = True
+            print("[COPILOT MENU] Abort queued (proc not yet live)", flush=True)
+    return True
+
 def launch_copilot_menu():
-    """Spawns picker menu in a background thread.
+    """
+    Spawns picker menu in a background thread.
     - Uses rofi if available (with Legion theme if present, else rofi defaults)
     - Falls back to kdialog if rofi is not installed
-    - Second hold while menu is open → dismisses (terminates) the picker.
-      Works even during the brief window before the subprocess is spawned."""
-    global _abort_requested
+    - Subsequent Copilot press (tap or hold) while menu is open → dismisses the picker.
+    """
     if _menu_open.is_set():
-        with _menu_proc_lock:
-            proc = _menu_proc
-            if proc and proc.poll() is None:
-                # Proc is live — kill it directly
-                proc.terminate()
-                print("[COPILOT MENU] Dismissed by second hold", flush=True)
-            else:
-                # Proc not yet spawned (still in config-read window) — mark abort
-                _abort_requested = True
-                print("[COPILOT MENU] Abort queued (proc not yet live)", flush=True)
+        dismiss_copilot_menu()
         return
 
     def _menu_worker():
@@ -1042,11 +1053,14 @@ def main():
                                         now = time.time()
                                         if now - last_tap_time > 0.3:
                                             last_tap_time = now
-                                            print("[COPILOT] Short tap detected ➔ Dispatching Default Action", flush=True)
-                                            cfg, err = get_copilot_config()
-                                            if err:
-                                                send_error_osd("Copilot Key — Config Warning", err)
-                                            dispatch_hotkey("Copilot Tap", cfg.get("tap"), DEFAULT_COPILOT_CMD)
+                                            if _menu_open.is_set():
+                                                dismiss_copilot_menu()
+                                            else:
+                                                print("[COPILOT] Short tap detected ➔ Dispatching Default Action", flush=True)
+                                                cfg, err = get_copilot_config()
+                                                if err:
+                                                    send_error_osd("Copilot Key — Config Warning", err)
+                                                dispatch_hotkey("Copilot Tap", cfg.get("tap"), DEFAULT_COPILOT_CMD)
                                     copilot_is_hold = False
 
                         except BlockingIOError:

@@ -18,6 +18,7 @@
   },
 
   // Copilot Key Long Press (>= 0.3s) Candidate Picker Menu (Rofi / Kdialog)
+  // Subsequent Copilot press (short tap or long hold) toggles/dismisses the open menu.
   "copilot_candidates": [
     { "key": "1", "name": "Terminal (Konsole)",      "exec": "konsole" },
     { "key": "2", "name": "KRunner Search",          "exec": "krunner" },
