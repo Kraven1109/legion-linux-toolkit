@@ -196,24 +196,39 @@ def run_executable(cmd_str, source_name="Copilot", env_extra=None):
         send_error_osd(f"{source_name} — Launch Error", errmsg)
         return None
 
+TERMINAL_COMM_NAMES = {
+    "alacritty", "kitty", "foot", "ghostty", "konsole", "wezterm",
+    "xterm", "gnome-terminal", "mate-terminal", "xfce4-terminal"
+}
+SESSION_STOP_NAMES = {
+    "systemd", "init", "systemd-run", "plasma-workspace", "kwin_wayland",
+    "antigravity-ide", "code", "vscodium", "cursor", "language_server", "node"
+}
+
 def get_related_pids(pids):
     """
     Finds all PIDs associated with the target processes in the process tree:
-    - Ancestors (parents up to 3 levels, e.g. terminal emulator hosting CLI tool)
+    - Ancestors (parents up to enclosing terminal emulator, stopping before system/session processes)
     - Descendants (children running under the process)
     """
     related = set(pids)
     for pid in pids:
         curr = pid
-        for _ in range(3):
+        for _ in range(4):
             try:
                 with open(f"/proc/{curr}/stat", "r") as f:
-                    ppid = int(f.read().split()[3])
-                if ppid > 1:
-                    related.add(ppid)
-                    curr = ppid
-                else:
+                    stat_parts = f.read().split()
+                    ppid = int(stat_parts[3])
+                if ppid <= 1:
                     break
+                with open(f"/proc/{ppid}/comm", "r") as f:
+                    pcomm = f.read().strip().lower()
+                if pcomm in SESSION_STOP_NAMES:
+                    break
+                related.add(ppid)
+                if pcomm in TERMINAL_COMM_NAMES:
+                    break
+                curr = ppid
             except Exception:
                 break
         try:
@@ -225,10 +240,61 @@ def get_related_pids(pids):
             pass
     return list(related)
 
+def find_process_pids(proc_name, match_type="auto"):
+    """
+    Finds PIDs for a process name:
+    1. Tries exact comm match (pgrep -x).
+    2. If not found or if match_type == 'full', tries full cmdline match (pgrep -f),
+       reliably handling interpreted scripts (Python, Bash, Node) while excluding
+       the daemon itself and zombie processes.
+    """
+    if not proc_name:
+        return []
+    pattern = re.escape(proc_name)
+    use_full = (match_type == "full") or (match_type != "exact" and (len(proc_name) > 15 or " " in proc_name))
+    flag = "-f" if use_full else "-x"
+
+    def _query(flg, pat):
+        try:
+            res = subprocess.run(["pgrep", flg, "--", pat], capture_output=True, text=True)
+            if res.returncode == 0:
+                return [int(p) for p in res.stdout.split() if p.isdigit()]
+        except Exception:
+            pass
+        return []
+
+    pids = _query(flag, pattern)
+    if not pids and flag == "-x" and match_type != "exact":
+        pids = _query("-f", pattern)
+
+    valid_pids = []
+    my_pid = os.getpid()
+    for pid in pids:
+        if pid == my_pid:
+            continue
+        try:
+            with open(f"/proc/{pid}/stat", "r") as f:
+                stat_str = f.read()
+            rparen = stat_str.rfind(")")
+            if rparen != -1 and len(stat_str) > rparen + 2:
+                state = stat_str[rparen + 2]
+                if state == "Z":
+                    continue
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmdline = f.read().replace(b"\x00", b" ").decode("utf-8", "ignore")
+            if "legion-profile-osd" in cmdline:
+                continue
+            valid_pids.append(pid)
+        except Exception:
+            continue
+    return valid_pids
+
 def manage_kwin_window(pids, on_active="close"):
     """
-    Interacts with KWin Wayland via DBus Scripting to bring an obscured window to front,
-    or toggle it off if already in the foreground.
+    Interacts with KWin Wayland via DBus Scripting:
+    - If currently focused window belongs to target process tree, toggles it off
+      (closes or minimizes according to on_active).
+    - If target window is in background or minimized, brings it to front and focuses it.
     Returns True if a matching window was found and managed, False otherwise.
     """
     qdbus_bin = shutil.which("qdbus6") or shutil.which("qdbus")
@@ -245,33 +311,49 @@ def manage_kwin_window(pids, on_active="close"):
     kwin_script = f"""
     (function() {{
         var targetPids = {related_pids};
-        var windows = workspace.windowList();
+        var activeWin = workspace.activeWindow;
+
+        // 1. If currently focused window belongs to target, handle dismiss/toggle-off
+        if (activeWin && targetPids.indexOf(activeWin.pid) !== -1) {{
+            var act = "{action_str}";
+            if (act === "minimize") {{
+                activeWin.minimized = true;
+            }} else if (act === "none" || act === "keep") {{
+                // keep active (no-op)
+            }} else {{
+                activeWin.closeWindow();
+            }}
+            return;
+        }}
+
+        // 2. Not active -> find topmost window in stacking order to raise and focus
         var matched = null;
-        for (var i = 0; i < windows.length; i++) {{
-            var w = windows[i];
-            if (targetPids.indexOf(w.pid) !== -1) {{
+        var list = workspace.stackingOrder || (workspace.windowList ? workspace.windowList() : []);
+        for (var i = list.length - 1; i >= 0; i--) {{
+            var w = list[i];
+            if (w.normalWindow && targetPids.indexOf(w.pid) !== -1) {{
                 matched = w;
                 break;
             }}
         }}
+        if (!matched && workspace.windowList) {{
+            var wins = workspace.windowList();
+            for (var j = 0; j < wins.length; j++) {{
+                var win = wins[j];
+                if (win.normalWindow && targetPids.indexOf(win.pid) !== -1) {{
+                    matched = win;
+                    break;
+                }}
+            }}
+        }}
+
         if (matched) {{
-            if (!matched.active || matched.minimized) {{
-                if (matched.minimized) {{
-                    matched.minimized = false;
-                }}
-                workspace.activeWindow = matched;
-                if (workspace.raiseWindow) {{
-                    workspace.raiseWindow(matched);
-                }}
-            }} else {{
-                var act = "{action_str}";
-                if (act === "minimize") {{
-                    matched.minimized = true;
-                }} else if (act === "none" || act === "keep") {{
-                    // keep active (no-op)
-                }} else {{
-                    matched.closeWindow();
-                }}
+            if (matched.minimized) {{
+                matched.minimized = false;
+            }}
+            workspace.activeWindow = matched;
+            if (workspace.raiseWindow) {{
+                workspace.raiseWindow(matched);
             }}
         }}
     }})();
@@ -680,26 +762,24 @@ def dispatch_hotkey(hotkey_label, cfg_entry, default_entry):
         return
 
     if action == "toggle":
-        if not proc_name:
-            args = shlex.split(cmd)
-            if len(args) >= 3 and args[1] in ("-e", "-x", "--command"):
-                proc_name = os.path.basename(args[2])
-            else:
-                proc_name = os.path.basename(args[-1])
+        inner_target = None
+        args = shlex.split(cmd) if cmd else []
+        if len(args) >= 3 and args[1] in ("-e", "-x", "--command"):
+            target = args[2]
+            if target in ("bash", "sh", "zsh") and len(args) >= 5 and args[3] in ("-c", "-lc"):
+                try:
+                    sub_args = shlex.split(args[4])
+                    if sub_args:
+                        target = sub_args[0]
+                except Exception:
+                    pass
+            inner_target = os.path.basename(target)
 
-        pids = []
-        use_full = False
-        if proc_name:
-            pattern = re.escape(proc_name)
-            use_full = (match_type == "full") or (match_type != "exact" and (len(proc_name) > 15 or " " in proc_name))
-            flag = "-f" if use_full else "-x"
-            res = subprocess.run(
-                ["pgrep", flag, "--", pattern],
-                capture_output=True,
-                text=True
-            )
-            if res.returncode == 0:
-                pids = [int(p) for p in res.stdout.split() if p.isdigit()]
+        target_proc = inner_target or proc_name or (entry.get("name", "").strip() if isinstance(entry, dict) else None) or (os.path.basename(args[-1]) if args else "")
+
+        pids = find_process_pids(target_proc, match_type=match_type)
+        if not pids and proc_name and proc_name != target_proc:
+            pids = find_process_pids(proc_name, match_type=match_type)
 
         if pids:
             on_active = "close"
@@ -708,11 +788,11 @@ def dispatch_hotkey(hotkey_label, cfg_entry, default_entry):
 
             managed = manage_kwin_window(pids, on_active=on_active)
             if managed:
-                print(f"[{hotkey_label}] Managed window for {proc_name!r} (PIDs: {pids}, on_active: {on_active})", flush=True)
+                print(f"[{hotkey_label}] Managed window for {target_proc!r} (PIDs: {pids}, on_active: {on_active})", flush=True)
             else:
-                flag = "-f" if use_full else "-x"
-                subprocess.run(["pkill", flag, "--", pattern], check=False)
-                print(f"[{hotkey_label}] Toggled OFF: killed {proc_name!r} (mode: {flag})", flush=True)
+                flag = "-f" if (match_type == "full" or len(target_proc) > 15 or " " in target_proc) else "-x"
+                subprocess.run(["pkill", flag, "--", re.escape(target_proc)], check=False)
+                print(f"[{hotkey_label}] Toggled OFF: killed {target_proc!r} (mode: {flag})", flush=True)
         else:
             run_executable(cmd, hotkey_label)
     else:
