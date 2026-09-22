@@ -407,28 +407,6 @@ def get_valid_shells():
     except Exception:
         return {"bash", "zsh", "fish", "sh", "dash"}
 
-def get_user_terminal_shell():
-    """
-    Resolves the user's interactive shell preference.
-    First checks ~/.config/alacritty/alacritty.toml, then $SHELL / pw_shell.
-    """
-    try:
-        cfg_path = os.path.expanduser("~/.config/alacritty/alacritty.toml")
-        if os.path.exists(cfg_path):
-            with open(cfg_path, "r") as f:
-                for line in f:
-                    if "program" in line and "=" in line:
-                        parts = line.split("=", 1)
-                        val = parts[1].strip().strip('"').strip("'")
-                        if os.path.exists(val) and os.access(val, os.X_OK):
-                            return val
-    except Exception:
-        pass
-    try:
-        import pwd
-        return os.environ.get("SHELL") or pwd.getpwuid(os.getuid()).pw_shell or "/bin/sh"
-    except Exception:
-        return os.environ.get("SHELL", "/bin/sh")
 
 def is_interactive_shell(sh_args):
     """
@@ -712,9 +690,15 @@ def dispatch_hotkey(hotkey_label, cfg_entry, default_entry):
     KNOWN_TERMINALS = ("alacritty", "kitty", "foot", "ghostty", "konsole", "wezterm", "xterm")
     args = shlex.split(cmd) if cmd else []
     cmd_base = os.path.basename(args[0]).lower() if args else ""
+    has_inner_cmd = len(args) >= 3 and args[1] in ("-e", "-x", "--command")
 
     if not action:
-        action = "smart_terminal" if cmd_base in KNOWN_TERMINALS else "exec"
+        if cmd_base in KNOWN_TERMINALS and not has_inner_cmd:
+            action = "smart_terminal"
+        elif has_inner_cmd:
+            action = "toggle"
+        else:
+            action = "exec"
 
     if not cmd or cmd.lower() in ("disabled", "none", "off", "false"):
         return
@@ -746,18 +730,9 @@ def dispatch_hotkey(hotkey_label, cfg_entry, default_entry):
             print(f"[{hotkey_label}] Found idle terminal(s) {idle_term_pids} ({target_proc}) ➔ Focusing in KWin", flush=True)
             focus_kwin_idle_terminal(idle_term_pids)
         else:
-            print(f"[{hotkey_label}] No idle terminal found (all busy or none open) ➔ Spawning new {target_proc} with lstats", flush=True)
+            print(f"[{hotkey_label}] No idle terminal found (all busy or none open) ➔ Spawning {target_proc}", flush=True)
             _last_terminal_spawn = now
-
-            # Spawn terminal running lstats, then transitioning to interactive shell
-            lstats_bin = os.path.expanduser("~/.local/bin/lstats")
-            user_sh = get_user_terminal_shell()
-            if os.path.isfile(lstats_bin) and cmd.strip() in ("alacritty", "/usr/bin/alacritty"):
-                spawn_cmd = f'{cmd} -e {user_sh} -c "{lstats_bin}; exec {user_sh}"'
-            else:
-                spawn_cmd = cmd
-
-            spawn_pid = run_executable(spawn_cmd, source_name=hotkey_label)
+            spawn_pid = run_executable(cmd, source_name=hotkey_label)
             _pending_spawn_pid = spawn_pid
         return
 

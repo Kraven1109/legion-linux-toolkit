@@ -571,12 +571,31 @@ class ShortRenderer:
         return f"⚡ {prof} │ 🌀 {fan_str} │ 🧠 CPU {c_temp} {c_pow} │ 🎮 GPU {g_temp} {g_pow} │ 🔋 {b_str} │ 🖥️ {disp_str} ({disp['color_profile_id'].upper()})"
 
 
+def get_user_shell() -> str:
+    """Resolves the user's preferred interactive shell."""
+    shell = os.environ.get("SHELL")
+    if shell and os.path.exists(shell) and os.access(shell, os.X_OK):
+        return shell
+    try:
+        import pwd
+        pw_shell = pwd.getpwuid(os.getuid()).pw_shell
+        if pw_shell and os.path.exists(pw_shell) and os.access(pw_shell, os.X_OK):
+            return pw_shell
+    except Exception:
+        pass
+    for fallback in ("/bin/fish", "/bin/zsh", "/bin/bash", "/bin/sh"):
+        if os.path.exists(fallback) and os.access(fallback, os.X_OK):
+            return fallback
+    return "/bin/sh"
+
+
 # --- Interactive Live Watch Loop ---
 
 def run_watch_mode(telemetry: TelemetryCollector, interval: float = 1.0):
     """Runs a real-time terminal dashboard with flicker-free updates."""
     is_tty = sys.stdin.isatty() and sys.stdout.isatty()
     old_term_settings = None
+    drop_shell = False
 
     if is_tty:
         try:
@@ -598,7 +617,8 @@ def run_watch_mode(telemetry: TelemetryCollector, interval: float = 1.0):
             output = DashboardRenderer.render(data, width=term_cols)
 
             if is_tty:
-                sys.stdout.write(Ansi.HOME + output + "\n" + c("Press 'q' or Ctrl+C to exit", Ansi.DIM))
+                hint = "Press 'q' to quit, 's' for shell (Ctrl+C to exit)"
+                sys.stdout.write(Ansi.HOME + output + "\n" + c(hint, Ansi.DIM))
                 sys.stdout.flush()
             else:
                 print(output)
@@ -614,7 +634,10 @@ def run_watch_mode(telemetry: TelemetryCollector, interval: float = 1.0):
                     r, _, _ = select.select([sys.stdin], [], [], min(remaining, 0.2))
                     if r:
                         ch = sys.stdin.read(1)
-                        if ch in ("q", "Q", "\x03", "\x1b"): # q, Ctrl+C, Esc
+                        if ch in ("s", "S"):
+                            drop_shell = True
+                            return
+                        elif ch in ("q", "Q", "\x03", "\x1b"):  # q, Ctrl+C, Esc
                             return
                 else:
                     time.sleep(remaining)
@@ -631,6 +654,14 @@ def run_watch_mode(telemetry: TelemetryCollector, interval: float = 1.0):
                 sys.stdout.flush()
             except Exception:
                 pass
+        if drop_shell:
+            user_sh = get_user_shell()
+            sh_name = os.path.basename(user_sh)
+            try:
+                os.execlp(user_sh, sh_name)
+            except Exception as e:
+                print(f"Failed to drop to shell {user_sh}: {e}", file=sys.stderr)
+                sys.exit(1)
 
 
 # --- Main CLI Entrypoint ---

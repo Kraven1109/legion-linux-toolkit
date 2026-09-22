@@ -7,9 +7,9 @@
 
   // Copilot Key (Keycode 193) Short Tap (< 0.3s)
   // Options:
-  //   - "smart_terminal" (default for terminal): Finds an existing idle terminal (at shell prompt)
+  //   - "smart_terminal" (default for plain terminal): Finds an existing idle terminal (at shell prompt)
   //                      and brings it to front. Spawns new only if all terminals are busy.
-  //   - "toggle"         : Smart window toggle (bring to front if hidden, close/minimize if active).
+  //   - "toggle"         (default for commands with -e/-x): Smart window toggle (bring to front if hidden, close/minimize if active).
   //   - "exec"           : Unconditionally launches a new process every time.
   "copilot_tap": {
     "action": "smart_terminal",
