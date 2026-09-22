@@ -15,6 +15,15 @@ import argparse
 
 # Common Linux evdev key mappings for laptop vendor keys
 KEY_NAMES = {
+    15: "KEY_TAB",
+    28: "KEY_ENTER",
+    29: "KEY_LEFTCTRL",
+    46: "KEY_C",
+    47: "KEY_V",
+    56: "KEY_LEFTALT",
+    102: "KEY_HOME (Fn + Left Arrow)",
+    107: "KEY_END (Fn + Right Arrow)",
+    119: "KEY_PAUSE",
     142: "KEY_SLEEP",
     148: "KEY_PROG1",
     149: "KEY_PROG2",
@@ -25,9 +34,37 @@ KEY_NAMES = {
     194: "KEY_F20",
     224: "KEY_BRIGHTNESSDOWN",
     225: "KEY_BRIGHTNESSUP",
-    240: "KEY_UNKNOWN_VPC",
+    240: "KEY_UNKNOWN_VPC (Generic VPC code)",
     248: "KEY_MICMUTE",
     562: "KEY_REFRESH_RATE_TOGGLE (Fn + R)",
+    618: "KEY_NOTIFICATION_CENTER (Fn + N)",
+}
+
+# Verified hardware scancodes on Lenovo Legion Pro 7 (16IAX10H) VPC2004 platform
+VPC_SCANCODES = {
+    # Fn + R: Refresh Rate Toggle
+    0x0110: "Fn + R (Refresh Rate Toggle: 240Hz <-> 60Hz)",
+
+    # Fn + Up / Down: Keyboard Backlight Brightness Levels (Firmware EC controlled)
+    0x0118: "Fn + Down (Keyboard Backlight: Off / Level 0)",
+    0x0119: "Fn + Up/Down (Keyboard Backlight: Low / Level 1)",
+    0x011a: "Fn + Up/Down (Keyboard Backlight: Medium / Level 2)",
+    0x0126: "Fn + Up (Keyboard Backlight: Max / Level 3)",
+
+    # Fn + Space: Keyboard RGB Backlight Profile Cycle (Firmware EC controlled)
+    0x0120: "Fn + Space (Keyboard RGB Profile 1)",
+    0x0121: "Fn + Space (Keyboard RGB Profile 2)",
+    0x0122: "Fn + Space (Keyboard RGB Profile 3)",
+    0x0123: "Fn + Space (Keyboard RGB Profile 4)",
+    0x0124: "Fn + Space (Keyboard RGB Profile 5)",
+    0x0125: "Fn + Space (Keyboard RGB Profile 6)",
+
+    # Fn + N: Smart Launcher / Utility
+    0x012a: "Fn + N (Smart Launcher / Utility)",
+
+    # Fn + L: Color Profile Cycler (Repurposed from Lid Logo)
+    0x012b: "Fn + L (Color Profile Cycle / Logo Off)",
+    0x012c: "Fn + L (Color Profile Cycle / Logo On)",
 }
 
 def main():
@@ -126,7 +163,8 @@ def main():
                             print(f"  [KEY EVENT] {names[fd]} ➔ Code: {code:3d} (0x{code:04x}) [{key_sym}] | Action: {state}")
                             events_found += 1
                         elif etype == 4:  # EV_MSC
-                            print(f"  [RAW SCAN]  {names[fd]} ➔ Scancode: 0x{value:04x}")
+                            annotation = f" [{VPC_SCANCODES[value]}]" if value in VPC_SCANCODES else ""
+                            print(f"  [RAW SCAN]  {names[fd]} ➔ Scancode: 0x{value:04x}{annotation}")
                             events_found += 1
                     except BlockingIOError:
                         break

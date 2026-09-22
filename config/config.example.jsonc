@@ -1,0 +1,59 @@
+{
+  // =========================================================================
+  // Legion Linux Toolkit — Configuration
+  // Location: ~/.config/legion/config.jsonc (or config.json)
+  // Supports single-line (//) and multi-line (/* */) comments & trailing commas.
+  // =========================================================================
+
+  // Copilot Key (Keycode 193) Short Tap (< 0.3s)
+  // Options:
+  //   - "smart_terminal" (default for terminal): Finds an existing idle terminal (at shell prompt)
+  //                      and brings it to front. Spawns new only if all terminals are busy.
+  //   - "toggle"         : Smart window toggle (bring to front if hidden, close/minimize if active).
+  //   - "exec"           : Unconditionally launches a new process every time.
+  "copilot_tap": {
+    "action": "smart_terminal",
+    "exec": "alacritty",
+    "process": "alacritty"
+  },
+
+  // Copilot Key Long Press (>= 0.3s) Candidate Picker Menu (Rofi / Kdialog)
+  "copilot_candidates": [
+    { "key": "1", "name": "Terminal (Konsole)",      "exec": "konsole" },
+    { "key": "2", "name": "KRunner Search",          "exec": "krunner" },
+    { "key": "3", "name": "Screenshot (Spectacle)",  "exec": "spectacle -r" }
+  ],
+
+  // Fn + N (Keycode 618) — Smart Window Toggle / Launcher
+  //
+  // Supported actions:
+  //   - "toggle" : Smart Wayland window toggle (KDE Plasma 6).
+  //                - If not running -> launches "exec".
+  //                - If running but obscured/minimized -> brings window to front & focuses.
+  //                - If running and already active -> handles via "on_active".
+  //   - "exec"   : Directly runs "exec" unconditionally.
+  //
+  // Options for "toggle":
+  //   - "exec"      : Command to launch if process is not running.
+  //   - "process"   : Process name to track via pgrep (e.g. "nvtop").
+  //   - "on_active" : Action when window is already focused in the foreground:
+  //                   * "close"    (default) Close window & kill process (saves CPU/GPU power).
+  //                   * "minimize" Minimize window to taskbar.
+  //                   * "none"     Keep window focused (no-op).
+  "fn_n": {
+    "action": "toggle",
+    "exec": "alacritty -e nvtop",
+    "process": "nvtop",
+    "on_active": "close"
+  },
+
+  // Fn + L (Keycode 240) — Display Color Profile Cycler
+  //
+  // Supported actions:
+  //   - "cycle" : Cycles calibrated ICC display profiles via lcolor cycle.
+  //   - "exec"  : Run a custom command.
+  "fn_l": {
+    "action": "cycle",
+    "exec": "lcolor cycle"
+  }
+}

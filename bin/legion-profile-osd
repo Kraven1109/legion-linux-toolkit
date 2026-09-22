@@ -5,11 +5,12 @@ Listens to:
   1. /sys/firmware/acpi/platform_profile (Fn+Q & lmode)
   2. /dev/input/by-path/*-VPC2004:00-event:
      - Keycode 562 (Fn+R ➔ Refresh Rate 240Hz/60Hz)
-     - Scancodes 0x012c / 0x012b (Fn+L ➔ Logo Light ON/OFF OSD)
+     - Scancodes 0x012c / 0x012b (Fn+L ➔ Display Color Profile Cycle)
+     - Keycode 618 / Scancode 0x012a (Fn+N ➔ Smart Launcher / Utility)
   3. /dev/input/event* (ITE Device 8258 Keyboard):
      - Keycode 193 (Copilot Key):
-       * Tap (< 0.3s)   ➔ Launch copilot_tap (Alacritty)
-       * Hold (>= 0.3s) ➔ Popup Candidate Menu (kdialog 1-2-3 picker)
+       * Tap (< 0.3s)   ➔ Smart Terminal / Candidate Launcher
+       * Hold (>= 0.3s) ➔ Popup Candidate Menu (Rofi / Kdialog fallback)
 Zero polling, sleeps indefinitely in kernel wait queues via select.poll().
 """
 
@@ -26,21 +27,34 @@ import shlex
 import shutil
 import threading
 import re
+import tempfile
+import signal
 
-NODE = "/sys/firmware/acpi/platform_profile"
-HOTKEY_NODE = "/dev/input/by-path/pci-0000:00:1f.0-platform-VPC2004:00-event"
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+
+from legion_core import (
+    PLATFORM_PROFILE_NODE as NODE,
+    PLATFORM_PROFILES as PROFILES,
+    HOTKEY_NODE,
+    CONFIG_DIR,
+    ICON_DIR,
+    ensure_gui_environment,
+)
+
 KBD_SYMLINK = "/dev/input/by-path/pci-0000:80:14.0-usb-0:4:1.0-event-kbd"
-CONFIG_PATH = os.path.expanduser("~/.config/legion/config.json")
-DEFAULT_COPILOT_CMD = "/usr/bin/alacritty"
+CONFIG_JSONC_PATH = os.path.join(CONFIG_DIR, "config.jsonc")
+CONFIG_JSON_PATH = os.path.join(CONFIG_DIR, "config.json")
+DEFAULT_COPILOT_CMD = {"action": "smart_terminal", "exec": "alacritty", "process": "alacritty"}
 LHZ_BIN = os.path.expanduser("~/.local/bin/lhz")
 LCOLOR_BIN = os.path.expanduser("~/.local/bin/lcolor")
-ICON_DIR = os.path.expanduser("~/.local/share/icons/legion")
 
 # Linux Input Event Codes
 KEY_REFRESH_RATE_TOGGLE = 562
-KEY_UNKNOWN_VPC = 240
-KEY_COPILOT = 193  # KEY_F23 emitted exclusively by Copilot key
-KEY_FN_N = 618     # Fn+N (scancode 0x012a) — default: "device info" (useless), repurposed
+KEY_UNKNOWN_VPC = 240  # Generic unmapped VPC keycode (shared by Fn+L, Fn+Up/Down arrows — filter by scancode)
+KEY_COPILOT = 193      # KEY_F23 emitted exclusively by Copilot key
+KEY_FN_N = 618         # Fn+N (scancode 0x012a) — default: "device info" (useless), repurposed
 
 # Scancodes on VPC2004 for Fn+L (repurposed to Color Profile Cycling)
 SCANCODE_FN_L_A = 0x012c
@@ -52,88 +66,6 @@ DEFAULT_CANDIDATES = [
     {"key": "2", "name": "KRunner Search", "exec": "krunner"},
     {"key": "3", "name": "Screenshot (Spectacle)", "exec": "spectacle -r"},
 ]
-
-PROFILES = {
-    "low-power": {
-        "title": "Quiet Mode",
-        "msg": "🔵 Blue LED • Silent fans, power-saving",
-        "icon_file": "quiet.svg",
-        "fallback": "battery-charging"
-    },
-    "balanced": {
-        "title": "Balanced Mode",
-        "msg": "⚪ White LED • Dynamic auto power allocation",
-        "icon_file": "balanced.svg",
-        "fallback": "battery-profile-balanced"
-    },
-    "performance": {
-        "title": "Performance Mode",
-        "msg": "🔴 Red LED • Full 175W TGP & High CPU boost",
-        "icon_file": "performance.svg",
-        "fallback": "preferences-system-performance"
-    },
-    "max-power": {
-        "title": "Extreme Mode",
-        "msg": "🟣 Purple LED • Maximum fan curves & peak power",
-        "icon_file": "extreme.svg",
-        "fallback": "speedometer"
-    },
-    "custom": {
-        "title": "Custom Mode",
-        "msg": "Custom thermal envelope & curves",
-        "icon_file": "custom.svg",
-        "fallback": "preferences-system"
-    }
-}
-
-def ensure_gui_environment():
-    """
-    Ensures that WAYLAND_DISPLAY, DISPLAY, and desktop session variables
-    are properly set in os.environ.
-
-    When the daemon starts before the desktop session (e.g., at system boot via default.target),
-    Wayland variables are not yet present. This dynamically acquires them from
-    `systemctl --user show-environment` or by probing `/run/user/<uid>/wayland-*`.
-    """
-    if os.environ.get("WAYLAND_DISPLAY") and os.environ.get("DISPLAY"):
-        return
-
-    uid = os.getuid()
-    runtime_dir = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{uid}")
-    os.environ["XDG_RUNTIME_DIR"] = runtime_dir
-
-    # 1. Query systemd user environment (authoritative in KDE Plasma 6 Wayland)
-    try:
-        res = subprocess.run(
-            ["systemctl", "--user", "show-environment"],
-            capture_output=True, text=True, timeout=1
-        )
-        if res.returncode == 0:
-            for line in res.stdout.splitlines():
-                if "=" in line:
-                    k, v = line.split("=", 1)
-                    if k in (
-                        "WAYLAND_DISPLAY", "DISPLAY", "XDG_CURRENT_DESKTOP",
-                        "XDG_SESSION_TYPE", "XAUTHORITY", "PATH", "QT_WAYLAND_RECONNECT"
-                    ):
-                        os.environ[k] = v
-    except Exception:
-        pass
-
-    # 2. Heuristic fallback: check /run/user/<uid>/wayland-* if WAYLAND_DISPLAY is still missing
-    if not os.environ.get("WAYLAND_DISPLAY"):
-        sockets = [
-            s for s in glob.glob(f"{runtime_dir}/wayland-*")
-            if not s.endswith(".lock")
-        ]
-        if sockets:
-            os.environ["WAYLAND_DISPLAY"] = os.path.basename(sorted(sockets)[0])
-
-    if not os.environ.get("DISPLAY"):
-        os.environ["DISPLAY"] = ":0"
-
-    if not os.environ.get("XDG_CURRENT_DESKTOP"):
-        os.environ["XDG_CURRENT_DESKTOP"] = "KDE"
 
 def send_error_osd(title, msg):
     """Shows a persistent desktop error notification for user-visible failures."""
@@ -152,31 +84,63 @@ def send_error_osd(title, msg):
     except Exception:
         pass
 
-def get_copilot_config():
+def reap_zombies():
+    """Reaps terminated child processes to prevent defunct/zombie processes."""
+    try:
+        while True:
+            pid, _ = os.waitpid(-1, os.WNOHANG)
+            if pid <= 0:
+                break
+    except OSError:
+        pass
+
+def parse_jsonc(text):
     """
-    Reads copilot config dynamically from ~/.config/legion/config.json.
+    Parses JSON with single-line (//) and multi-line (/* */) comments,
+    preserving string literals and stripping trailing commas.
+    """
+    pattern = r'("(?:\\.|[^"\\])*")|//[^\n]*|/\*.*?\*/'
+    def replace(match):
+        if match.group(1):
+            return match.group(1)
+        return ""
+    cleaned = re.sub(pattern, replace, text, flags=re.DOTALL)
+    cleaned = re.sub(r",\s*([\]}])", r"\1", cleaned)
+    return json.loads(cleaned)
+
+def load_config():
+    """
+    Reads configuration dynamically from ~/.config/legion/config.jsonc (or config.json).
     Returns (config_dict, error_or_None).
     """
-    if not os.path.isfile(CONFIG_PATH):
+    for path in (CONFIG_JSONC_PATH, CONFIG_JSON_PATH):
+        if os.path.isfile(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    return parse_jsonc(f.read()), None
+            except Exception as e:
+                return {}, f"{os.path.basename(path)} error: {e}"
+    return {}, None
+
+def get_copilot_config():
+    """
+    Reads copilot config dynamically from ~/.config/legion/config.jsonc (or config.json).
+    Returns (config_dict, error_or_None).
+    """
+    cfg, err = load_config()
+    if not cfg and not err:
         return {
             "tap": DEFAULT_COPILOT_CMD,
             "candidates": DEFAULT_CANDIDATES
         }, None
-    try:
-        with open(CONFIG_PATH, "r") as f:
-            cfg = json.load(f)
-        tap_entry = cfg.get("copilot_tap") if "copilot_tap" in cfg else cfg.get("copilot_command", DEFAULT_COPILOT_CMD)
-        candidates = cfg.get("copilot_candidates", DEFAULT_CANDIDATES)
-        return {
-            "tap": tap_entry,
-            "candidates": candidates
-        }, None
-    except json.JSONDecodeError as e:
-        return {"tap": DEFAULT_COPILOT_CMD, "candidates": DEFAULT_CANDIDATES}, f"config.json parse error: {e}"
-    except Exception as e:
-        return {"tap": DEFAULT_COPILOT_CMD, "candidates": DEFAULT_CANDIDATES}, f"config.json read error: {e}"
+    tap_entry = cfg.get("copilot_tap") if "copilot_tap" in cfg else cfg.get("copilot_command", DEFAULT_COPILOT_CMD)
+    candidates = cfg.get("copilot_candidates", DEFAULT_CANDIDATES)
+    return {
+        "tap": tap_entry,
+        "candidates": candidates
+    }, err
 
-def run_executable(cmd_str, source_name="Copilot"):
+def run_executable(cmd_str, source_name="Copilot", env_extra=None):
     """Validates and launches an application outside the daemon's cgroup."""
     ensure_gui_environment()
     try:
@@ -188,14 +152,14 @@ def run_executable(cmd_str, source_name="Copilot"):
         return False
 
     if not args:
-        errmsg = f"Command is empty string\nEdit ~/.config/legion/config.json"
+        errmsg = f"Command is empty string\nEdit ~/.config/legion/config.jsonc"
         print(f"[{source_name}] {errmsg}", flush=True)
         send_error_osd(f"{source_name} — Empty Command", errmsg)
         return False
 
     exe = shutil.which(args[0]) or (args[0] if os.path.isfile(args[0]) else None)
     if not exe:
-        errmsg = f"App not found: {args[0]!r}\nEdit ~/.config/legion/config.json"
+        errmsg = f"App not found: {args[0]!r}\nEdit ~/.config/legion/config.jsonc"
         print(f"[{source_name}] {errmsg}", flush=True)
         send_error_osd(f"{source_name} — App Not Found", errmsg)
         return False
@@ -205,15 +169,25 @@ def run_executable(cmd_str, source_name="Copilot"):
         # resource accounting and making systemctl restart kill the app. A user
         # scope gives each interactive launch an independent lifecycle instead.
         launcher = shutil.which("systemd-run")
+        full_env = dict(os.environ)
+        if env_extra:
+            full_env.update(env_extra)
+
         if launcher:
+            launcher_cmd = [launcher, "--user", "--scope", "--collect", "--quiet"]
+            if env_extra:
+                for k, v in env_extra.items():
+                    launcher_cmd.append(f"--setenv={k}={v}")
+            launcher_cmd.extend(["--", *args])
             subprocess.Popen(
-                [launcher, "--user", "--scope", "--collect", "--quiet", "--", *args],
+                launcher_cmd,
                 start_new_session=True,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                env=full_env
             )
         else:
-            subprocess.Popen(args, start_new_session=True)
+            subprocess.Popen(args, start_new_session=True, env=full_env)
         print(f"[{source_name}] Executed successfully: {cmd_str}", flush=True)
         return True
     except Exception as e:
@@ -222,36 +196,405 @@ def run_executable(cmd_str, source_name="Copilot"):
         send_error_osd(f"{source_name} — Launch Error", errmsg)
         return False
 
+def get_related_pids(pids):
+    """
+    Finds all PIDs associated with the target processes in the process tree:
+    - Ancestors (parents up to 3 levels, e.g. terminal emulator hosting CLI tool)
+    - Descendants (children running under the process)
+    """
+    related = set(pids)
+    for pid in pids:
+        curr = pid
+        for _ in range(3):
+            try:
+                with open(f"/proc/{curr}/stat", "r") as f:
+                    ppid = int(f.read().split()[3])
+                if ppid > 1:
+                    related.add(ppid)
+                    curr = ppid
+                else:
+                    break
+            except Exception:
+                break
+        try:
+            with open(f"/proc/{pid}/task/{pid}/children", "r") as f:
+                for cpid in f.read().split():
+                    if cpid.isdigit():
+                        related.add(int(cpid))
+        except Exception:
+            pass
+    return list(related)
+
+def manage_kwin_window(pids, on_active="close"):
+    """
+    Interacts with KWin Wayland via DBus Scripting to bring an obscured window to front,
+    or toggle it off if already in the foreground.
+    Returns True if a matching window was found and managed, False otherwise.
+    """
+    qdbus_bin = shutil.which("qdbus6") or shutil.which("qdbus")
+    if not qdbus_bin:
+        return False
+
+    related_pids = get_related_pids(pids)
+    if not related_pids:
+        return False
+
+    script_name = f"legion_win_{int(time.time() * 1000)}"
+    action_str = on_active.lower() if on_active else "close"
+
+    kwin_script = f"""
+    (function() {{
+        var targetPids = {related_pids};
+        var windows = workspace.windowList();
+        var matched = null;
+        for (var i = 0; i < windows.length; i++) {{
+            var w = windows[i];
+            if (targetPids.indexOf(w.pid) !== -1) {{
+                matched = w;
+                break;
+            }}
+        }}
+        if (matched) {{
+            if (!matched.active || matched.minimized) {{
+                if (matched.minimized) {{
+                    matched.minimized = false;
+                }}
+                workspace.activeWindow = matched;
+                if (workspace.raiseWindow) {{
+                    workspace.raiseWindow(matched);
+                }}
+            }} else {{
+                var act = "{action_str}";
+                if (act === "minimize") {{
+                    matched.minimized = true;
+                }} else if (act === "none" || act === "keep") {{
+                    // keep active (no-op)
+                }} else {{
+                    matched.closeWindow();
+                }}
+            }}
+        }}
+    }})();
+    """
+
+    tmp_file = None
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
+            f.write(kwin_script)
+            tmp_file = f.name
+
+        load_res = subprocess.run(
+            [qdbus_bin, "org.kde.KWin", "/Scripting", "loadScript", tmp_file, script_name],
+            capture_output=True,
+            text=True,
+            timeout=2
+        )
+        if load_res.returncode != 0:
+            return False
+
+        script_id = load_res.stdout.strip()
+        subprocess.run(
+            [qdbus_bin, "org.kde.KWin", f"/Scripting/Script{script_id}", "run"],
+            capture_output=True,
+            timeout=2
+        )
+        subprocess.run(
+            [qdbus_bin, "org.kde.KWin", "/Scripting", "unloadScript", script_name],
+            capture_output=True,
+            timeout=2
+        )
+        return True
+    except Exception as e:
+        print(f"[KWIN] Window toggle error: {e}", flush=True)
+        return False
+    finally:
+        if tmp_file and os.path.exists(tmp_file):
+            try:
+                os.unlink(tmp_file)
+            except Exception:
+                pass
+
+_last_terminal_spawn = 0.0
+_pending_spawn_pid = None
+
+def get_valid_shells():
+    """Reads valid login shells from /etc/shells."""
+    try:
+        with open("/etc/shells", "r") as f:
+            return {os.path.basename(line.strip()) for line in f if line.strip() and not line.strip().startswith("#")}
+    except Exception:
+        return {"bash", "zsh", "fish", "sh", "dash"}
+
+def get_user_terminal_shell():
+    """
+    Resolves the user's interactive shell preference.
+    First checks ~/.config/alacritty/alacritty.toml, then $SHELL / pw_shell.
+    """
+    try:
+        cfg_path = os.path.expanduser("~/.config/alacritty/alacritty.toml")
+        if os.path.exists(cfg_path):
+            with open(cfg_path, "r") as f:
+                for line in f:
+                    if "program" in line and "=" in line:
+                        parts = line.split("=", 1)
+                        val = parts[1].strip().strip('"').strip("'")
+                        if os.path.exists(val) and os.access(val, os.X_OK):
+                            return val
+    except Exception:
+        pass
+    try:
+        import pwd
+        return os.environ.get("SHELL") or pwd.getpwuid(os.getuid()).pw_shell or "/bin/sh"
+    except Exception:
+        return os.environ.get("SHELL", "/bin/sh")
+
+def is_interactive_shell(sh_args):
+    """
+    Checks if a shell's arguments match an allowlist of interactive invocation patterns.
+    Fails-safe to False (non-interactive) for any script (-c, file path, unknown options).
+    """
+    if not sh_args:
+        return False
+    args = sh_args[1:]
+    COMMON_SAFE_FLAGS = {"-l", "--login", "-i", "--norc", "--noprofile", "--no-rc", "-s"}
+    i = 0
+    n = len(args)
+    while i < n:
+        arg = args[i]
+        # Special handling for bash/zsh --rcfile / --init-file <path>
+        if arg in ("--rcfile", "--init-file") and i + 1 < n:
+            i += 2
+            continue
+        # Check against common safe interactive flags
+        if arg in COMMON_SAFE_FLAGS:
+            i += 1
+            continue
+        # Combined short flags like -il, -li (must only consist of 'i' and 'l')
+        if arg.startswith("-") and not arg.startswith("--"):
+            flag_chars = set(arg[1:])
+            if flag_chars.issubset({"i", "l"}):
+                i += 1
+                continue
+        # Any other flag or argument (like -c, script.sh, etc.) is considered non-interactive
+        return False
+    return True
+
+def check_pending_spawn(now):
+    """
+    Checks whether a pending terminal spawn is still active.
+    Returns True if spawn is still in progress (should debounce/block duplicate spawn).
+    Returns False if spawn has completed (shell transitioned to interactive, died, or timed out).
+    """
+    global _pending_spawn_pid, _last_terminal_spawn
+    if _pending_spawn_pid is None:
+        return False
+
+    # 1. Timeout protection: max 3.5s
+    if now - _last_terminal_spawn >= 3.5:
+        _pending_spawn_pid = None
+        return False
+
+    # 2. Check if terminal process is still alive
+    try:
+        os.kill(_pending_spawn_pid, 0)
+    except OSError:
+        _pending_spawn_pid = None
+        return False
+
+    # 3. Check if any child shell of the pending terminal has transitioned to interactive
+    for tc in glob.glob(f"/proc/{_pending_spawn_pid}/task/*/children"):
+        try:
+            with open(tc) as f:
+                children = [int(c) for c in f.read().split() if c.isdigit()]
+            for cpid in children:
+                with open(f"/proc/{cpid}/cmdline", "rb") as cf:
+                    raw = cf.read().split(b"\x00")
+                sh_args = [a.decode("utf-8", errors="ignore") for a in raw if a]
+                if is_interactive_shell(sh_args):
+                    _pending_spawn_pid = None
+                    return False
+        except Exception:
+            pass
+
+    return True
+
+def get_idle_terminals(proc_name="alacritty"):
+    """
+    Finds running terminal instances whose direct child is a valid login shell
+    from /etc/shells and currently truly idle at prompt:
+    1. Child is in /etc/shells (excludes nvtop, btop, etc.).
+    2. Child is not in zombie state.
+    3. tpgid == child_pid (foreground of terminal pty).
+    4. Child argv matches interactive allowlist (excludes -c, scripts, etc.).
+    Returns list of dicts: [{"term_pid": pid, "shell_pid": cpid}, ...]
+    """
+    idle_entries = []
+    try:
+        out = subprocess.check_output(["pgrep", "-x", proc_name], text=True)
+        pids = [int(p) for p in out.split() if p.isdigit()]
+    except subprocess.CalledProcessError:
+        return []
+
+    valid_shells = get_valid_shells()
+
+    for pid in pids:
+        try:
+            # 1. Filter out zombie processes
+            with open(f"/proc/{pid}/stat", "r") as f:
+                raw_stat = f.read()
+            after_comm = raw_stat[raw_stat.rfind(")") + 2:].split()
+            if after_comm[0] == "Z":
+                continue
+
+            # 2. Find direct children of the terminal process
+            children = []
+            for task_child in glob.glob(f"/proc/{pid}/task/*/children"):
+                try:
+                    with open(task_child, "r") as f:
+                        children.extend([int(c) for c in f.read().split() if c.isdigit()])
+                except Exception:
+                    pass
+            children = list(set(children))
+            if not children:
+                continue
+
+            # 3. Inspect children: must be a valid shell from /etc/shells AND tpgid == child_pid
+            for cpid in children:
+                try:
+                    with open(f"/proc/{cpid}/comm", "r") as f:
+                        comm = f.read().strip()
+                    if comm not in valid_shells:
+                        continue
+
+                    with open(f"/proc/{cpid}/stat", "r") as f:
+                        sh_stat = f.read()
+                    sh_after = sh_stat[sh_stat.rfind(")") + 2:].split()
+                    if sh_after[0] == "Z":
+                        continue
+
+                    tpgid = int(sh_after[5])
+                    if tpgid != cpid:
+                        continue
+
+                    # Filter out non-interactive shells via allowlist
+                    with open(f"/proc/{cpid}/cmdline", "rb") as f:
+                        raw = f.read().split(b"\x00")
+                    sh_args = [a.decode("utf-8", errors="ignore") for a in raw if a]
+                    if not is_interactive_shell(sh_args):
+                        continue
+
+                    idle_entries.append({"term_pid": pid, "shell_pid": cpid})
+                    break
+                except Exception:
+                    continue
+        except Exception:
+            continue
+
+    return idle_entries
+
+def focus_kwin_idle_terminal(idle_pids):
+    """
+    Focuses the most recently used idle terminal window in KWin 6 stacking order.
+    If an idle terminal is already active in the foreground, keeps focus (Option A).
+    """
+    qdbus_bin = shutil.which("qdbus6") or shutil.which("qdbus")
+    if not qdbus_bin:
+        return False
+
+    script_name = f"legion_idle_focus_{int(time.time() * 1000)}"
+    kwin_script = f"""
+    (function() {{
+        var targetPids = {idle_pids};
+        var activeWin = workspace.activeWindow;
+        if (activeWin && targetPids.indexOf(activeWin.pid) !== -1) {{
+            // Option A: already focused on an idle terminal -> keep focus
+            return;
+        }}
+        for (var i = workspace.stackingOrder.length - 1; i >= 0; i--) {{
+            var w = workspace.stackingOrder[i];
+            if (w.normalWindow && targetPids.indexOf(w.pid) !== -1) {{
+                if (w.minimized) w.minimized = false;
+                workspace.activeWindow = w;
+                if (workspace.raiseWindow) workspace.raiseWindow(w);
+                break;
+            }}
+        }}
+    }})();
+    """
+    tmp_file = None
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
+            f.write(kwin_script)
+            tmp_file = f.name
+
+        load_res = subprocess.run(
+            [qdbus_bin, "org.kde.KWin", "/Scripting", "loadScript", tmp_file, script_name],
+            capture_output=True,
+            text=True,
+            timeout=2
+        )
+        if load_res.returncode != 0:
+            return False
+
+        script_id = load_res.stdout.strip()
+        subprocess.run(
+            [qdbus_bin, "org.kde.KWin", f"/Scripting/Script{script_id}", "run"],
+            capture_output=True,
+            timeout=2
+        )
+        subprocess.run(
+            [qdbus_bin, "org.kde.KWin", "/Scripting", "unloadScript", script_name],
+            capture_output=True,
+            timeout=2
+        )
+        return True
+    except Exception as e:
+        print(f"[KWIN] Focus idle terminal error: {e}", flush=True)
+        return False
+    finally:
+        if tmp_file and os.path.exists(tmp_file):
+            try:
+                os.unlink(tmp_file)
+            except Exception:
+                pass
+
 def dispatch_hotkey(hotkey_label, cfg_entry, default_entry):
     """
-    Executes a configurable hotkey action based on ~/.config/legion/config.json.
+    Executes a configurable hotkey action based on ~/.config/legion/config.jsonc (or config.json).
     Supports two clean modes:
       1. 'exec' / 'cycle' : Directly runs the command (e.g. lcolor cycle, lhz toggle, spectacle).
-      2. 'toggle'         : Process toggle. Checks if 'process' is running via pgrep.
-                            If running -> kills it via pkill.
-                            If not running -> launches 'exec'.
+      2. 'toggle'         : Smart process & window toggle.
+                            - If not running -> launches 'exec'.
+                            - If running but obscured -> brings window to front & focuses.
+                            - If running and already active -> handles via 'on_active' ('close'/'minimize'/'none').
     cfg_entry can be:
-      - A dict: {"action": "toggle", "exec": "...", "process": "...", "match": "full"|"exact"}
-        `full` matches a literal substring of the command line; `exact` matches
-        the executable name. Auto selects `full` for a long ID or a spaced value.
+      - A dict: {"action": "toggle", "exec": "...", "process": "...", "on_active": "close"|"minimize"|"none", "match": "full"|"exact"}
       - A string: "lcolor cycle" or "alacritty -e nvtop"
       - None: falls back to default_entry
     """
+    reap_zombies()
     ensure_gui_environment()
     entry = cfg_entry if cfg_entry is not None else default_entry
 
     if isinstance(entry, dict):
-        action = entry.get("action", "exec").strip().lower()
+        action = entry.get("action", "").strip().lower()
         cmd = entry.get("exec", "").strip()
         proc_name = entry.get("process", "").strip() or None
         match_type = entry.get("match", "auto").strip().lower()
     elif isinstance(entry, str):
         cmd = entry.strip()
-        action = "exec"
+        action = ""
         proc_name = None
         match_type = "auto"
     else:
         return
+
+    KNOWN_TERMINALS = ("alacritty", "kitty", "foot", "ghostty", "konsole", "wezterm", "xterm")
+    args = shlex.split(cmd) if cmd else []
+    cmd_base = os.path.basename(args[0]).lower() if args else ""
+
+    if not action:
+        action = "smart_terminal" if cmd_base in KNOWN_TERMINALS else "exec"
 
     if not cmd or cmd.lower() in ("disabled", "none", "off", "false"):
         return
@@ -261,6 +604,52 @@ def dispatch_hotkey(hotkey_label, cfg_entry, default_entry):
     elif cmd.startswith("lhz") and os.path.isfile(LHZ_BIN):
         cmd = cmd.replace("lhz", LHZ_BIN, 1)
 
+    if action in ("smart_terminal", "smart_spawn"):
+        global _last_terminal_spawn, _pending_spawn_pid
+        now = time.monotonic()
+
+        # 1. Debounce protection (< 1.2s between rapid presses)
+        if now - _last_terminal_spawn < 1.2:
+            print(f"[{hotkey_label}] Terminal spawn debounce (< 1.2s), ignoring duplicate press.", flush=True)
+            return
+
+        # 2. Check if a previously spawned terminal is still in its startup phase
+        if check_pending_spawn(now):
+            print(f"[{hotkey_label}] Terminal spawn still in progress (PID {_pending_spawn_pid}), ignoring duplicate press.", flush=True)
+            return
+
+        target_proc = proc_name or (cmd_base if cmd_base in KNOWN_TERMINALS else "alacritty")
+        idle_entries = get_idle_terminals(target_proc)
+        if idle_entries:
+            _pending_spawn_pid = None
+            idle_term_pids = [e["term_pid"] for e in idle_entries]
+            print(f"[{hotkey_label}] Found idle terminal(s) {idle_term_pids} ({target_proc}) ➔ Focusing in KWin", flush=True)
+            focus_kwin_idle_terminal(idle_term_pids)
+        else:
+            print(f"[{hotkey_label}] No idle terminal found (all busy or none open) ➔ Spawning new {target_proc} with lstats", flush=True)
+            _last_terminal_spawn = now
+
+            # Spawn terminal running lstats, then transitioning to interactive shell
+            lstats_bin = os.path.expanduser("~/.local/bin/lstats")
+            user_sh = get_user_terminal_shell()
+            if os.path.isfile(lstats_bin) and cmd.strip() in ("alacritty", "/usr/bin/alacritty"):
+                spawn_cmd = f'{cmd} -e {user_sh} -c "{lstats_bin}; exec {user_sh}"'
+            else:
+                spawn_cmd = cmd
+
+            try:
+                proc = subprocess.Popen(
+                    shlex.split(spawn_cmd),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True
+                )
+                _pending_spawn_pid = proc.pid
+                print(f"[{hotkey_label}] Spawned terminal PID {proc.pid}: {spawn_cmd}", flush=True)
+            except Exception as e:
+                print(f"[{hotkey_label}] Failed to spawn {spawn_cmd}: {e}", flush=True)
+        return
+
     if action == "toggle":
         if not proc_name:
             args = shlex.split(cmd)
@@ -269,23 +658,32 @@ def dispatch_hotkey(hotkey_label, cfg_entry, default_entry):
             else:
                 proc_name = os.path.basename(args[-1])
 
-        already_running = False
+        pids = []
         use_full = False
         if proc_name:
-            # pgrep/pkill interpret their pattern as an ERE. Escape user config so
-            # matching an app identifier cannot kill an unrelated process.
             pattern = re.escape(proc_name)
             use_full = (match_type == "full") or (match_type != "exact" and (len(proc_name) > 15 or " " in proc_name))
             flag = "-f" if use_full else "-x"
-            already_running = subprocess.run(
+            res = subprocess.run(
                 ["pgrep", flag, "--", pattern],
-                capture_output=True
-            ).returncode == 0
+                capture_output=True,
+                text=True
+            )
+            if res.returncode == 0:
+                pids = [int(p) for p in res.stdout.split() if p.isdigit()]
 
-        if already_running:
-            flag = "-f" if use_full else "-x"
-            subprocess.run(["pkill", flag, "--", pattern], check=False)
-            print(f"[{hotkey_label}] Toggled OFF: killed {proc_name!r} (mode: {flag})", flush=True)
+        if pids:
+            on_active = "close"
+            if isinstance(entry, dict):
+                on_active = entry.get("on_active", "close").strip().lower()
+
+            managed = manage_kwin_window(pids, on_active=on_active)
+            if managed:
+                print(f"[{hotkey_label}] Managed window for {proc_name!r} (PIDs: {pids}, on_active: {on_active})", flush=True)
+            else:
+                flag = "-f" if use_full else "-x"
+                subprocess.run(["pkill", flag, "--", pattern], check=False)
+                print(f"[{hotkey_label}] Toggled OFF: killed {proc_name!r} (mode: {flag})", flush=True)
         else:
             run_executable(cmd, hotkey_label)
     else:
@@ -351,6 +749,9 @@ def _show_rofi(names, lookup):
         "-i",                   # case-insensitive filter
         "-p", "✦ Quick Launch",
         "-no-custom",           # reject free-text not in list
+        "-hover-select",
+        "-me-select-entry", "",
+        "-me-accept-entry", "MousePrimary",
     ]
     # Only inject our theme if it exists — never silently override a user's own theme
     if os.path.isfile(LEGION_THEME):
@@ -536,8 +937,12 @@ def main():
                                 break
                             sec, usec, etype, code, value = struct.unpack("qqHHI", data)
                             
+                            # EV_SYN (etype 0) boundary: reset pending scancode
+                            if etype == 0:
+                                last_scancode = 0
+
                             # EV_MSC (etype 4) captures raw hardware scancode
-                            if etype == 4:
+                            elif etype == 4:
                                 last_scancode = value
 
                             # EV_KEY (etype 1), value 1 = PRESS
@@ -553,32 +958,26 @@ def main():
                                             subprocess.run([LHZ_BIN, "toggle"], check=False)
 
                                 # Fn + L: Display Color Profile Cycle / Configurable Action
-                                elif code == KEY_UNKNOWN_VPC or last_scancode in (SCANCODE_FN_L_A, SCANCODE_FN_L_B):
+                                # Strictly match Fn+L scancodes (0x012c, 0x012b). KEY_UNKNOWN_VPC (240)
+                                # is generic and also emitted by Fn+Up (0x0119), Fn+Down (0x011a), etc.
+                                elif last_scancode in (SCANCODE_FN_L_A, SCANCODE_FN_L_B):
                                     if now - last_fn_l_time > 0.4:
                                         last_fn_l_time = now
-                                        cfg = {}
-                                        try:
-                                            with open(CONFIG_PATH) as _f:
-                                                cfg = json.load(_f)
-                                        except Exception:
-                                            pass
+                                        cfg, _ = load_config()
                                         cfg_l = cfg.get("fn_l") if "fn_l" in cfg else cfg.get("fn_l_command")
                                         default_l = {"action": "cycle", "exec": "lcolor cycle"}
                                         dispatch_hotkey("Fn+L", cfg_l, default_l)
 
                                 # Fn + N: Configurable Launcher / Utility
-                                elif code == KEY_FN_N:
+                                elif code == KEY_FN_N or last_scancode == SCANCODE_FN_N:
                                     if now - last_fn_n_time > 0.4:
                                         last_fn_n_time = now
-                                        cfg = {}
-                                        try:
-                                            with open(CONFIG_PATH) as _f:
-                                                cfg = json.load(_f)
-                                        except Exception:
-                                            pass
+                                        cfg, _ = load_config()
                                         cfg_n = cfg.get("fn_n") if "fn_n" in cfg else cfg.get("fn_n_command")
                                         default_n = {"action": "toggle", "exec": "alacritty -e nvtop", "process": "nvtop"}
                                         dispatch_hotkey("Fn+N", cfg_n, default_n)
+
+                                last_scancode = 0
 
                         except BlockingIOError:
                             break

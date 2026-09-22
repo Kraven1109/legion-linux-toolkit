@@ -14,129 +14,18 @@ import json
 import shutil
 import subprocess
 
-EXPECTED_PANEL_ID = "SDC420B"
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 PROJECT_DIR = os.path.realpath(os.path.join(SCRIPT_DIR, ".."))
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
 
-PROFILES = [
-    {
-        "id": "srgb",
-        "name": "sRGB",
-        "file": "TPLCD_420B_sRGB.icm",
-        "title": "sRGB (Standard Color)",
-        "desc": "Web & Office • Clamped Gamut • Accurate Colors",
-    },
-    {
-        "id": "displayp3",
-        "name": "Display P3",
-        "file": "TPLCD_420B_DisplayP3.icm",
-        "title": "Display P3 (Wide Gamut)",
-        "desc": "Modern Media & Apple Standard • Rich Vibrant Gamut",
-    },
-    {
-        "id": "dcip3",
-        "name": "DCI-P3",
-        "file": "TPLCD_420B_DCIP3.icm",
-        "title": "DCI-P3 (Digital Cinema)",
-        "desc": "Theatrical & Movie Production • DCI Color Space",
-    },
-    {
-        "id": "adobergb",
-        "name": "Adobe RGB",
-        "file": "TPLCD_420B_AdobeRGB.icm",
-        "title": "Adobe RGB (Print & Photo)",
-        "desc": "Expanded Cyan-Green Range • Professional Publishing",
-    },
-    {
-        "id": "rec709",
-        "name": "Rec.709",
-        "file": "TPLCD_420B_REC709.icm",
-        "title": "Rec.709 (HDTV Broadcast)",
-        "desc": "Television & Video Broadcast Standard",
-    },
-    {
-        "id": "native",
-        "name": "Native",
-        "file": "TPLCD_420B_Native.icm",
-        "title": "Native (Full OLED)",
-        "desc": "Unclamped OLED Gamut • Maximum Hardware Color Space",
-    },
-]
-
-def ensure_gui_environment():
-    """Ensures WAYLAND_DISPLAY and DISPLAY exist in os.environ for kscreen-doctor."""
-    if os.environ.get("WAYLAND_DISPLAY") and os.environ.get("DISPLAY"):
-        return
-    uid = os.getuid()
-    runtime_dir = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{uid}")
-    os.environ["XDG_RUNTIME_DIR"] = runtime_dir
-    try:
-        res = subprocess.run(
-            ["systemctl", "--user", "show-environment"],
-            capture_output=True, text=True, timeout=1
-        )
-        if res.returncode == 0:
-            for line in res.stdout.splitlines():
-                if "=" in line:
-                    k, v = line.split("=", 1)
-                    if k in ("WAYLAND_DISPLAY", "DISPLAY", "XDG_CURRENT_DESKTOP", "XDG_SESSION_TYPE", "XAUTHORITY"):
-                        os.environ[k] = v
-    except Exception:
-        pass
-    if not os.environ.get("WAYLAND_DISPLAY"):
-        sockets = [s for s in glob.glob(f"{runtime_dir}/wayland-*") if not s.endswith(".lock")]
-        if sockets:
-            os.environ["WAYLAND_DISPLAY"] = os.path.basename(sorted(sockets)[0])
-    if not os.environ.get("DISPLAY"):
-        os.environ["DISPLAY"] = ":0"
-
-def get_panel_info():
-    """
-    Reads internal eDP display EDID directly from sysfs.
-    Extracts Manufacturer ID (bytes 8-9) and Product Code (bytes 10-11).
-    Returns (hardware_id, edid_sysfs_path) or (None, None).
-    """
-    candidates = sorted(glob.glob("/sys/class/drm/*-eDP-*/edid"))
-    for edid_path in candidates:
-        try:
-            with open(edid_path, "rb") as f:
-                data = f.read()
-            if len(data) >= 128:
-                mfg = int.from_bytes(data[8:10], "big")
-                c1 = chr(((mfg >> 10) & 0x1F) + ord("A") - 1)
-                c2 = chr(((mfg >> 5) & 0x1F) + ord("A") - 1)
-                c3 = chr((mfg & 0x1F) + ord("A") - 1)
-                prod = int.from_bytes(data[10:12], "little")
-                hw_id = f"{c1}{c2}{c3}{prod:04X}"
-                return hw_id, edid_path
-        except Exception:
-            continue
-    return None, None
-
-def get_active_display():
-    """
-    Queries kscreen-doctor -j for the primary connected eDP output.
-    Returns (output_name, current_icc_path).
-    """
-    ensure_gui_environment()
-    if not shutil.which("kscreen-doctor"):
-        return None, None
-    try:
-        proc = subprocess.run(["kscreen-doctor", "-j"], capture_output=True, text=True, check=True)
-        data = json.loads(proc.stdout)
-        outputs = data.get("outputs", [])
-        for out in outputs:
-            if out.get("connected") and out.get("enabled"):
-                name = out.get("name", "")
-                if name.startswith("eDP") or out.get("priority") == 1:
-                    return name, out.get("iccProfilePath") or ""
-        # Fallback to first connected output
-        for out in outputs:
-            if out.get("connected") and out.get("enabled"):
-                return out.get("name", "1"), out.get("iccProfilePath") or ""
-    except Exception as e:
-        print(f"[WARN] Failed to query kscreen-doctor: {e}", file=sys.stderr)
-    return "eDP-1", ""
+from legion_core import (
+    EXPECTED_PANEL_ID,
+    COLOR_PROFILES as PROFILES,
+    ensure_gui_environment,
+    get_panel_info,
+    get_active_display,
+)
 
 def resolve_profile_path(filename):
     """

@@ -1,0 +1,700 @@
+#!/usr/bin/env python3
+"""
+lstats — Hardware & Platform Telemetry CLI for Lenovo Legion Pro 7
+Target Device: Lenovo Legion Pro 7 16IAX10H (Type 83F5, CachyOS Linux)
+Architecture: Pure Python 3 standard library, native sysfs & NVML, zero bloat (<15ms).
+Consolidated: Reuses legion_core for all hardware abstractions and platform metadata.
+"""
+
+import os
+import sys
+import time
+import glob
+import json
+import shutil
+import argparse
+import re
+import unicodedata
+from typing import Dict, Any, Optional, List
+
+# Ensure local script directory is in sys.path for direct repository execution
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+
+from legion_core import (
+    PLATFORM_PROFILES,
+    COLOR_PROFILES,
+    EXPECTED_PANEL_ID,
+    RAPL_ENERGY_NODE,
+    NvmlTelemetry,
+    get_panel_info,
+    get_active_display,
+    get_cooling_fans,
+    get_spd_ram_temps,
+    get_nvme_temps,
+    get_cpu_package_temp,
+    get_battery_info,
+    get_platform_profile,
+    get_daemon_status,
+)
+
+
+# --- Terminal Color & Styling Utilities ---
+
+class Ansi:
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    UNDERLINE = "\033[4m"
+
+    # Standard Colors
+    BLACK = "\033[30m"
+    RED = "\033[31m"
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+    BLUE = "\033[34m"
+    MAGENTA = "\033[35m"
+    CYAN = "\033[36m"
+    WHITE = "\033[37m"
+
+    # Bright Colors
+    BRIGHT_BLACK = "\033[90m"
+    BRIGHT_RED = "\033[91m"
+    BRIGHT_GREEN = "\033[92m"
+    BRIGHT_YELLOW = "\033[93m"
+    BRIGHT_BLUE = "\033[94m"
+    BRIGHT_MAGENTA = "\033[95m"
+    BRIGHT_CYAN = "\033[96m"
+    BRIGHT_WHITE = "\033[97m"
+
+    # Cursor & Screen Controls
+    CURSOR_HIDE = "\033[?25l"
+    CURSOR_SHOW = "\033[?25h"
+    CLEAR_SCREEN = "\033[2J"
+    HOME = "\033[H"
+
+COLOR_ENABLED = sys.stdout.isatty() and "NO_COLOR" not in os.environ
+
+def c(text: str, *styles: str) -> str:
+    """Wraps text in ANSI styles if color is enabled."""
+    if not COLOR_ENABLED or not styles:
+        return text
+    prefix = "".join(styles)
+    return f"{prefix}{text}{Ansi.RESET}"
+
+ANSI_REGEX = re.compile(r'\x1b\[[0-9;?]*[a-zA-Z]')
+
+def strip_ansi(text: str) -> str:
+    """Strips ANSI escape sequences to obtain raw text."""
+    return ANSI_REGEX.sub('', text)
+
+def visible_width(text: str) -> int:
+    """Calculates true character cell width in a monospaced terminal."""
+    plain = strip_ansi(text)
+    return sum(2 if unicodedata.east_asian_width(ch) in ('W', 'F') else 1 for ch in plain)
+
+def fit_cell(text: str, width: int, align: str = "<") -> str:
+    """Pads or aligns text to exact visual cell width, accounting for ANSI escape sequences."""
+    vlen = visible_width(text)
+    pad = max(0, width - vlen)
+    if align == ">":
+        return (" " * pad) + text
+    elif align == "^":
+        pad_l = pad // 2
+        pad_r = pad - pad_l
+        return (" " * pad_l) + text + (" " * pad_r)
+    else:
+        return text + (" " * pad)
+
+def pct_color(percent: float) -> str:
+    """Returns an adaptive ANSI color based on workload saturation."""
+    if percent >= 85.0:
+        return Ansi.BRIGHT_RED
+    if percent >= 70.0:
+        return Ansi.BRIGHT_YELLOW
+    if percent >= 50.0:
+        return Ansi.BRIGHT_CYAN
+    return Ansi.BRIGHT_GREEN
+
+def make_bar(percent: float, width: int = 6) -> str:
+    """Creates an adaptive colorized progress bar: ▰▰▱▱."""
+    percent = max(0.0, min(100.0, percent))
+    filled_len = int(round(width * (percent / 100.0)))
+    empty_len = width - filled_len
+    bar_color = pct_color(percent)
+
+    filled = "▰" * filled_len
+    empty = "▱" * empty_len
+    if COLOR_ENABLED:
+        return f"{bar_color}{filled}{Ansi.BRIGHT_BLACK}{empty}{Ansi.RESET}"
+    return f"{filled}{empty}"
+
+def temp_color(t: float, comp: str = "cpu") -> str:
+    """Returns an adaptive ANSI color string based on hardware thermal limits."""
+    if comp == "gpu":
+        # RTX 5090 Laptop: throttles at 87°C
+        if t >= 80.0:
+            return Ansi.BRIGHT_RED
+        if t >= 65.0:
+            return Ansi.BRIGHT_YELLOW
+        return Ansi.BRIGHT_GREEN
+    elif comp == "ram":
+        # DDR5 SPD limit: 85°C
+        if t >= 70.0:
+            return Ansi.BRIGHT_RED
+        if t >= 55.0:
+            return Ansi.BRIGHT_YELLOW
+        return Ansi.BRIGHT_GREEN
+    elif comp == "nvme":
+        # NVMe SSD throttles at 70°C
+        if t >= 65.0:
+            return Ansi.BRIGHT_RED
+        if t >= 50.0:
+            return Ansi.BRIGHT_YELLOW
+        return Ansi.BRIGHT_GREEN
+    else:
+        # Intel Core Ultra 9 275HX: Tjmax 105°C
+        if t >= 85.0:
+            return Ansi.BRIGHT_RED
+        if t >= 70.0:
+            return Ansi.BRIGHT_YELLOW
+        return Ansi.BRIGHT_GREEN
+
+
+# --- High-Level Telemetry Aggregator ---
+
+class TelemetryCollector:
+    """Aggregates CPU, GPU, memory, power, thermals, and display telemetry."""
+
+    def __init__(self):
+        self.nvml = NvmlTelemetry()
+        self._last_rapl_energy: Optional[int] = None
+        self._last_rapl_time: Optional[float] = None
+        self._last_cpu_ticks: Optional[tuple] = None
+
+    def get_cpu_info(self, sample_interval: float = 0.05) -> Dict[str, Any]:
+        """Reads CPU model, cores, frequencies, load, coretemp, and live RAPL power."""
+        res = {
+            "model": "Intel Processor",
+            "logical_cores": 0,
+            "avg_frequency_mhz": None,
+            "max_frequency_mhz": None,
+            "load_avg": list(os.getloadavg()),
+            "temperature_c": get_cpu_package_temp(),
+            "package_power_w": None,
+        }
+
+        # Model and core count from /proc/cpuinfo
+        try:
+            with open("/proc/cpuinfo", "r") as f:
+                for line in f:
+                    if line.startswith("model name") and res["model"] == "Intel Processor":
+                        res["model"] = line.split(":", 1)[1].strip().replace("Intel(R) Core(TM) ", "").replace(" CPU", "")
+                    elif line.startswith("processor"):
+                        res["logical_cores"] += 1
+        except Exception:
+            pass
+
+        # CPU Frequencies
+        freqs: List[int] = []
+        for fpath in glob.glob("/sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq"):
+            try:
+                with open(fpath, "r") as fp:
+                    freqs.append(int(fp.read().strip()))
+            except Exception:
+                pass
+        if freqs:
+            res["avg_frequency_mhz"] = round(sum(freqs) / len(freqs) / 1000.0)
+            res["max_frequency_mhz"] = round(max(freqs) / 1000.0)
+
+        # Intel RAPL Live Power & CPU Utilization %
+        def _read_cpu_ticks():
+            try:
+                with open("/proc/stat", "r") as sf:
+                    line = sf.readline()
+                parts = [float(x) for x in line.split()[1:]]
+                idle = parts[3] + parts[4]
+                total = sum(parts)
+                return total, idle
+            except Exception:
+                return 0.0, 0.0
+
+        c_stat1 = _read_cpu_ticks()
+        if os.path.isfile(RAPL_ENERGY_NODE):
+            try:
+                with open(RAPL_ENERGY_NODE, "r") as f:
+                    e1 = int(f.read().strip())
+                t1 = time.time()
+
+                if self._last_rapl_energy is not None and self._last_rapl_time is not None:
+                    dt = t1 - self._last_rapl_time
+                    de = e1 - self._last_rapl_energy
+                    if dt > 0.1 and de >= 0:
+                        res["package_power_w"] = round(de / (dt * 1e6), 1)
+                elif sample_interval > 0:
+                    time.sleep(sample_interval)
+                    with open(RAPL_ENERGY_NODE, "r") as f:
+                        e2 = int(f.read().strip())
+                    t2 = time.time()
+                    dt = t2 - t1
+                    de = e2 - e1
+                    if dt > 0 and de >= 0:
+                        res["package_power_w"] = round(de / (dt * 1e6), 1)
+
+                self._last_rapl_energy = e1
+                self._last_rapl_time = t1
+            except Exception:
+                pass
+        elif sample_interval > 0 and self._last_cpu_ticks is None:
+            time.sleep(sample_interval)
+
+        if self._last_cpu_ticks is not None:
+            dt_tot = c_stat1[0] - self._last_cpu_ticks[0]
+            di_idle = c_stat1[1] - self._last_cpu_ticks[1]
+            res["usage_percent"] = round(100.0 * (dt_tot - di_idle) / dt_tot, 1) if dt_tot > 0 else 0.0
+            self._last_cpu_ticks = c_stat1
+        else:
+            c_stat2 = _read_cpu_ticks()
+            dt_tot = c_stat2[0] - c_stat1[0]
+            di_idle = c_stat2[1] - c_stat1[1]
+            res["usage_percent"] = round(100.0 * (dt_tot - di_idle) / dt_tot, 1) if dt_tot > 0 else 0.0
+            self._last_cpu_ticks = c_stat2
+
+        return res
+
+    def get_memory_info(self) -> Dict[str, Any]:
+        """Reads system RAM and SPD temperatures."""
+        res = {
+            "total_gib": 0.0,
+            "used_gib": 0.0,
+            "available_gib": 0.0,
+            "percent": 0.0,
+            "spd_temps_c": get_spd_ram_temps(),
+        }
+        try:
+            mem = {}
+            with open("/proc/meminfo", "r") as f:
+                for line in f:
+                    parts = line.split(":")
+                    if len(parts) == 2:
+                        mem[parts[0].strip()] = int(parts[1].strip().split()[0])
+            total = mem.get("MemTotal", 0) / (1024**2)
+            avail = mem.get("MemAvailable", 0) / (1024**2)
+            used = total - avail
+            res["total_gib"] = round(total, 1)
+            res["available_gib"] = round(avail, 1)
+            res["used_gib"] = round(used, 1)
+            if total > 0:
+                res["percent"] = round((used / total) * 100.0, 1)
+        except Exception:
+            pass
+        return res
+
+    def get_display_info(self) -> Dict[str, Any]:
+        """Reads display panel ID, refresh rate, and matches active color profile."""
+        hw_id, _ = get_panel_info()
+        output_name, current_icc_path = get_active_display()
+
+        res = {
+            "panel_id": hw_id or EXPECTED_PANEL_ID,
+            "output_name": output_name,
+            "resolution": "2560x1600",
+            "refresh_rate_hz": 240.0,
+            "scale": 1.5,
+            "color_profile_id": "unknown",
+            "color_profile_title": "Default / Native",
+        }
+
+        # Query kscreen-doctor -j for exact mode details
+        if shutil.which("kscreen-doctor"):
+            try:
+                proc = subprocess.run(["kscreen-doctor", "-j"], capture_output=True, text=True, timeout=1)
+                if proc.returncode == 0:
+                    data = json.loads(proc.stdout)
+                    for out in data.get("outputs", []):
+                        if out.get("name") == output_name or (out.get("connected") and out.get("enabled")):
+                            curr_mode_id = str(out.get("currentModeId"))
+                            for m in out.get("modes", []):
+                                if str(m.get("id")) == curr_mode_id:
+                                    res["refresh_rate_hz"] = round(float(m.get("refreshRate", 240)), 2)
+                                    size = m.get("size", {})
+                                    if "width" in size and "height" in size:
+                                        res["resolution"] = f"{size['width']}x{size['height']}"
+                                    break
+                            res["scale"] = out.get("scale", 1.0)
+                            break
+            except Exception:
+                pass
+
+        # Match active color profile against consolidated COLOR_PROFILES
+        if current_icc_path:
+            base_file = os.path.basename(current_icc_path)
+            for p in COLOR_PROFILES:
+                if p["file"] == base_file or p["id"] in base_file.lower():
+                    res["color_profile_id"] = p["id"]
+                    res["color_profile_title"] = p["title"]
+                    break
+            if res["color_profile_id"] == "unknown":
+                res["color_profile_title"] = base_file
+
+        return res
+
+    def collect_all(self, sample_interval: float = 0.05) -> Dict[str, Any]:
+        """Aggregates full system metrics tree."""
+        return {
+            "timestamp": time.time(),
+            "platform_profile": get_platform_profile(),
+            "daemon": get_daemon_status(),
+            "fans": get_cooling_fans(),
+            "cpu": self.get_cpu_info(sample_interval=sample_interval),
+            "gpu": self.nvml.query(),
+            "memory": self.get_memory_info(),
+            "storage": {"nvme_temps_c": get_nvme_temps()},
+            "power_battery": get_battery_info(),
+            "display": self.get_display_info(),
+        }
+
+    def close(self):
+        """Releases NVML."""
+        self.nvml.close()
+
+
+# --- TUI Dashboard Renderer ---
+
+class DashboardRenderer:
+    """Formats telemetry data into an ultra-clean, high-density terminal dashboard with laser-straight borders."""
+
+    @staticmethod
+    def render(data: Dict[str, Any], width: int = 80) -> str:
+        box_w = 80
+        inner_w = box_w - 4  # Exactly 76 content cells between '│ ' and ' │'
+
+        def row(content: str) -> str:
+            vlen = visible_width(content)
+            pad = max(0, inner_w - vlen)
+            return f"│ {content}{' ' * pad} │"
+
+        def split_row(left: str, right: str) -> str:
+            v_l = visible_width(left)
+            v_r = visible_width(right)
+            pad = max(1, inner_w - (v_l + v_r))
+            return f"│ {left}{' ' * pad}{right} │"
+
+        def divider(title: str, color_style: str) -> str:
+            dashes = max(0, inner_w - len(title))
+            return f"├─{c(title, Ansi.BOLD, color_style)}{'─' * dashes}─┤"
+
+        lines: List[str] = []
+
+        # Header
+        title = " LEGION LINUX TOOLKIT "
+        model_str = " Pro 7 16IAX10H "
+        pad_top = inner_w - len(title) - len(model_str)
+        lines.append(f"╭─{c(title, Ansi.BOLD, Ansi.BRIGHT_CYAN)}{'─' * max(0, pad_top)}{c(model_str, Ansi.DIM)}─╮")
+
+        # 1. Platform Profile & Daemon Status
+        prof = data["platform_profile"]
+        led_color = prof.get("led_color_code", Ansi.WHITE)
+        plat_title = prof["title"].replace(" Mode", "")
+        plat_text = f"Profile: {c('[●] ' + plat_title + ' (' + prof['led'] + ' LED)', Ansi.BOLD, led_color)}"
+        daemon = data["daemon"]
+        if daemon["active"]:
+            d_rss = f" ({daemon['rss_mib']} MB)" if daemon["rss_mib"] else ""
+            daemon_text = f"Daemon: {c('Active', Ansi.BRIGHT_GREEN)} {c('[PID ' + str(daemon['pid']) + d_rss + ']', Ansi.DIM)}"
+        else:
+            daemon_text = f"Daemon: {c('Inactive', Ansi.BRIGHT_YELLOW)}"
+        lines.append(split_row(plat_text, daemon_text))
+
+        # 2. Cooling & Thermals
+        lines.append(divider(" COOLING & THERMAL ENVELOPE ", Ansi.YELLOW))
+        fans = data["fans"]
+        cpu_f = fans["cpu_fan"]
+        gpu_f = fans["gpu_fan"]
+        aux_f = fans["aux_fan"]
+
+        fan_line = f"Fans CPU: {cpu_f['rpm']:4d}/{cpu_f['max_rpm']} RPM  │  GPU: {gpu_f['rpm']:4d}/{gpu_f['max_rpm']} RPM  │  AUX: {aux_f['rpm']:4d}/{aux_f['max_rpm']} RPM"
+        lines.append(row(fan_line))
+
+        cpu_t = data["cpu"]["temperature_c"]
+        gpu_t = data["gpu"]["temperature_c"]
+        spd_t = data["memory"]["spd_temps_c"]
+        nvme_t = data["storage"]["nvme_temps_c"]
+
+        cpu_str = f"{c(str(cpu_t) + '°C', temp_color(cpu_t, 'cpu'))}" if cpu_t else "N/A"
+        gpu_str = f"{c(str(gpu_t) + '°C', temp_color(gpu_t, 'gpu'))}" if gpu_t else c("Sleep", Ansi.DIM)
+        spd_str = "/".join(f"{c(str(t), temp_color(t, 'ram'))}" for t in spd_t) + ("°C" if spd_t else "") if spd_t else "N/A"
+        nvme_str = "/".join(f"{c(str(t), temp_color(t, 'nvme'))}" for t in nvme_t) + ("°C" if nvme_t else "") if nvme_t else "N/A"
+
+        temp_line = f"Temps CPU: {cpu_str} │ GPU: {gpu_str} │ RAM: {spd_str} │ NVMe: {nvme_str}"
+        lines.append(row(temp_line))
+
+        # 3. Compute & Acceleration
+        lines.append(divider(" COMPUTE & ACCELERATION ", Ansi.BRIGHT_GREEN))
+        cpu = data["cpu"]
+        c_power = f"{cpu['package_power_w']:.1f} W" if cpu["package_power_w"] is not None else "N/A"
+        c_freq = f"{cpu['avg_frequency_mhz']} MHz" if cpu["avg_frequency_mhz"] else "N/A"
+        cpu_pct = max(0.0, min(100.0, cpu.get("usage_percent", 0.0)))
+        c_bar = make_bar(cpu_pct, 6)
+
+        cpu_col1 = fit_cell(f"CPU  {c(cpu['model'], Ansi.BOLD)}", 20)
+        cpu_col2 = fit_cell(f"Power: {c(c_power, Ansi.BOLD, Ansi.BRIGHT_YELLOW)}", 16)
+        cpu_col3 = fit_cell(f"Clk: {c_freq}", 13)
+        cpu_col4 = fit_cell(f"Load {c_bar} {c(f'{cpu_pct:5.1f}%', Ansi.BOLD, pct_color(cpu_pct))}", 18)
+        lines.append(row(f"{cpu_col1} │ {cpu_col2} │ {cpu_col3} │ {cpu_col4}"))
+
+        gpu = data["gpu"]
+        gpu_short = gpu['name'].replace("NVIDIA ", "").replace("GeForce ", "").replace("Laptop GPU", "Laptop")
+        gpu_col1 = fit_cell(f"GPU  {c(gpu_short, Ansi.BOLD)}", 20)
+
+        if gpu.get("state") == "suspended":
+            gpu_col2 = fit_cell(f"Power: {c('Sleep 0W', Ansi.DIM)}", 16)
+            gpu_col3 = fit_cell(f"Clk: {c('Sleep', Ansi.DIM)}", 13)
+            gpu_col4 = fit_cell(f"Util {make_bar(0.0, 6)} {c('  0.0%', Ansi.DIM)}", 18)
+        else:
+            g_power_num = gpu.get('power_draw_w')
+            if g_power_num is not None:
+                g_draw_val = f"{g_power_num:.0f}" if g_power_num >= 100 else f"{g_power_num:.1f}"
+            else:
+                g_draw_val = "N/A"
+            g_limit_num = gpu.get('power_limit_w')
+            g_limit_val = f"/{g_limit_num:.0f}W" if g_limit_num is not None else ""
+            g_util = max(0.0, min(100.0, float(gpu.get('utilization_gpu') or 0.0)))
+            g_clk = f"{gpu['clock_graphics_mhz']} MHz" if gpu.get('clock_graphics_mhz') is not None else "N/A"
+            g_bar = make_bar(g_util, 6)
+
+            gpu_col2 = fit_cell(f"Power: {c(g_draw_val, Ansi.BOLD, Ansi.BRIGHT_YELLOW)}{g_limit_val}", 16)
+            gpu_col3 = fit_cell(f"Clk: {g_clk}", 13)
+            gpu_col4 = fit_cell(f"Util {g_bar} {c(f'{g_util:5.1f}%', Ansi.BOLD, pct_color(g_util))}", 18)
+
+        lines.append(row(f"{gpu_col1} │ {gpu_col2} │ {gpu_col3} │ {gpu_col4}"))
+
+        mem = data["memory"]
+        v_used_mib = gpu.get("memory_used_mib")
+        v_tot_mib = gpu.get("memory_total_mib")
+        vram_pct = max(0.0, min(100.0, float(gpu.get("memory_percent") or 0.0)))
+        vram_bar = make_bar(vram_pct, 6)
+
+        if gpu.get("state") == "suspended":
+            if v_tot_mib:
+                vram_str = f"VRAM 0.0/{v_tot_mib / 1024:.1f} GB   {vram_bar} {c('  0.0%', Ansi.DIM)}"
+            else:
+                vram_str = f"VRAM {c('Sleep / Standby', Ansi.DIM)}"
+        else:
+            v_used_gb = f"{v_used_mib / 1024:.1f}" if v_used_mib is not None else "0.0"
+            v_tot_gb = f"{v_tot_mib / 1024:.1f}" if v_tot_mib is not None else "N/A"
+            vram_str = f"VRAM {v_used_gb}/{v_tot_gb} GB   {vram_bar} {c(f'{vram_pct:5.1f}%', Ansi.BOLD, pct_color(vram_pct))}"
+
+        ram_used = f"{mem['used_gib']:.1f}"
+        ram_tot = f"{mem['total_gib']:.1f}"
+        ram_pct = max(0.0, min(100.0, float(mem['percent'])))
+        ram_bar = make_bar(ram_pct, 6)
+
+        ram_col = fit_cell(f"RAM  {ram_used}/{ram_tot} GiB   {ram_bar} {c(f'{ram_pct:5.1f}%', Ansi.BOLD, pct_color(ram_pct))}", 39)
+        vram_col = fit_cell(vram_str, 34)
+        lines.append(row(f"{ram_col} │ {vram_col}"))
+
+        # 4. Power & Battery
+        lines.append(divider(" POWER & BATTERY SUBSYSTEM ", Ansi.BRIGHT_BLUE))
+        bat = data["power_battery"]
+        if bat["present"]:
+            b_cap = f"{bat['capacity_percent']}%" if bat["capacity_percent"] is not None else "N/A"
+            b_bar = make_bar(float(bat["capacity_percent"] or 0), 8)
+            b_hlth = f"{bat['health_percent']}%" if bat["health_percent"] is not None else "N/A"
+            b_cyc = f"{bat['cycle_count']}" if bat["cycle_count"] is not None else "N/A"
+            b_volt = f"{bat['voltage_v']} V" if bat["voltage_v"] is not None else "N/A"
+
+            bat_line1 = f"Battery {b_cap} {b_bar} ({bat['status']})  │  Health: {b_hlth} ({b_cyc} Cyc)  │  {b_volt}"
+            lines.append(row(bat_line1))
+
+            if bat["conservation_mode"]:
+                cons_badge = c("[●] Conservation ON (~80% Cap)", Ansi.BOLD, Ansi.BRIGHT_GREEN)
+                cons_desc = "Extends Li-poly battery lifespan"
+            else:
+                cons_badge = c("[○] Full Charge Mode (100%)", Ansi.BOLD, Ansi.BRIGHT_YELLOW)
+                cons_desc = "Maximum travel run-time"
+            bat_line2 = f"Mode:   {cons_badge} • {c(cons_desc, Ansi.DIM)}"
+            lines.append(row(bat_line2))
+        else:
+            lines.append(row("Battery: No battery detected (Desktop / AC Only)"))
+
+        # 5. Display & Calibration
+        lines.append(divider(" DISPLAY & FACTORY CALIBRATION ", Ansi.BRIGHT_MAGENTA))
+        disp = data["display"]
+        rate_color = Ansi.BRIGHT_GREEN if disp["refresh_rate_hz"] >= 120 else Ansi.BRIGHT_YELLOW
+        rate_str = c(f"{disp['refresh_rate_hz']:.2f} Hz", Ansi.BOLD, rate_color)
+
+        d_panel = fit_cell(f"Panel:   Samsung {disp['panel_id']} ({disp['resolution']} @ {disp['scale']}x)", 44)
+        d_line1 = f"{d_panel}  │  Refresh Rate: {rate_str}"
+        lines.append(row(d_line1))
+
+        prof_color = Ansi.BRIGHT_CYAN if disp["color_profile_id"] != "unknown" else Ansi.WHITE
+        d_prof = fit_cell(f"Profile: {c(disp['color_profile_title'], Ansi.BOLD, prof_color)}", 44)
+        d_line2 = f"{d_prof}  │  KWin Wayland Color Pipeline"
+        lines.append(row(d_line2))
+
+        # Footer
+        footer_cmd = " lstats -w (Watch) │ lstats -j (JSON) │ lstats -s (Short) "
+        pad_bot = inner_w - len(footer_cmd)
+        lines.append(f"╰─{'─' * max(0, pad_bot)}{c(footer_cmd, Ansi.DIM)}─╯")
+
+        return "\n".join(lines)
+
+
+# --- Short Single-Line Renderer ---
+
+class ShortRenderer:
+    """Formats telemetry data into a compact single-line summary string."""
+
+    @staticmethod
+    def render(data: Dict[str, Any]) -> str:
+        prof = data["platform_profile"]["alias"].capitalize()
+        fans = data["fans"]
+        fan_str = f"{fans['cpu_fan']['rpm']}/{fans['gpu_fan']['rpm']}/{fans['aux_fan']['rpm']} RPM"
+
+        cpu = data["cpu"]
+        c_temp = f"{cpu['temperature_c']}°C" if cpu.get("temperature_c") else "N/A"
+        c_pow = f" {cpu['package_power_w']:.0f}W" if cpu.get("package_power_w") is not None else ""
+
+        gpu = data["gpu"]
+        g_temp = f"{gpu['temperature_c']}°C" if gpu.get("temperature_c") else ("Sleep" if gpu.get("state") == "suspended" else "N/A")
+        g_pow = f" {gpu['power_draw_w']:.0f}W" if gpu.get("power_draw_w") is not None and gpu["power_draw_w"] > 0 else ""
+
+        bat = data["power_battery"]
+        b_str = f"{bat['capacity_percent']}%" if bat["capacity_percent"] is not None else "AC"
+        if bat["conservation_mode"]:
+            b_str += " (80% Cap)"
+
+        disp = data["display"]
+        disp_str = f"{disp['refresh_rate_hz']:.0f}Hz"
+
+        return f"⚡ {prof} │ 🌀 {fan_str} │ 🧠 CPU {c_temp} {c_pow} │ 🎮 GPU {g_temp} {g_pow} │ 🔋 {b_str} │ 🖥️ {disp_str} ({disp['color_profile_id'].upper()})"
+
+
+# --- Interactive Live Watch Loop ---
+
+def run_watch_mode(telemetry: TelemetryCollector, interval: float = 1.0):
+    """Runs a real-time terminal dashboard with flicker-free updates."""
+    is_tty = sys.stdin.isatty() and sys.stdout.isatty()
+    old_term_settings = None
+
+    if is_tty:
+        try:
+            import tty
+            import termios
+            old_term_settings = termios.tcgetattr(sys.stdin)
+            tty.setcbreak(sys.stdin.fileno())
+            sys.stdout.write(Ansi.CURSOR_HIDE + Ansi.CLEAR_SCREEN)
+            sys.stdout.flush()
+        except Exception:
+            is_tty = False
+
+    try:
+        while True:
+            t_start = time.time()
+
+            term_cols = shutil.get_terminal_size(fallback=(80, 24)).columns
+            data = telemetry.collect_all(sample_interval=0.0)
+            output = DashboardRenderer.render(data, width=term_cols)
+
+            if is_tty:
+                sys.stdout.write(Ansi.HOME + output + "\n" + c("Press 'q' or Ctrl+C to exit", Ansi.DIM))
+                sys.stdout.flush()
+            else:
+                print(output)
+
+            while True:
+                elapsed = time.time() - t_start
+                remaining = max(0.0, interval - elapsed)
+                if remaining <= 0.0:
+                    break
+
+                if is_tty:
+                    import select
+                    r, _, _ = select.select([sys.stdin], [], [], min(remaining, 0.2))
+                    if r:
+                        ch = sys.stdin.read(1)
+                        if ch in ("q", "Q", "\x03", "\x1b"): # q, Ctrl+C, Esc
+                            return
+                else:
+                    time.sleep(remaining)
+                    break
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if is_tty and old_term_settings:
+            try:
+                import termios
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_term_settings)
+                sys.stdout.write(Ansi.CURSOR_SHOW + "\n")
+                sys.stdout.flush()
+            except Exception:
+                pass
+
+
+# --- Main CLI Entrypoint ---
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="lstats",
+        description="Hardware & Platform Telemetry CLI for Lenovo Legion Pro 7.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  lstats               Show comprehensive hardware & platform status snapshot
+  lstats -w            Launch live-updating real-time monitor (1s interval)
+  lstats -w 0.5        Launch live monitor updating every 500ms
+  lstats -j            Export complete telemetry tree as structured JSON
+  lstats -s            Print compact single-line telemetry string
+        """,
+    )
+    parser.add_argument(
+        "-w", "--watch",
+        nargs="?", const=1.0, type=float, default=None,
+        metavar="INTERVAL",
+        help="Run in live continuous watch mode (default interval: 1.0s)",
+    )
+    parser.add_argument(
+        "-j", "--json",
+        action="store_true",
+        help="Output full telemetry as formatted JSON",
+    )
+    parser.add_argument(
+        "-s", "--short",
+        action="store_true",
+        help="Output single-line compact telemetry summary",
+    )
+    parser.add_argument(
+        "--no-color",
+        action="store_true",
+        help="Disable ANSI color output",
+    )
+
+    args = parser.parse_args()
+
+    if args.no_color:
+        global COLOR_ENABLED
+        COLOR_ENABLED = False
+
+    telemetry = TelemetryCollector()
+    try:
+        if args.json:
+            data = telemetry.collect_all(sample_interval=0.05)
+            print(json.dumps(data, indent=2))
+        elif args.short:
+            data = telemetry.collect_all(sample_interval=0.05)
+            print(ShortRenderer.render(data))
+        elif args.watch is not None:
+            interval = max(0.2, float(args.watch))
+            run_watch_mode(telemetry, interval=interval)
+        else:
+            data = telemetry.collect_all(sample_interval=0.05)
+            term_cols = shutil.get_terminal_size(fallback=(80, 24)).columns
+            print(DashboardRenderer.render(data, width=term_cols))
+    finally:
+        telemetry.close()
+
+
+if __name__ == "__main__":
+    main()

@@ -7,6 +7,12 @@
  *   RIGHT: border: 1px;  +  border-color: @color;  ← always split
  */
 
+configuration {
+    hover-select:       true;
+    me-select-entry:    "";
+    me-accept-entry:    "MousePrimary";
+}
+
 /* ── Palette (all #RRGGBBAA 8-digit hex for alpha support) ─────────────── */
 * {
     bg-window:      #0d0b12f5;   /* 96% opaque deep-black glass              */

@@ -11,31 +11,17 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo "📦 Installing CLI tools to ~/.local/bin/..."
 mkdir -p "$HOME/.local/bin"
 cp -v "$DIR"/bin/* "$HOME/.local/bin/"
-chmod +x "$HOME"/.local/bin/{lbat,lmode,lhz,lcolor,legion-profile-osd,test-hotkey}
+chmod +x "$HOME"/.local/bin/{lbat,lmode,lhz,lcolor,lstats,legion-profile-osd,test-hotkey}
 
 # 2. Deploy default configuration (only if not already present)
-echo "⚙️  Ensuring ~/.config/legion/config.json exists..."
+echo "⚙️  Ensuring ~/.config/legion/config.jsonc exists..."
 mkdir -p "$HOME/.config/legion"
-if [[ ! -f "$HOME/.config/legion/config.json" ]]; then
-    cat > "$HOME/.config/legion/config.json" << 'JSONEOF'
-{
-  "copilot_tap": "alacritty",
-  "copilot_candidates": [
-    { "key": "1", "name": "Terminal (Konsole)",      "exec": "konsole" },
-    { "key": "2", "name": "KRunner Search",          "exec": "krunner" },
-    { "key": "3", "name": "Screenshot (Spectacle)",  "exec": "spectacle -r" }
-  ],
-  "fn_n": {
-    "action": "toggle",
-    "exec": "alacritty -e nvtop",
-    "process": "nvtop"
-  },
-  "fn_l": {
-    "action": "cycle",
-    "exec": "lcolor cycle"
-  }
-}
-JSONEOF
+if [[ ! -f "$HOME/.config/legion/config.jsonc" && ! -f "$HOME/.config/legion/config.json" ]]; then
+    if [[ -f "$DIR/config/config.example.jsonc" ]]; then
+        cp -v "$DIR/config/config.example.jsonc" "$HOME/.config/legion/config.jsonc"
+    fi
+else
+    echo "   Skipped: ~/.config/legion configuration already exists"
 fi
 
 # 3. Deploy SVG badges & Color Profiles
@@ -98,6 +84,7 @@ echo "   - lbat         : Battery Conservation (~80% cap / 100% full)"
 echo "   - lmode        : Power & Thermal Profiles (Quiet, Balanced, Perf, Extreme)"
 echo "   - lhz          : Display Refresh Rate (240Hz / 60Hz)"
 echo "   - lcolor       : Display Color Profile Manager (sRGB, Display P3, DCI-P3...)"
+echo "   - lstats       : Hardware & Platform Telemetry CLI (Live Dashboard)"
 echo "   - Fn + Q       : Hardware 3-mode power loop + OSD banner"
 echo "   - Fn + R       : Hardware refresh rate toggle + OSD banner"
 echo "   - Fn + L       : Display color profile cycle (EDID-validated) + OSD banner"

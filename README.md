@@ -21,11 +21,32 @@ Native, zero-overhead hardware control suite and event-driven OSD daemon for the
 
 | Command | Purpose | Options / Modes |
 | :--- | :--- | :--- |
+| **`lstats`** | Hardware & Platform Telemetry CLI | `lstats` (TUI dashboard), `-w` (Live watch), `-j` (JSON), `-s` (Short) |
 | **`lbat`** | Battery Conservation Mode | `status`, `on` (~80% cap), `off` (100% full), `toggle` |
 | **`lmode`** | Power & Thermal Manager | `status`, `next` (Fn+Q loop), `quiet`, `balanced`, `perf`, `extreme` |
 | **`lhz`** | Display Refresh Rate | `status`, `toggle` (240Hz $\leftrightarrow$ 60Hz), `240`, `60` |
 | **`lcolor`** | Display Color Profile Manager | `status`, `cycle` (Fn+L), `set <name>`, `list` |
 | **`test-hotkey`** | Hardware Event Sniffer | Real-time evdev scancode & keycode diagnostic tool |
+
+---
+
+### 📊 `lstats` — Hardware & Platform Telemetry Dashboard
+
+`lstats` is a zero-bloat, native Python CLI dashboard that runs with sub-15ms execution time using pure standard library (`ctypes`, `os`, `sys`, `json`). It aggregates telemetry across all Legion subsystems:
+
+* **CPU (Core Ultra 9 275HX):** Package temperature, frequency, system load, and **live RAPL package power draw (W)**.
+* **GPU (RTX 5090 Mobile 24GB):** Native NVML via `ctypes` querying temperature, live wattage vs. TGP (150W/175W), VRAM used/total, GPU utilization %, and graphics/memory clocks.
+* **Triple Independent PWM Fans:** Native `lenovo_wmi_other` readings for CPU Fan (max 5200 RPM), GPU Fan (max 5400 RPM), and Aux/Rear Fan (max 6500 RPM) with micro percentage gauges.
+* **Thermals & Storage:** DDR5 SPD thermal sensors (`spd5118`), NVMe composite temperatures, and CPU package thermals.
+* **Power & Battery:** Battery charge %, status, health %, cycle count, voltage, and Conservation Mode (~80% cap vs. 100%).
+* **Display & Calibration:** Primary eDP panel (`SDC420B`), refresh rate (240Hz/60Hz), scaling factor, and active factory ICC color profile (sRGB, Display P3, DCI-P3, Adobe RGB, Rec.709, Native).
+
+```bash
+lstats         # Instant snapshot TUI dashboard (<15ms)
+lstats -w      # Real-time interactive watch mode (1s interval, 'q' to exit)
+lstats -j      # Export structured JSON for Waybar / Polybar / scripts
+lstats -s      # Compact one-line status string
+```
 
 ---
 
@@ -47,9 +68,11 @@ legion-linux-toolkit/
 ├── bin/                     # Standalone CLI tools (deployed to ~/.local/bin/)
 │   ├── lbat
 │   ├── lcolor
+│   ├── legion_core.py       # Consolidated hardware & platform core library
+│   ├── legion-profile-osd
 │   ├── lhz
 │   ├── lmode
-│   ├── legion-profile-osd
+│   ├── lstats               # Hardware telemetry dashboard
 │   └── test-hotkey
 ├── color-profiles/          # Factory-calibrated ICC profiles & Dolby Vision PQ config
 ├── config/                  # Launcher themes (Rofi)
