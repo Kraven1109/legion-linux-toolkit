@@ -240,13 +240,13 @@ def get_related_pids(pids):
             pass
     return list(related)
 
-def find_process_pids(proc_name, match_type="auto"):
+def find_process_pids(proc_name, match_type="auto", is_inner_payload=False):
     """
     Finds PIDs for a process name:
     1. Tries exact comm match (pgrep -x).
     2. If not found or if match_type == 'full', tries full cmdline match (pgrep -f),
        reliably handling interpreted scripts (Python, Bash, Node) while excluding
-       the daemon itself and zombie processes.
+       the daemon itself, zombie processes, and wrapper terminal emulators.
     """
     if not proc_name:
         return []
@@ -273,6 +273,11 @@ def find_process_pids(proc_name, match_type="auto"):
         if pid == my_pid:
             continue
         try:
+            with open(f"/proc/{pid}/comm", "r") as f:
+                comm = f.read().strip().lower()
+            if is_inner_payload and comm in TERMINAL_COMM_NAMES:
+                # Do not match the terminal emulator wrapper itself when querying for an inner payload
+                continue
             with open(f"/proc/{pid}/stat", "r") as f:
                 stat_str = f.read()
             rparen = stat_str.rfind(")")
@@ -752,9 +757,9 @@ def dispatch_hotkey(hotkey_label, cfg_entry, default_entry):
 
         target_proc = inner_target or proc_name or (entry.get("name", "").strip() if isinstance(entry, dict) else None) or (os.path.basename(args[-1]) if args else "")
 
-        pids = find_process_pids(target_proc, match_type=match_type)
+        pids = find_process_pids(target_proc, match_type=match_type, is_inner_payload=bool(inner_target))
         if not pids and proc_name and proc_name != target_proc:
-            pids = find_process_pids(proc_name, match_type=match_type)
+            pids = find_process_pids(proc_name, match_type=match_type, is_inner_payload=bool(inner_target))
 
         if pids:
             on_active = "close"

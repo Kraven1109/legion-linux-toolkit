@@ -22,6 +22,14 @@ SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
+# Set Linux process comm name to 'lstats' for accurate kernel process tracking
+try:
+    import ctypes
+    libc = ctypes.CDLL("libc.so.6")
+    libc.prctl(15, b"lstats", 0, 0, 0)
+except Exception:
+    pass
+
 from legion_core import (
     PLATFORM_PROFILES,
     COLOR_PROFILES,
