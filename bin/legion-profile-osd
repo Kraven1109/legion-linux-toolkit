@@ -179,7 +179,7 @@ def run_executable(cmd_str, source_name="Copilot", env_extra=None):
                 for k, v in env_extra.items():
                     launcher_cmd.append(f"--setenv={k}={v}")
             launcher_cmd.extend(["--", *args])
-            subprocess.Popen(
+            proc = subprocess.Popen(
                 launcher_cmd,
                 start_new_session=True,
                 stdout=subprocess.DEVNULL,
@@ -187,14 +187,14 @@ def run_executable(cmd_str, source_name="Copilot", env_extra=None):
                 env=full_env
             )
         else:
-            subprocess.Popen(args, start_new_session=True, env=full_env)
+            proc = subprocess.Popen(args, start_new_session=True, env=full_env)
         print(f"[{source_name}] Executed successfully: {cmd_str}", flush=True)
-        return True
+        return proc.pid
     except Exception as e:
         errmsg = f"Launch failed: {e}\nCommand: {cmd_str}"
         print(f"[{source_name}] {errmsg}", flush=True)
         send_error_osd(f"{source_name} — Launch Error", errmsg)
-        return False
+        return None
 
 def get_related_pids(pids):
     """
@@ -424,8 +424,10 @@ def get_idle_terminals(proc_name="alacritty"):
     from /etc/shells and currently truly idle at prompt:
     1. Child is in /etc/shells (excludes nvtop, btop, etc.).
     2. Child is not in zombie state.
-    3. tpgid == child_pid (foreground of terminal pty).
-    4. Child argv matches interactive allowlist (excludes -c, scripts, etc.).
+    3. tpgid == child_pid (controlling terminal foreground is the shell itself).
+    4. Shell wchan is not waiting on a child process (do_wait, wait4, waitid, sigsuspend).
+    5. Shell has NO living child processes running in foreground or sharing shell pgrp.
+    6. Child argv matches interactive allowlist (excludes -c, scripts, etc.).
     Returns list of dicts: [{"term_pid": pid, "shell_pid": cpid}, ...]
     """
     idle_entries = []
@@ -458,7 +460,7 @@ def get_idle_terminals(proc_name="alacritty"):
             if not children:
                 continue
 
-            # 3. Inspect children: must be a valid shell from /etc/shells AND tpgid == child_pid
+            # 3. Inspect children: must be a valid shell from /etc/shells AND truly idle at prompt
             for cpid in children:
                 try:
                     with open(f"/proc/{cpid}/comm", "r") as f:
@@ -474,9 +476,45 @@ def get_idle_terminals(proc_name="alacritty"):
 
                     tpgid = int(sh_after[5])
                     if tpgid != cpid:
-                        continue
+                        continue  # Terminal pty foreground owned by child process -> BUSY
 
-                    # Filter out non-interactive shells via allowlist
+                    # 4. Check kernel wait-channel: if waiting on children/signals, shell is NOT at prompt
+                    try:
+                        with open(f"/proc/{cpid}/wchan", "r") as wf:
+                            wchan = wf.read().strip()
+                        if any(w in wchan for w in ("do_wait", "wait4", "waitid", "sigsuspend")):
+                            continue  # Blocked waiting on child process -> BUSY
+                    except Exception:
+                        pass
+
+                    # 5. Check if shell has any living children in foreground or shell pgrp
+                    has_running_child = False
+                    for tc in glob.glob(f"/proc/{cpid}/task/*/children"):
+                        try:
+                            with open(tc, "r") as cf:
+                                sh_kids = [int(x) for x in cf.read().split() if x.isdigit()]
+                            for k in sh_kids:
+                                try:
+                                    with open(f"/proc/{k}/stat", "r") as kf:
+                                        kst = kf.read()
+                                    kafter = kst[kst.rfind(")") + 2:].split()
+                                    if kafter[0] != "Z":  # Living, non-zombie child
+                                        kpgrp = int(kafter[2])
+                                        ktpgid = int(kafter[5])
+                                        if ktpgid == tpgid or kpgrp == tpgid or kpgrp == cpid:
+                                            has_running_child = True
+                                            break
+                                except Exception:
+                                    pass
+                            if has_running_child:
+                                break
+                        except Exception:
+                            pass
+
+                    if has_running_child:
+                        continue  # Shell is actively holding a command -> BUSY
+
+                    # 6. Filter out non-interactive shells via allowlist
                     with open(f"/proc/{cpid}/cmdline", "rb") as f:
                         raw = f.read().split(b"\x00")
                     sh_args = [a.decode("utf-8", errors="ignore") for a in raw if a]
@@ -637,17 +675,8 @@ def dispatch_hotkey(hotkey_label, cfg_entry, default_entry):
             else:
                 spawn_cmd = cmd
 
-            try:
-                proc = subprocess.Popen(
-                    shlex.split(spawn_cmd),
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    start_new_session=True
-                )
-                _pending_spawn_pid = proc.pid
-                print(f"[{hotkey_label}] Spawned terminal PID {proc.pid}: {spawn_cmd}", flush=True)
-            except Exception as e:
-                print(f"[{hotkey_label}] Failed to spawn {spawn_cmd}: {e}", flush=True)
+            spawn_pid = run_executable(spawn_cmd, source_name=hotkey_label)
+            _pending_spawn_pid = spawn_pid
         return
 
     if action == "toggle":
@@ -878,6 +907,10 @@ def find_keyboard_fd():
 
 def main():
     ensure_gui_environment()
+    try:
+        signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+    except Exception:
+        pass
     poller = select.poll()
 
     # 1. Register ACPI platform_profile for Fn+Q & lmode
