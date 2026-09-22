@@ -572,10 +572,43 @@ class ShortRenderer:
 
 
 def get_user_shell() -> str:
-    """Resolves the user's preferred interactive shell."""
+    """
+    Resolves the user's active shell preference adhering to system and terminal settings:
+    1. Parent process shell: if lstats was launched inside an existing shell session (zsh, bash, fish, etc.)
+    2. Terminal configuration: if running in Alacritty (~/.config/alacritty/alacritty.toml)
+    3. User login shell: $SHELL / /etc/passwd
+    """
+    # 1. If launched from an interactive shell, return that exact shell
+    try:
+        ppid = os.getppid()
+        if ppid > 1:
+            pcomm = open(f"/proc/{ppid}/comm").read().strip().lower()
+            if pcomm in ("zsh", "bash", "fish", "dash", "sh"):
+                pexe = os.path.realpath(f"/proc/{ppid}/exe")
+                if os.path.exists(pexe) and os.access(pexe, os.X_OK):
+                    return pexe
+    except Exception:
+        pass
+
+    # 2. Check terminal configuration (e.g. Alacritty custom shell)
+    try:
+        alacritty_cfg = os.path.expanduser("~/.config/alacritty/alacritty.toml")
+        if os.path.exists(alacritty_cfg):
+            with open(alacritty_cfg, "r", encoding="utf-8") as f:
+                for line in f:
+                    if "program" in line and "=" in line:
+                        val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                        if os.path.exists(val) and os.access(val, os.X_OK):
+                            return val
+    except Exception:
+        pass
+
+    # 3. Check environment $SHELL
     shell = os.environ.get("SHELL")
     if shell and os.path.exists(shell) and os.access(shell, os.X_OK):
         return shell
+
+    # 4. Check user record in /etc/passwd
     try:
         import pwd
         pw_shell = pwd.getpwuid(os.getuid()).pw_shell
@@ -583,7 +616,8 @@ def get_user_shell() -> str:
             return pw_shell
     except Exception:
         pass
-    for fallback in ("/bin/fish", "/bin/zsh", "/bin/bash", "/bin/sh"):
+
+    for fallback in ("/usr/bin/zsh", "/bin/zsh", "/usr/bin/fish", "/bin/fish", "/bin/bash", "/bin/sh"):
         if os.path.exists(fallback) and os.access(fallback, os.X_OK):
             return fallback
     return "/bin/sh"
