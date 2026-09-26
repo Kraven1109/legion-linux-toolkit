@@ -12,6 +12,7 @@ import time
 import glob
 import json
 import shutil
+import subprocess
 import argparse
 import re
 import unicodedata
@@ -37,7 +38,7 @@ from legion_core import (
     RAPL_ENERGY_NODE,
     NvmlTelemetry,
     get_panel_info,
-    get_active_display,
+    get_active_display_info,
     get_cooling_fans,
     get_spd_ram_temps,
     get_nvme_temps,
@@ -302,40 +303,20 @@ class TelemetryCollector:
     def get_display_info(self) -> Dict[str, Any]:
         """Reads display panel ID, refresh rate, and matches active color profile."""
         hw_id, _ = get_panel_info()
-        output_name, current_icc_path = get_active_display()
+        disp_info = get_active_display_info()
 
         res = {
             "panel_id": hw_id or EXPECTED_PANEL_ID,
-            "output_name": output_name,
-            "resolution": "2560x1600",
-            "refresh_rate_hz": 240.0,
-            "scale": 1.5,
+            "output_name": disp_info.get("output_name", "eDP-1"),
+            "resolution": disp_info.get("resolution", "2560x1600"),
+            "refresh_rate_hz": disp_info.get("refresh_rate_hz", 240.0),
+            "scale": disp_info.get("scale", 1.5),
             "color_profile_id": "unknown",
             "color_profile_title": "Default / Native",
         }
 
-        # Query kscreen-doctor -j for exact mode details
-        if shutil.which("kscreen-doctor"):
-            try:
-                proc = subprocess.run(["kscreen-doctor", "-j"], capture_output=True, text=True, timeout=1)
-                if proc.returncode == 0:
-                    data = json.loads(proc.stdout)
-                    for out in data.get("outputs", []):
-                        if out.get("name") == output_name or (out.get("connected") and out.get("enabled")):
-                            curr_mode_id = str(out.get("currentModeId"))
-                            for m in out.get("modes", []):
-                                if str(m.get("id")) == curr_mode_id:
-                                    res["refresh_rate_hz"] = round(float(m.get("refreshRate", 240)), 2)
-                                    size = m.get("size", {})
-                                    if "width" in size and "height" in size:
-                                        res["resolution"] = f"{size['width']}x{size['height']}"
-                                    break
-                            res["scale"] = out.get("scale", 1.0)
-                            break
-            except Exception:
-                pass
-
         # Match active color profile against consolidated COLOR_PROFILES
+        current_icc_path = disp_info.get("icc_profile_path", "")
         if current_icc_path:
             base_file = os.path.basename(current_icc_path)
             for p in COLOR_PROFILES:

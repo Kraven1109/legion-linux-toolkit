@@ -220,31 +220,82 @@ def get_panel_info() -> Tuple[Optional[str], Optional[str]]:
     return None, None
 
 
-def get_active_display() -> Tuple[str, str]:
+def get_active_display_info() -> Dict[str, Any]:
     """
     Queries kscreen-doctor -j for the primary connected eDP output.
-    Returns (output_name, current_icc_path).
+    Returns dictionary with:
+      - output_name: str (e.g. 'eDP-1')
+      - icc_profile_path: str
+      - refresh_rate_hz: float (e.g. 60.0 or 240.0)
+      - resolution: str (e.g. '2560x1600')
+      - scale: float (e.g. 1.5)
     """
     ensure_gui_environment()
+    res = {
+        "output_name": "eDP-1",
+        "icc_profile_path": "",
+        "refresh_rate_hz": 240.0,
+        "resolution": "2560x1600",
+        "scale": 1.5,
+    }
     if not shutil.which("kscreen-doctor"):
-        return "eDP-1", ""
+        return res
 
     try:
         proc = subprocess.run(["kscreen-doctor", "-j"], capture_output=True, text=True, timeout=1)
-        data = json.loads(proc.stdout)
-        outputs = data.get("outputs", [])
-        for out in outputs:
-            if out.get("connected") and out.get("enabled"):
-                name = out.get("name", "")
-                if name.startswith("eDP") or out.get("priority") == 1:
-                    return name, out.get("iccProfilePath") or ""
-        for out in outputs:
-            if out.get("connected") and out.get("enabled"):
-                return out.get("name", "1"), out.get("iccProfilePath") or ""
+        if proc.returncode == 0:
+            data = json.loads(proc.stdout)
+            outputs = data.get("outputs", [])
+            target = None
+            for out in outputs:
+                if out.get("connected") and out.get("enabled"):
+                    name = out.get("name", "")
+                    if name.startswith("eDP") or out.get("priority") == 1:
+                        target = out
+                        break
+            if not target:
+                for out in outputs:
+                    if out.get("connected") and out.get("enabled"):
+                        target = out
+                        break
+
+            if target:
+                res["output_name"] = target.get("name", "eDP-1")
+                res["icc_profile_path"] = target.get("iccProfilePath") or ""
+                res["scale"] = float(target.get("scale", 1.5))
+
+                curr_mode_id = str(target.get("currentModeId"))
+                for m in target.get("modes", []):
+                    if str(m.get("id")) == curr_mode_id:
+                        res["refresh_rate_hz"] = round(float(m.get("refreshRate", 240)), 2)
+                        size = m.get("size", {})
+                        if "width" in size and "height" in size:
+                            res["resolution"] = f"{size['width']}x{size['height']}"
+                        break
     except Exception:
         pass
 
-    return "eDP-1", ""
+    # Fast regex fallback from kscreen-doctor -o if refresh rate is still unparsed
+    if shutil.which("kscreen-doctor"):
+        try:
+            proc_o = subprocess.run(["kscreen-doctor", "-o"], capture_output=True, text=True, timeout=1)
+            if proc_o.returncode == 0:
+                m = re.search(r"@([0-9.]+)\*", proc_o.stdout)
+                if m:
+                    res["refresh_rate_hz"] = round(float(m.group(1)), 2)
+        except Exception:
+            pass
+
+    return res
+
+
+def get_active_display() -> Tuple[str, str]:
+    """
+    Queries kscreen-doctor for the primary connected eDP output.
+    Returns (output_name, current_icc_path).
+    """
+    info = get_active_display_info()
+    return info["output_name"], info["icc_profile_path"]
 
 
 def get_conservation_mode() -> Tuple[bool, str]:
