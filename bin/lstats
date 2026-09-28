@@ -302,12 +302,16 @@ class TelemetryCollector:
 
     def get_display_info(self) -> Dict[str, Any]:
         """Reads display panel ID, refresh rate, and matches active color profile."""
-        hw_id, _ = get_panel_info()
         disp_info = get_active_display_info()
 
         res = {
-            "panel_id": hw_id or EXPECTED_PANEL_ID,
             "output_name": disp_info.get("output_name", "eDP-1"),
+            "is_internal": disp_info.get("is_internal", True),
+            "vendor": disp_info.get("vendor", "Samsung"),
+            "model": disp_info.get("model", EXPECTED_PANEL_ID),
+            "hw_id": disp_info.get("hw_id", EXPECTED_PANEL_ID),
+            "panel_id": disp_info.get("hw_id", EXPECTED_PANEL_ID),
+            "display_title": disp_info.get("display_title", f"Samsung {EXPECTED_PANEL_ID}"),
             "resolution": disp_info.get("resolution", "2560x1600"),
             "refresh_rate_hz": disp_info.get("refresh_rate_hz", 240.0),
             "scale": disp_info.get("scale", 1.5),
@@ -513,13 +517,21 @@ class DashboardRenderer:
         rate_color = Ansi.BRIGHT_GREEN if disp["refresh_rate_hz"] >= 120 else Ansi.BRIGHT_YELLOW
         rate_str = c(f"{disp['refresh_rate_hz']:.2f} Hz", Ansi.BOLD, rate_color)
 
-        d_panel = fit_cell(f"Panel:   Samsung {disp['panel_id']} ({disp['resolution']} @ {disp['scale']}x)", 44)
+        label = "Panel:  " if disp.get("is_internal", True) else "Display:"
+        d_panel = fit_cell(f"{label} {disp['display_title']} ({disp['resolution']} @ {disp['scale']}x)", 44)
         d_line1 = f"{d_panel}  │  Refresh Rate: {rate_str}"
         lines.append(row(d_line1))
 
-        prof_color = Ansi.BRIGHT_CYAN if disp["color_profile_id"] != "unknown" else Ansi.WHITE
-        d_prof = fit_cell(f"Profile: {c(disp['color_profile_title'], Ansi.BOLD, prof_color)}", 44)
-        d_line2 = f"{d_prof}  │  KWin Wayland Color Pipeline"
+        if disp.get("is_internal", True):
+            prof_color = Ansi.BRIGHT_CYAN if disp["color_profile_id"] != "unknown" else Ansi.WHITE
+            d_prof = fit_cell(f"Profile: {c(disp['color_profile_title'], Ansi.BOLD, prof_color)}", 44)
+            d_line2 = f"{d_prof}  │  KWin Wayland Color Pipeline"
+        else:
+            ext_prof = disp.get("color_profile_title")
+            if ext_prof in ("Default / Native", "unknown"):
+                ext_prof = "Standard / Uncalibrated"
+            d_prof = fit_cell(f"Profile: {c(ext_prof, Ansi.BOLD, Ansi.WHITE)}", 44)
+            d_line2 = f"{d_prof}  │  External Output ({disp['output_name']})"
         lines.append(row(d_line2))
 
         # Footer
@@ -556,8 +568,9 @@ class ShortRenderer:
 
         disp = data["display"]
         disp_str = f"{disp['refresh_rate_hz']:.0f}Hz"
+        badge = disp["color_profile_id"].upper() if disp.get("is_internal", True) else disp.get("output_name", "EXT")
 
-        return f"⚡ {prof} │ 🌀 {fan_str} │ 🧠 CPU {c_temp} {c_pow} │ 🎮 GPU {g_temp} {g_pow} │ 🔋 {b_str} │ 🖥️ {disp_str} ({disp['color_profile_id'].upper()})"
+        return f"⚡ {prof} │ 🌀 {fan_str} │ 🧠 CPU {c_temp} {c_pow} │ 🎮 GPU {g_temp} {g_pow} │ 🔋 {b_str} │ 🖥️ {disp_str} ({badge})"
 
 
 def get_user_shell() -> str:

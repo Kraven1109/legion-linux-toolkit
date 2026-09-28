@@ -220,19 +220,102 @@ def get_panel_info() -> Tuple[Optional[str], Optional[str]]:
     return None, None
 
 
+# Common 3-letter PNP Manufacturer IDs for external monitors
+PNP_MANUFACTURERS: Dict[str, str] = {
+    "SDC": "Samsung",
+    "SAM": "Samsung",
+    "DEL": "Dell",
+    "GSM": "LG",
+    "LGD": "LG",
+    "ACR": "Acer",
+    "AUS": "ASUS",
+    "ASU": "ASUS",
+    "BNQ": "BenQ",
+    "LEN": "Lenovo",
+    "AOC": "AOC",
+    "MSI": "MSI",
+    "SNY": "Sony",
+    "HPN": "HP",
+    "HWP": "HP",
+    "GIG": "Gigabyte",
+    "VSC": "ViewSonic",
+    "PHL": "Philips",
+}
+
+
+def parse_edid(data: bytes) -> Optional[Dict[str, str]]:
+    """
+    Parses a 128+ byte EDID binary structure.
+    Extracts 3-letter PNP Manufacturer ID, product code, model name (type 0xFC/0xFE),
+    and friendly display title.
+    """
+    if len(data) < 128:
+        return None
+    try:
+        mfg = int.from_bytes(data[8:10], "big")
+        c1 = chr(((mfg >> 10) & 0x1F) + ord("A") - 1)
+        c2 = chr(((mfg >> 5) & 0x1F) + ord("A") - 1)
+        c3 = chr((mfg & 0x1F) + ord("A") - 1)
+        mfg_code = f"{c1}{c2}{c3}"
+        prod = int.from_bytes(data[10:12], "little")
+        hw_id = f"{mfg_code}{prod:04X}"
+        vendor_name = PNP_MANUFACTURERS.get(mfg_code, mfg_code)
+
+        model_name = None
+        for offset in (54, 72, 90, 108):
+            desc = data[offset : offset + 18]
+            if desc[:3] == b"\x00\x00\x00" and desc[3] in (0xFC, 0xFE):
+                try:
+                    name_cand = desc[5:].split(b"\x0a")[0].decode("ascii", errors="ignore").strip()
+                    if name_cand:
+                        model_name = name_cand
+                        if desc[3] == 0xFC:
+                            break
+                except Exception:
+                    pass
+
+        # For known internal Legion panel, standardize on Samsung SDC420B
+        if mfg_code == "SDC" and hw_id == "SDC420B":
+            display_title = "Samsung SDC420B"
+        elif model_name:
+            display_title = f"{vendor_name} {model_name}"
+        else:
+            display_title = f"{vendor_name} {hw_id}"
+
+        return {
+            "mfg_code": mfg_code,
+            "vendor": vendor_name,
+            "hw_id": hw_id,
+            "model": model_name or hw_id,
+            "display_title": display_title,
+        }
+    except Exception:
+        return None
+
+
 def get_active_display_info() -> Dict[str, Any]:
     """
-    Queries kscreen-doctor -j for the primary connected eDP output.
+    Queries kscreen-doctor -j for the primary connected and enabled output.
     Returns dictionary with:
-      - output_name: str (e.g. 'eDP-1')
+      - output_name: str (eDP-1, DP-3, etc.)
+      - is_internal: bool (True for eDP-1)
+      - vendor: str (Samsung, LG, Dell, etc.)
+      - model: str
+      - hw_id: str
+      - display_title: str
       - icc_profile_path: str
-      - refresh_rate_hz: float (e.g. 60.0 or 240.0)
-      - resolution: str (e.g. '2560x1600')
-      - scale: float (e.g. 1.5)
+      - refresh_rate_hz: float
+      - resolution: str
+      - scale: float
     """
     ensure_gui_environment()
     res = {
         "output_name": "eDP-1",
+        "is_internal": True,
+        "vendor": "Samsung",
+        "model": EXPECTED_PANEL_ID,
+        "hw_id": EXPECTED_PANEL_ID,
+        "display_title": f"Samsung {EXPECTED_PANEL_ID}",
         "icc_profile_path": "",
         "refresh_rate_hz": 240.0,
         "resolution": "2560x1600",
@@ -261,6 +344,7 @@ def get_active_display_info() -> Dict[str, Any]:
 
             if target:
                 res["output_name"] = target.get("name", "eDP-1")
+                res["is_internal"] = res["output_name"].startswith("eDP")
                 res["icc_profile_path"] = target.get("iccProfilePath") or ""
                 res["scale"] = float(target.get("scale", 1.5))
 
@@ -274,6 +358,28 @@ def get_active_display_info() -> Dict[str, Any]:
                         break
     except Exception:
         pass
+
+    # Read connector-specific EDID to resolve real vendor and model name
+    edid_matches = glob.glob(f"/sys/class/drm/*-{res['output_name']}/edid")
+    edid_info = None
+    if edid_matches:
+        try:
+            with open(edid_matches[0], "rb") as f:
+                edid_info = parse_edid(f.read())
+        except Exception:
+            pass
+
+    if edid_info:
+        res["vendor"] = edid_info["vendor"]
+        res["model"] = edid_info["model"]
+        res["hw_id"] = edid_info["hw_id"]
+        res["display_title"] = edid_info["display_title"]
+    else:
+        if not res["is_internal"]:
+            res["vendor"] = "External"
+            res["model"] = res["output_name"]
+            res["hw_id"] = res["output_name"]
+            res["display_title"] = f"External ({res['output_name']})"
 
     # Fast regex fallback from kscreen-doctor -o if refresh rate is still unparsed
     if shutil.which("kscreen-doctor"):
