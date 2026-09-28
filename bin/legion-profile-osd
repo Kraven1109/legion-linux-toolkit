@@ -29,6 +29,7 @@ import threading
 import re
 import tempfile
 import signal
+import socket
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 if SCRIPT_DIR not in sys.path:
@@ -93,6 +94,43 @@ def reap_zombies():
                 break
     except OSError:
         pass
+
+def check_external_displays_connected() -> bool:
+    """Checks sysfs to determine if any non-eDP DRM display connector is currently connected."""
+    for p in glob.glob("/sys/class/drm/*-*/status"):
+        if "-eDP-" not in p:
+            try:
+                with open(p, "r") as f:
+                    if f.read().strip() == "connected":
+                        return True
+            except Exception:
+                pass
+    return False
+
+def handle_drm_hotplug():
+    """
+    Called when an external display disconnect is detected.
+    Restarts plasma-powerdevil.service after a brief settling delay to rebind
+    KDE Plasma 6's backlight controller back to the internal panel.
+    """
+    def _worker():
+        time.sleep(1.0)
+        ensure_gui_environment()
+        try:
+            res = subprocess.run(
+                ["systemctl", "--user", "restart", "plasma-powerdevil.service"],
+                capture_output=True,
+                timeout=5,
+            )
+            if res.returncode == 0:
+                print("[DISPLAY] External monitor unplugged: successfully restarted plasma-powerdevil to rebind backlight", flush=True)
+            else:
+                print(f"[DISPLAY] Notice: plasma-powerdevil restart returned code {res.returncode}", flush=True)
+        except Exception as e:
+            print(f"[DISPLAY] Failed to restart plasma-powerdevil: {e}", flush=True)
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
 
 def parse_jsonc(text):
     """
@@ -1026,6 +1064,18 @@ def main():
     else:
         print("[INIT] Notice: ITE Keyboard node not accessible without read permissions.", flush=True)
 
+    # 4. Register DRM Uevent Netlink socket for display hotplug/unplug auto-recovery
+    nl_sock = None
+    last_external_connected = check_external_displays_connected()
+    try:
+        nl_sock = socket.socket(socket.AF_NETLINK, socket.SOCK_DGRAM, 15)  # 15 = NETLINK_KOBJECT_UEVENT
+        nl_sock.bind((0, 1))  # Multicast group 1 (kernel uevents)
+        nl_sock.setblocking(False)
+        poller.register(nl_sock.fileno(), select.POLLIN | select.POLLERR)
+        print(f"[INIT] Successfully hooked kernel DRM hotplug uevents (external display: {last_external_connected})", flush=True)
+    except Exception as e:
+        print(f"[INIT] Notice: Could not bind DRM netlink socket: {e}", flush=True)
+
     last_toggle_time = 0
     last_fn_l_time = 0
     last_fn_n_time = 0
@@ -1142,6 +1192,29 @@ def main():
                         except Exception as e:
                             print(f"[COPILOT] Unexpected read error: {e}", flush=True)
                             break
+
+                # Handle DRM Kernel Uevents (Display Hotplug / Unplug)
+                elif nl_sock and fd == nl_sock.fileno():
+                    has_drm_event = False
+                    while True:
+                        try:
+                            data = nl_sock.recv(4096)
+                            if not data:
+                                break
+                            if b"SUBSYSTEM=drm" in data:
+                                has_drm_event = True
+                        except BlockingIOError:
+                            break
+                        except Exception:
+                            break
+
+                    if has_drm_event:
+                        curr_external = check_external_displays_connected()
+                        # Detect transition: external display was unplugged
+                        if last_external_connected and not curr_external:
+                            print("[DISPLAY] DRM event: External display unplugged ➔ recovering PowerDevil backlight", flush=True)
+                            handle_drm_hotplug()
+                        last_external_connected = curr_external
 
     except KeyboardInterrupt:
         sys.exit(0)

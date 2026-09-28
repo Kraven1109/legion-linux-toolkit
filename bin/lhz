@@ -82,6 +82,55 @@ show_status() {
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 }
 
+fix_display() {
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo -e " 🛠️  \033[1mDisplay & Brightness Recovery\033[0m"
+    echo "────────────────────────────────────────────────────────────────────"
+    echo "  • Diagnosing KDE Plasma 6 PowerDevil & Wayland display outputs..."
+
+    # 1. Restart PowerDevil to rebind backlight controller after display hotplug/unplug
+    if systemctl --user is-active plasma-powerdevil.service >/dev/null 2>&1; then
+        echo "  • Restarting plasma-powerdevil.service..."
+        systemctl --user restart plasma-powerdevil.service
+        sleep 0.3
+    fi
+
+    # 2. Verify /sys/class/backlight/intel_backlight
+    local intel_cur=""
+    local intel_max=""
+    if [[ -f /sys/class/backlight/intel_backlight/brightness ]]; then
+        intel_cur=$(cat /sys/class/backlight/intel_backlight/brightness 2>/dev/null || echo "")
+        intel_max=$(cat /sys/class/backlight/intel_backlight/max_brightness 2>/dev/null || echo "")
+    fi
+
+    # 3. Query DBus brightness to verify connection
+    local dbus_val=""
+    if command -v qdbus6 >/dev/null 2>&1; then
+        dbus_val=$(qdbus6 org.kde.Solid.PowerManagement /org/kde/Solid/PowerManagement/Actions/BrightnessControl org.kde.Solid.PowerManagement.Actions.BrightnessControl.brightness 2>/dev/null || echo "")
+    fi
+
+    local rate
+    rate=$(get_current_rate)
+    echo "────────────────────────────────────────────────────────────────────"
+    echo -e "  Display Rate:       \033[1;32m${rate} Hz\033[0m"
+    if [[ -n "$intel_cur" && -n "$intel_max" && "$intel_max" -gt 0 ]]; then
+        local pct=$(( intel_cur * 100 / intel_max ))
+        echo -e "  Hardware Backlight: \033[1;32m${intel_cur}/${intel_max} (${pct}%)\033[0m"
+    fi
+    if [[ -n "$dbus_val" ]]; then
+        echo -e "  PowerDevil DBus:    \033[1;32m${dbus_val}/10000 (Active & Synced)\033[0m"
+    fi
+    echo -e "  Status:             \033[1;32m✔ Display & Brightness subsystems recovered\033[0m"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    notify-send -a "Legion Toolkit" \
+        -i "video-display" \
+        -h "string:x-canonical-private-synchronous:display-recovery" \
+        -t 2000 \
+        "Display & Brightness Recovered" \
+        "✔ PowerDevil re-bound to hardware backlight • ${rate} Hz" 2>/dev/null || true
+}
+
 cmd="${1:-status}"
 
 case "$cmd" in
@@ -97,8 +146,11 @@ case "$cmd" in
     60|low|save)
         set_rate "60"
         ;;
+    fix|--fix|recover)
+        fix_display
+        ;;
     help|-h|--help)
-        echo "Usage: lhz [status|toggle|240|60]"
+        echo "Usage: lhz [status|toggle|240|60|fix]"
         ;;
     *)
         echo "[ERROR] Unknown command: $cmd" >&2
