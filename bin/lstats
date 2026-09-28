@@ -301,8 +301,27 @@ class TelemetryCollector:
         return res
 
     def get_display_info(self) -> Dict[str, Any]:
-        """Reads display panel ID, refresh rate, and matches active color profile."""
+        """Reads display panel ID, refresh rate, and matches active color profiles for all displays."""
         disp_info = get_active_display_info()
+
+        def _resolve_profile(icc_path: str, is_int: bool):
+            if not icc_path:
+                return "unknown", "Default / Native" if is_int else "Standard / Uncalibrated"
+            base_file = os.path.basename(icc_path)
+            for p in COLOR_PROFILES:
+                if p["file"] == base_file or p["id"] in base_file.lower():
+                    return p["id"], p["title"]
+            return "unknown", base_file
+
+        prof_id, prof_title = _resolve_profile(disp_info.get("icc_profile_path", ""), disp_info.get("is_internal", True))
+
+        all_displays = []
+        for d in disp_info.get("displays", []):
+            d_copy = dict(d)
+            d_prof_id, d_prof_title = _resolve_profile(d.get("icc_profile_path", ""), d.get("is_internal", True))
+            d_copy["color_profile_id"] = d_prof_id
+            d_copy["color_profile_title"] = d_prof_title
+            all_displays.append(d_copy)
 
         res = {
             "output_name": disp_info.get("output_name", "eDP-1"),
@@ -315,21 +334,12 @@ class TelemetryCollector:
             "resolution": disp_info.get("resolution", "2560x1600"),
             "refresh_rate_hz": disp_info.get("refresh_rate_hz", 240.0),
             "scale": disp_info.get("scale", 1.5),
-            "color_profile_id": "unknown",
-            "color_profile_title": "Default / Native",
+            "color_profile_id": prof_id,
+            "color_profile_title": prof_title,
+            "display_mode": disp_info.get("display_mode", "single"),
+            "count": disp_info.get("count", len(all_displays) or 1),
+            "displays": all_displays,
         }
-
-        # Match active color profile against consolidated COLOR_PROFILES
-        current_icc_path = disp_info.get("icc_profile_path", "")
-        if current_icc_path:
-            base_file = os.path.basename(current_icc_path)
-            for p in COLOR_PROFILES:
-                if p["file"] == base_file or p["id"] in base_file.lower():
-                    res["color_profile_id"] = p["id"]
-                    res["color_profile_title"] = p["title"]
-                    break
-            if res["color_profile_id"] == "unknown":
-                res["color_profile_title"] = base_file
 
         return res
 
@@ -511,28 +521,63 @@ class DashboardRenderer:
         else:
             lines.append(row("Battery: No battery detected (Desktop / AC Only)"))
 
-        # 5. Display & Calibration
-        lines.append(divider(" DISPLAY & FACTORY CALIBRATION ", Ansi.BRIGHT_MAGENTA))
+        # 5. Display & Calibration (Supports Single, Extended, and Mirrored)
         disp = data["display"]
-        rate_color = Ansi.BRIGHT_GREEN if disp["refresh_rate_hz"] >= 120 else Ansi.BRIGHT_YELLOW
-        rate_str = c(f"{disp['refresh_rate_hz']:.2f} Hz", Ansi.BOLD, rate_color)
+        d_count = disp.get("count", 1)
+        d_mode = disp.get("display_mode", "single")
 
-        label = "Panel:  " if disp.get("is_internal", True) else "Display:"
-        d_panel = fit_cell(f"{label} {disp['display_title']} ({disp['resolution']} @ {disp['scale']}x)", 44)
-        d_line1 = f"{d_panel}  │  Refresh Rate: {rate_str}"
-        lines.append(row(d_line1))
-
-        if disp.get("is_internal", True):
-            prof_color = Ansi.BRIGHT_CYAN if disp["color_profile_id"] != "unknown" else Ansi.WHITE
-            d_prof = fit_cell(f"Profile: {c(disp['color_profile_title'], Ansi.BOLD, prof_color)}", 44)
-            d_line2 = f"{d_prof}  │  KWin Wayland Color Pipeline"
+        if d_count > 1 and d_mode == "extended":
+            lines.append(divider(f" DISPLAYS & CALIBRATION (EXTENDED {d_count}X) ", Ansi.BRIGHT_MAGENTA))
+        elif d_count > 1 and d_mode == "mirrored":
+            lines.append(divider(" DISPLAYS & CALIBRATION (MIRRORED / CLONE) ", Ansi.BRIGHT_MAGENTA))
         else:
-            ext_prof = disp.get("color_profile_title")
-            if ext_prof in ("Default / Native", "unknown"):
-                ext_prof = "Standard / Uncalibrated"
-            d_prof = fit_cell(f"Profile: {c(ext_prof, Ansi.BOLD, Ansi.WHITE)}", 44)
-            d_line2 = f"{d_prof}  │  External Output ({disp['output_name']})"
-        lines.append(row(d_line2))
+            lines.append(divider(" DISPLAY & FACTORY CALIBRATION ", Ansi.BRIGHT_MAGENTA))
+
+        if d_count > 1 and "displays" in disp and len(disp["displays"]) > 1:
+            for idx, d in enumerate(disp["displays"], start=1):
+                d_rate = d["refresh_rate_hz"]
+                r_color = Ansi.BRIGHT_GREEN if d_rate >= 120 else Ansi.BRIGHT_YELLOW
+                r_str = c(f"{d_rate:.2f} Hz", Ansi.BOLD, r_color)
+
+                out_tag = f"[{idx}] {d['output_name']}:"
+                title_str = fit_cell(f"{out_tag} {d['display_title']} ({d['resolution']} @ {d['scale']}x)", 44)
+
+                if d_mode == "mirrored":
+                    role = "Primary Source" if d.get("is_primary") else "Mirror Clone"
+                    r_badge = c(role, Ansi.BOLD, Ansi.BRIGHT_CYAN if d.get("is_primary") else Ansi.BRIGHT_YELLOW)
+                    d_row = f"{title_str}  │  {r_str} • {r_badge}"
+                else:
+                    if d.get("is_internal"):
+                        prof_color = Ansi.BRIGHT_CYAN if d.get("color_profile_id") != "unknown" else Ansi.WHITE
+                        prof_text = c(d.get("color_profile_title", "Native"), Ansi.BOLD, prof_color)
+                        d_row = f"{title_str}  │  {r_str} • {prof_text}"
+                    else:
+                        ext_p = d.get("color_profile_title", "External")
+                        if ext_p in ("Default / Native", "unknown"):
+                            ext_p = "Standard"
+                        d_row = f"{title_str}  │  {r_str} • {c(ext_p, Ansi.DIM)}"
+
+                lines.append(row(d_row))
+        else:
+            rate_color = Ansi.BRIGHT_GREEN if disp["refresh_rate_hz"] >= 120 else Ansi.BRIGHT_YELLOW
+            rate_str = c(f"{disp['refresh_rate_hz']:.2f} Hz", Ansi.BOLD, rate_color)
+
+            label = "Panel:  " if disp.get("is_internal", True) else "Display:"
+            d_panel = fit_cell(f"{label} {disp['display_title']} ({disp['resolution']} @ {disp['scale']}x)", 44)
+            d_line1 = f"{d_panel}  │  Refresh Rate: {rate_str}"
+            lines.append(row(d_line1))
+
+            if disp.get("is_internal", True):
+                prof_color = Ansi.BRIGHT_CYAN if disp["color_profile_id"] != "unknown" else Ansi.WHITE
+                d_prof = fit_cell(f"Profile: {c(disp['color_profile_title'], Ansi.BOLD, prof_color)}", 44)
+                d_line2 = f"{d_prof}  │  KWin Wayland Color Pipeline"
+            else:
+                ext_prof = disp.get("color_profile_title")
+                if ext_prof in ("Default / Native", "unknown"):
+                    ext_prof = "Standard / Uncalibrated"
+                d_prof = fit_cell(f"Profile: {c(ext_prof, Ansi.BOLD, Ansi.WHITE)}", 44)
+                d_line2 = f"{d_prof}  │  External Output ({disp['output_name']})"
+            lines.append(row(d_line2))
 
         # Footer
         footer_cmd = " lstats -w (Watch) │ lstats -j (JSON) │ lstats -s (Short) "
@@ -567,10 +612,25 @@ class ShortRenderer:
             b_str += " (80% Cap)"
 
         disp = data["display"]
-        disp_str = f"{disp['refresh_rate_hz']:.0f}Hz"
-        badge = disp["color_profile_id"].upper() if disp.get("is_internal", True) else disp.get("output_name", "EXT")
+        d_count = disp.get("count", 1)
+        d_mode = disp.get("display_mode", "single")
 
-        return f"⚡ {prof} │ 🌀 {fan_str} │ 🧠 CPU {c_temp} {c_pow} │ 🎮 GPU {g_temp} {g_pow} │ 🔋 {b_str} │ 🖥️ {disp_str} ({badge})"
+        if d_count > 1 and "displays" in disp and len(disp["displays"]) > 1:
+            if d_mode == "mirrored":
+                rates = " ⇄ ".join(f"{d['refresh_rate_hz']:.0f}Hz" for d in disp["displays"])
+                disp_summary = f"{rates} (Mirror)"
+            else:
+                parts = []
+                for d in disp["displays"]:
+                    tag = d["output_name"]
+                    parts.append(f"{d['refresh_rate_hz']:.0f}Hz ({tag})")
+                disp_summary = " + ".join(parts)
+        else:
+            disp_str = f"{disp['refresh_rate_hz']:.0f}Hz"
+            badge = disp["color_profile_id"].upper() if disp.get("is_internal", True) else disp.get("output_name", "EXT")
+            disp_summary = f"{disp_str} ({badge})"
+
+        return f"⚡ {prof} │ 🌀 {fan_str} │ 🧠 CPU {c_temp} {c_pow} │ 🎮 GPU {g_temp} {g_pow} │ 🔋 {b_str} │ 🖥️ {disp_summary}"
 
 
 def get_user_shell() -> str:

@@ -295,22 +295,21 @@ def parse_edid(data: bytes) -> Optional[Dict[str, str]]:
 
 def get_active_display_info() -> Dict[str, Any]:
     """
-    Queries kscreen-doctor -j for the primary connected and enabled output.
+    Queries kscreen-doctor -j for all connected and enabled outputs.
+    Supports single-display, extended multi-display, and mirrored/cloned setups.
     Returns dictionary with:
-      - output_name: str (eDP-1, DP-3, etc.)
-      - is_internal: bool (True for eDP-1)
-      - vendor: str (Samsung, LG, Dell, etc.)
-      - model: str
-      - hw_id: str
-      - display_title: str
-      - icc_profile_path: str
-      - refresh_rate_hz: float
-      - resolution: str
-      - scale: float
+      - display_mode: 'single' | 'extended' | 'mirrored'
+      - count: int (number of active displays)
+      - displays: List[Dict[str, Any]] (per-display metadata)
+      - output_name, is_internal, vendor, model, hw_id, display_title,
+        icc_profile_path, refresh_rate_hz, resolution, scale (primary display flattened)
     """
     ensure_gui_environment()
-    res = {
+    default_disp = {
         "output_name": "eDP-1",
+        "id": 1,
+        "priority": 1,
+        "is_primary": True,
         "is_internal": True,
         "vendor": "Samsung",
         "model": EXPECTED_PANEL_ID,
@@ -320,78 +319,109 @@ def get_active_display_info() -> Dict[str, Any]:
         "refresh_rate_hz": 240.0,
         "resolution": "2560x1600",
         "scale": 1.5,
+        "pos": {"x": 0, "y": 0},
+        "replication_source": 0,
     }
+
     if not shutil.which("kscreen-doctor"):
+        res = dict(default_disp)
+        res["display_mode"] = "single"
+        res["count"] = 1
+        res["displays"] = [default_disp]
         return res
+
+    active_displays: List[Dict[str, Any]] = []
+    display_mode = "single"
 
     try:
         proc = subprocess.run(["kscreen-doctor", "-j"], capture_output=True, text=True, timeout=1)
         if proc.returncode == 0:
             data = json.loads(proc.stdout)
             outputs = data.get("outputs", [])
-            target = None
-            for out in outputs:
-                if out.get("connected") and out.get("enabled"):
-                    name = out.get("name", "")
-                    if name.startswith("eDP") or out.get("priority") == 1:
-                        target = out
-                        break
-            if not target:
-                for out in outputs:
-                    if out.get("connected") and out.get("enabled"):
-                        target = out
-                        break
+            active_outs = [o for o in outputs if o.get("connected") and o.get("enabled")]
 
-            if target:
-                res["output_name"] = target.get("name", "eDP-1")
-                res["is_internal"] = res["output_name"].startswith("eDP")
-                res["icc_profile_path"] = target.get("iccProfilePath") or ""
-                res["scale"] = float(target.get("scale", 1.5))
+            # Detect display mode: mirrored if any clone/replicationSource exists, else extended
+            if len(active_outs) > 1:
+                is_mirrored = any(
+                    o.get("replicationSource") or o.get("clones")
+                    for o in active_outs
+                )
+                display_mode = "mirrored" if is_mirrored else "extended"
 
-                curr_mode_id = str(target.get("currentModeId"))
-                for m in target.get("modes", []):
+            for out in active_outs:
+                out_name = out.get("name", "eDP-1")
+                is_internal = out_name.startswith("eDP")
+                d_info = {
+                    "output_name": out_name,
+                    "id": out.get("id"),
+                    "priority": out.get("priority", 99),
+                    "is_primary": out.get("priority") == 1 or (is_internal and out.get("priority") is None),
+                    "is_internal": is_internal,
+                    "vendor": "Samsung" if is_internal else "External",
+                    "model": EXPECTED_PANEL_ID if is_internal else out_name,
+                    "hw_id": EXPECTED_PANEL_ID if is_internal else out_name,
+                    "display_title": f"Samsung {EXPECTED_PANEL_ID}" if is_internal else f"External ({out_name})",
+                    "icc_profile_path": out.get("iccProfilePath") or "",
+                    "scale": float(out.get("scale", 1.0)),
+                    "pos": out.get("pos", {"x": 0, "y": 0}),
+                    "replication_source": out.get("replicationSource", 0),
+                    "refresh_rate_hz": 240.0 if is_internal else 60.0,
+                    "resolution": "2560x1600" if is_internal else "1920x1080",
+                }
+
+                # Find mode details
+                curr_mode_id = str(out.get("currentModeId"))
+                for m in out.get("modes", []):
                     if str(m.get("id")) == curr_mode_id:
-                        res["refresh_rate_hz"] = round(float(m.get("refreshRate", 240)), 2)
+                        d_info["refresh_rate_hz"] = round(float(m.get("refreshRate", 240)), 2)
                         size = m.get("size", {})
-                        if "width" in size and "height" in size:
-                            res["resolution"] = f"{size['width']}x{size['height']}"
+                        w = size.get("width")
+                        h = size.get("height")
+                        if w and h:
+                            d_info["resolution"] = f"{w}x{h}"
                         break
+
+                # Resolve EDID for this connector
+                edid_matches = glob.glob(f"/sys/class/drm/*-{out_name}/edid")
+                if edid_matches:
+                    try:
+                        with open(edid_matches[0], "rb") as f:
+                            edid_parsed = parse_edid(f.read())
+                        if edid_parsed:
+                            d_info["vendor"] = edid_parsed["vendor"]
+                            d_info["model"] = edid_parsed["model"]
+                            d_info["hw_id"] = edid_parsed["hw_id"]
+                            d_info["display_title"] = edid_parsed["display_title"]
+                    except Exception:
+                        pass
+
+                active_displays.append(d_info)
     except Exception:
         pass
 
-    # Read connector-specific EDID to resolve real vendor and model name
-    edid_matches = glob.glob(f"/sys/class/drm/*-{res['output_name']}/edid")
-    edid_info = None
-    if edid_matches:
-        try:
-            with open(edid_matches[0], "rb") as f:
-                edid_info = parse_edid(f.read())
-        except Exception:
-            pass
+    if not active_displays:
+        active_displays = [default_disp]
 
-    if edid_info:
-        res["vendor"] = edid_info["vendor"]
-        res["model"] = edid_info["model"]
-        res["hw_id"] = edid_info["hw_id"]
-        res["display_title"] = edid_info["display_title"]
-    else:
-        if not res["is_internal"]:
-            res["vendor"] = "External"
-            res["model"] = res["output_name"]
-            res["hw_id"] = res["output_name"]
-            res["display_title"] = f"External ({res['output_name']})"
+    # Sort: Primary display first (priority 1 or internal), then by output name
+    active_displays.sort(key=lambda d: (0 if d["is_primary"] else 1, 0 if d["is_internal"] else 1, d["output_name"]))
 
-    # Fast regex fallback from kscreen-doctor -o if refresh rate is still unparsed
-    if shutil.which("kscreen-doctor"):
+    primary = active_displays[0]
+
+    # Fast regex fallback for primary refresh rate if still unparsed
+    if primary["refresh_rate_hz"] == 240.0 and shutil.which("kscreen-doctor"):
         try:
             proc_o = subprocess.run(["kscreen-doctor", "-o"], capture_output=True, text=True, timeout=1)
             if proc_o.returncode == 0:
                 m = re.search(r"@([0-9.]+)\*", proc_o.stdout)
                 if m:
-                    res["refresh_rate_hz"] = round(float(m.group(1)), 2)
+                    primary["refresh_rate_hz"] = round(float(m.group(1)), 2)
         except Exception:
             pass
 
+    res = dict(primary)
+    res["display_mode"] = display_mode
+    res["count"] = len(active_displays)
+    res["displays"] = active_displays
     return res
 
 
