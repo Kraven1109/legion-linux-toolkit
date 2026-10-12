@@ -262,18 +262,27 @@ def parse_edid(data: bytes) -> Optional[Dict[str, str]]:
         vendor_name = PNP_MANUFACTURERS.get(mfg_code, mfg_code)
 
         model_name = None
-        for offset in (54, 72, 90, 108):
-            desc = data[offset : offset + 18]
-            if desc[:3] == b"\x00\x00\x00" and desc[3] in (0xFC, 0xFE):
-                try:
-                    name_cand = desc[5:].split(b"\x0a")[0].decode("ascii", errors="ignore").strip()
-                    if name_cand:
-                        model_name = name_cand
-                        if desc[3] == 0xFC:
-                            break
-                except Exception:
-                    pass
+        candidate_offsets = [54, 72, 90, 108]
+        if len(data) >= 256 and data[128] == 0x02:
+            dtd_start = data[128 + 2]
+            if dtd_start >= 4:
+                ext_offset = 128 + dtd_start
+                while ext_offset + 18 <= 254:
+                    candidate_offsets.append(ext_offset)
+                    ext_offset += 18
 
+        for offset in candidate_offsets:
+            if offset + 18 <= len(data):
+                desc = data[offset : offset + 18]
+                if desc[:3] == b"\x00\x00\x00" and desc[3] in (0xFC, 0xFE):
+                    try:
+                        name_cand = desc[5:].split(b"\x0a")[0].decode("ascii", errors="ignore").strip()
+                        if name_cand:
+                            model_name = name_cand
+                            if desc[3] == 0xFC:
+                                break
+                    except Exception:
+                        pass
         # For known internal Legion panel, standardize on Samsung SDC420B
         if mfg_code == "SDC" and hw_id == "SDC420B":
             display_title = "Samsung SDC420B"
@@ -383,17 +392,20 @@ def get_active_display_info() -> Dict[str, Any]:
 
                 # Resolve EDID for this connector
                 edid_matches = glob.glob(f"/sys/class/drm/*-{out_name}/edid")
-                if edid_matches:
+                for edid_p in edid_matches:
                     try:
-                        with open(edid_matches[0], "rb") as f:
-                            edid_parsed = parse_edid(f.read())
-                        if edid_parsed:
-                            d_info["vendor"] = edid_parsed["vendor"]
-                            d_info["model"] = edid_parsed["model"]
-                            d_info["hw_id"] = edid_parsed["hw_id"]
-                            d_info["display_title"] = edid_parsed["display_title"]
+                        with open(edid_p, "rb") as f:
+                            edid_data = f.read()
+                        if len(edid_data) >= 128:
+                            edid_parsed = parse_edid(edid_data)
+                            if edid_parsed:
+                                d_info["vendor"] = edid_parsed["vendor"]
+                                d_info["model"] = edid_parsed["model"]
+                                d_info["hw_id"] = edid_parsed["hw_id"]
+                                d_info["display_title"] = edid_parsed["display_title"]
+                                break
                     except Exception:
-                        pass
+                        continue
 
                 active_displays.append(d_info)
     except Exception:
@@ -422,7 +434,20 @@ def get_active_display_info() -> Dict[str, Any]:
     res["display_mode"] = display_mode
     res["count"] = len(active_displays)
     res["displays"] = active_displays
+    res["internal_display"] = next((d for d in active_displays if d.get("is_internal")), default_disp)
     return res
+
+
+def get_internal_display() -> Tuple[str, str]:
+    """
+    Specifically returns the internal eDP panel output name and its active ICC profile path.
+    Guarantees returning (internal_name, icc_path) regardless of primary external displays.
+    """
+    info = get_active_display_info()
+    for d in info.get("displays", []):
+        if d.get("is_internal"):
+            return d.get("output_name", "eDP-1"), d.get("icc_profile_path", "")
+    return "eDP-1", ""
 
 
 def get_active_display() -> Tuple[str, str]:

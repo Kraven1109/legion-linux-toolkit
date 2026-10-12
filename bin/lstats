@@ -104,8 +104,36 @@ def visible_width(text: str) -> int:
     return sum(2 if unicodedata.east_asian_width(ch) in ('W', 'F') else 1 for ch in plain)
 
 def fit_cell(text: str, width: int, align: str = "<") -> str:
-    """Pads or aligns text to exact visual cell width, accounting for ANSI escape sequences."""
+    """Pads, aligns, or truncates text to exact visual cell width, accounting for ANSI escape sequences."""
     vlen = visible_width(text)
+    if vlen > width:
+        clean = re.sub(r'\x1b\[[0-9;]*m', '', text)
+        if len(clean) == len(text):
+            return text[:width - 1] + "…" if width > 1 else text[:width]
+        else:
+            cur_w = 0
+            res = []
+            tokens = re.split(r'(\x1b\[[0-9;]*m)', text)
+            for token in tokens:
+                if not token:
+                    continue
+                if token.startswith('\x1b['):
+                    res.append(token)
+                else:
+                    for ch in token:
+                        ch_w = 2 if unicodedata.east_asian_width(ch) in ('W', 'F') else 1
+                        if cur_w + ch_w > width - 1:
+                            res.append('…')
+                            res.append(Ansi.RESET)
+                            cur_w += 1
+                            break
+                        res.append(ch)
+                        cur_w += ch_w
+                    if cur_w >= width:
+                        break
+            pad = max(0, width - cur_w)
+            return "".join(res) + (" " * pad)
+
     pad = max(0, width - vlen)
     if align == ">":
         return (" " * pad) + text
@@ -375,6 +403,9 @@ class DashboardRenderer:
 
         def row(content: str) -> str:
             vlen = visible_width(content)
+            if vlen > inner_w:
+                content = fit_cell(content, inner_w)
+                vlen = inner_w
             pad = max(0, inner_w - vlen)
             return f"│ {content}{' ' * pad} │"
 
@@ -540,7 +571,7 @@ class DashboardRenderer:
                 r_str = c(f"{d_rate:.2f} Hz", Ansi.BOLD, r_color)
 
                 out_tag = f"[{idx}] {d['output_name']}:"
-                title_str = fit_cell(f"{out_tag} {d['display_title']} ({d['resolution']} @ {d['scale']}x)", 44)
+                title_str = fit_cell(f"{out_tag} {d['display_title']} ({d['resolution']} @ {d['scale']}x)", 38)
 
                 if d_mode == "mirrored":
                     role = "Primary Source" if d.get("is_primary") else "Mirror Clone"

@@ -24,7 +24,7 @@ from legion_core import (
     COLOR_PROFILES as PROFILES,
     ensure_gui_environment,
     get_panel_info,
-    get_active_display,
+    get_internal_display,
 )
 
 def resolve_profile_path(filename):
@@ -113,7 +113,7 @@ def set_profile(target_key):
         print(f"[ERROR] Profile file not found: {match['file']}", file=sys.stderr)
         sys.exit(1)
 
-    output_name, _ = get_active_display()
+    output_name, _ = get_internal_display()
     if not output_name:
         output_name = "eDP-1"
 
@@ -132,7 +132,7 @@ def set_profile(target_key):
 def cycle_profile():
     """Cycles sequentially to the next color profile in the defined sequence."""
     verify_hardware_panel()
-    _, current_path = get_active_display()
+    _, current_path = get_internal_display()
 
     current_idx = -1
     if current_path:
@@ -149,7 +149,7 @@ def cycle_profile():
 def show_status():
     """Displays current color profile status, active output, and panel ID."""
     hw_id, edid_path = get_panel_info()
-    output_name, current_path = get_active_display()
+    output_name, current_path = get_internal_display()
 
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     print(" 🎨 \033[1mDisplay Color Profile Controller (lcolor)\033[0m")

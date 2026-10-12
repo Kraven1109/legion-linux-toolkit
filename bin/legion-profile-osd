@@ -107,15 +107,64 @@ def check_external_displays_connected() -> bool:
                 pass
     return False
 
+def is_display_sleeping() -> bool:
+    """Checks if the internal laptop screen has entered DPMS sleep or screens are blanked."""
+    for p in glob.glob("/sys/class/drm/*-eDP-*/dpms"):
+        try:
+            with open(p, "r") as f:
+                if f.read().strip().lower() != "on":
+                    return True
+        except Exception:
+            pass
+    return False
+
+def is_session_locked() -> bool:
+    """Checks if KDE screensaver / lockscreen is currently active."""
+    try:
+        res = subprocess.run(
+            ["qdbus6", "org.freedesktop.ScreenSaver", "/ScreenSaver", "org.freedesktop.ScreenSaver.GetActive"],
+            capture_output=True,
+            text=True,
+            timeout=1,
+        )
+        return res.stdout.strip().lower() == "true"
+    except Exception:
+        return False
+
 def handle_drm_hotplug():
     """
     Called when an external display disconnect is detected.
     Restarts plasma-powerdevil.service after a brief settling delay to rebind
     KDE Plasma 6's backlight controller back to the internal panel.
+    Suppressed if the display is in DPMS sleep or session is locked to prevent wake-up loops.
     """
     def _worker():
         time.sleep(1.0)
         ensure_gui_environment()
+
+        # Safety Guard 1: Do NOT restart PowerDevil if session is locked or screens are asleep (DPMS Off).
+        # When an external monitor enters DPMS standby, USB-C/HDMI adapters drop HPD, causing DRM to report
+        # disconnected. Restarting PowerDevil during DPMS sleep wakes the monitors and causes an infinite wake loop.
+        if is_display_sleeping() or is_session_locked():
+            print("[DISPLAY] External display disconnect during DPMS sleep / screen lock ➔ suppressing PowerDevil restart", flush=True)
+            return
+
+        # Safety Guard 2: Verify if PowerDevil already has healthy hardware backlight control.
+        # If BrightnessControl DBus interface is responsive and reports valid brightness, no restart is needed.
+        try:
+            res_b = subprocess.run(
+                ["qdbus6", "org.kde.Solid.PowerManagement", "/org/kde/Solid/PowerManagement/Actions/BrightnessControl",
+                 "org.kde.Solid.PowerManagement.Actions.BrightnessControl.brightness"],
+                capture_output=True,
+                text=True,
+                timeout=1,
+            )
+            if res_b.returncode == 0 and res_b.stdout.strip().isdigit():
+                print(f"[DISPLAY] Backlight controller is already healthy ({res_b.stdout.strip()}/10000) ➔ skipping PowerDevil restart", flush=True)
+                return
+        except Exception:
+            pass
+
         try:
             res = subprocess.run(
                 ["systemctl", "--user", "restart", "plasma-powerdevil.service"],
@@ -1212,7 +1261,7 @@ def main():
                         curr_external = check_external_displays_connected()
                         # Detect transition: external display was unplugged
                         if last_external_connected and not curr_external:
-                            print("[DISPLAY] DRM event: External display unplugged ➔ recovering PowerDevil backlight", flush=True)
+                            print("[DISPLAY] DRM event: External display unplugged ➔ evaluating PowerDevil recovery", flush=True)
                             handle_drm_hotplug()
                         last_external_connected = curr_external
 
