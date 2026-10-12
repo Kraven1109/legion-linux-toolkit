@@ -11,6 +11,10 @@ Listens to:
      - Keycode 193 (Copilot Key):
        * Tap (< 0.3s)   ➔ Smart Terminal / Candidate Launcher
        * Hold (>= 0.3s) ➔ Popup Candidate Menu (Rofi / Kdialog fallback)
+  4. NETLINK_KOBJECT_UEVENT (DRM display hotplug listener):
+     - Automatically rebinds KDE Plasma 6 brightness control on external unplug
+     - DPMS & screen-lock guards prevent wake-up loops during idle standby
+     - Deferred recovery automatically recovers brightness when waking/unlocking
 Zero polling, sleeps indefinitely in kernel wait queues via select.poll().
 """
 
@@ -108,12 +112,21 @@ def check_external_displays_connected() -> bool:
     return False
 
 def is_display_sleeping() -> bool:
-    """Checks if the internal laptop screen has entered DPMS sleep or screens are blanked."""
-    for p in glob.glob("/sys/class/drm/*-eDP-*/dpms"):
+    """
+    Checks if connected internal laptop screen(s) have entered DPMS sleep or screens are blanked.
+    Strictly filters by status == 'connected' to prevent disconnected/phantom connectors
+    (e.g. inactive dGPU card0-eDP-2) from falsely triggering display-sleep guards.
+    """
+    for p in glob.glob("/sys/class/drm/*-eDP-*"):
         try:
-            with open(p, "r") as f:
-                if f.read().strip().lower() != "on":
-                    return True
+            status_p = os.path.join(p, "status")
+            dpms_p = os.path.join(p, "dpms")
+            if os.path.isfile(status_p) and os.path.isfile(dpms_p):
+                with open(status_p, "r") as f_st:
+                    if f_st.read().strip().lower() == "connected":
+                        with open(dpms_p, "r") as f_dp:
+                            if f_dp.read().strip().lower() != "on":
+                                return True
         except Exception:
             pass
     return False
@@ -131,39 +144,30 @@ def is_session_locked() -> bool:
     except Exception:
         return False
 
-def handle_drm_hotplug():
+# Tracks deferred PowerDevil backlight recovery if an external display was disconnected while sleeping/locked
+_deferred_drm_recovery = False
+
+def handle_drm_hotplug(force: bool = False):
     """
     Called when an external display disconnect is detected.
     Restarts plasma-powerdevil.service after a brief settling delay to rebind
     KDE Plasma 6's backlight controller back to the internal panel.
-    Suppressed if the display is in DPMS sleep or session is locked to prevent wake-up loops.
+    Suppressed if the display is in DPMS sleep or session is locked to prevent wake-up loops;
+    in that case, recovery is deferred until the session wakes up and unlocks.
     """
+    global _deferred_drm_recovery
+
+    # Guard: Do NOT restart PowerDevil if session is locked or screens are asleep (DPMS Off).
+    # When an external monitor enters DPMS standby, USB-C/HDMI adapters drop HPD, causing DRM to report
+    # disconnected. Restarting PowerDevil during DPMS sleep wakes the monitors and causes an infinite wake loop.
+    if not force and (is_display_sleeping() or is_session_locked()):
+        print("[DISPLAY] External display disconnect during DPMS sleep / screen lock ➔ deferring PowerDevil restart until wake", flush=True)
+        _deferred_drm_recovery = True
+        return
+
     def _worker():
         time.sleep(1.0)
         ensure_gui_environment()
-
-        # Safety Guard 1: Do NOT restart PowerDevil if session is locked or screens are asleep (DPMS Off).
-        # When an external monitor enters DPMS standby, USB-C/HDMI adapters drop HPD, causing DRM to report
-        # disconnected. Restarting PowerDevil during DPMS sleep wakes the monitors and causes an infinite wake loop.
-        if is_display_sleeping() or is_session_locked():
-            print("[DISPLAY] External display disconnect during DPMS sleep / screen lock ➔ suppressing PowerDevil restart", flush=True)
-            return
-
-        # Safety Guard 2: Verify if PowerDevil already has healthy hardware backlight control.
-        # If BrightnessControl DBus interface is responsive and reports valid brightness, no restart is needed.
-        try:
-            res_b = subprocess.run(
-                ["qdbus6", "org.kde.Solid.PowerManagement", "/org/kde/Solid/PowerManagement/Actions/BrightnessControl",
-                 "org.kde.Solid.PowerManagement.Actions.BrightnessControl.brightness"],
-                capture_output=True,
-                text=True,
-                timeout=1,
-            )
-            if res_b.returncode == 0 and res_b.stdout.strip().isdigit():
-                print(f"[DISPLAY] Backlight controller is already healthy ({res_b.stdout.strip()}/10000) ➔ skipping PowerDevil restart", flush=True)
-                return
-        except Exception:
-            pass
 
         try:
             res = subprocess.run(
@@ -1132,10 +1136,27 @@ def main():
     copilot_is_hold = False
     last_scancode = 0
 
+    global _deferred_drm_recovery
     try:
         while True:
-            # Sleep indefinitely in kernel wait queue (0% CPU overhead)
-            events = poller.poll()
+            # Sleep indefinitely in kernel wait queue (0% CPU), or 1s timeout if deferred recovery is pending
+            timeout = 1000 if _deferred_drm_recovery else None
+            events = poller.poll(timeout)
+
+            # Check deferred recovery: runs if screen woke up / unlocked after an external disconnect
+            if _deferred_drm_recovery:
+                curr_ext = check_external_displays_connected()
+                if curr_ext:
+                    # External display reconnected or woke up (was never physically unplugged)
+                    print("[DISPLAY] External display reconnected/woke ➔ clearing deferred recovery", flush=True)
+                    _deferred_drm_recovery = False
+                    last_external_connected = True
+                elif not is_display_sleeping() and not is_session_locked():
+                    # Session is awake and unlocked, and external display is confirmed disconnected
+                    print("[DISPLAY] Session awake and unlocked after external disconnect ➔ executing deferred recovery", flush=True)
+                    _deferred_drm_recovery = False
+                    handle_drm_hotplug(force=True)
+
             for fd, event in events:
                 # Handle Profile change (Fn+Q)
                 if profile_file and fd == profile_file.fileno():
@@ -1263,6 +1284,10 @@ def main():
                         if last_external_connected and not curr_external:
                             print("[DISPLAY] DRM event: External display unplugged ➔ evaluating PowerDevil recovery", flush=True)
                             handle_drm_hotplug()
+                        elif not last_external_connected and curr_external:
+                            if _deferred_drm_recovery:
+                                print("[DISPLAY] External display reconnected ➔ clearing deferred recovery", flush=True)
+                                _deferred_drm_recovery = False
                         last_external_connected = curr_external
 
     except KeyboardInterrupt:

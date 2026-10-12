@@ -10,7 +10,7 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 # 1. Deploy CLI binaries
 echo "📦 Installing CLI tools to ~/.local/bin/..."
 mkdir -p "$HOME/.local/bin"
-cp -v "$DIR"/bin/* "$HOME/.local/bin/"
+find "$DIR/bin" -maxdepth 1 -type f -exec cp -v {} "$HOME/.local/bin/" \;
 chmod +x "$HOME"/.local/bin/{lbat,lmode,lhz,lcolor,lstats,legion-profile-osd,test-hotkey}
 
 # 2. Deploy default configuration (only if not already present)

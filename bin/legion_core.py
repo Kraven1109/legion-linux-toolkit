@@ -261,28 +261,28 @@ def parse_edid(data: bytes) -> Optional[Dict[str, str]]:
         hw_id = f"{mfg_code}{prod:04X}"
         vendor_name = PNP_MANUFACTURERS.get(mfg_code, mfg_code)
 
+        # Scan for human-readable descriptors across the entire EDID payload
+        # (Prioritize 0xFC Display Product Name first, then 0xFE Alphanumeric String)
         model_name = None
-        candidate_offsets = [54, 72, 90, 108]
-        if len(data) >= 256 and data[128] == 0x02:
-            dtd_start = data[128 + 2]
-            if dtd_start >= 4:
-                ext_offset = 128 + dtd_start
-                while ext_offset + 18 <= 254:
-                    candidate_offsets.append(ext_offset)
-                    ext_offset += 18
-
-        for offset in candidate_offsets:
-            if offset + 18 <= len(data):
-                desc = data[offset : offset + 18]
-                if desc[:3] == b"\x00\x00\x00" and desc[3] in (0xFC, 0xFE):
+        for tag in (0xFC, 0xFE):
+            target = b"\x00\x00\x00" + bytes([tag])
+            idx = 0
+            while True:
+                found = data.find(target, idx)
+                if found == -1:
+                    break
+                if found + 18 <= len(data):
+                    desc = data[found : found + 18]
                     try:
-                        name_cand = desc[5:].split(b"\x0a")[0].decode("ascii", errors="ignore").strip()
-                        if name_cand:
-                            model_name = name_cand
-                            if desc[3] == 0xFC:
-                                break
+                        cand = desc[5:].split(b"\x0a")[0].decode("ascii", errors="ignore").strip()
+                        if cand and len(cand) >= 2 and all(32 <= ord(c) <= 126 for c in cand):
+                            model_name = cand
+                            break
                     except Exception:
                         pass
+                idx = found + 1
+            if model_name:
+                break
         # For known internal Legion panel, standardize on Samsung SDC420B
         if mfg_code == "SDC" and hw_id == "SDC420B":
             display_title = "Samsung SDC420B"
