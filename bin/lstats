@@ -81,6 +81,10 @@ class Ansi:
     CURSOR_HIDE = "\033[?25l"
     CURSOR_SHOW = "\033[?25h"
     CLEAR_SCREEN = "\033[2J"
+    CLEAR_LINE = "\033[K"
+    CLEAR_TO_END = "\033[J"
+    ENTER_ALT_SCREEN = "\033[?1049h"
+    EXIT_ALT_SCREEN = "\033[?1049l"
     HOME = "\033[H"
 
 COLOR_ENABLED = sys.stdout.isatty() and "NO_COLOR" not in os.environ
@@ -719,18 +723,48 @@ def get_user_shell() -> str:
 # --- Interactive Live Watch Loop ---
 
 def run_watch_mode(telemetry: TelemetryCollector, interval: float = 1.0):
-    """Runs a real-time terminal dashboard with flicker-free updates."""
+    """Runs a real-time terminal dashboard with flicker-free updates and clean screen isolation."""
     is_tty = sys.stdin.isatty() and sys.stdout.isatty()
+    stdin_fd = sys.stdin.fileno() if is_tty else None
     old_term_settings = None
+    old_sigwinch = None
     drop_shell = False
+    resized = False
 
-    if is_tty:
+    pipe_r = None
+    pipe_w = None
+
+    if is_tty and stdin_fd is not None:
         try:
             import tty
             import termios
-            old_term_settings = termios.tcgetattr(sys.stdin)
-            tty.setcbreak(sys.stdin.fileno())
-            sys.stdout.write(Ansi.CURSOR_HIDE + Ansi.CLEAR_SCREEN)
+            import signal
+
+            pipe_r, pipe_w = os.pipe()
+            os.set_blocking(pipe_r, False)
+            os.set_blocking(pipe_w, False)
+
+            def on_sigwinch(signum, frame):
+                nonlocal resized
+                resized = True
+                if pipe_w is not None:
+                    try:
+                        os.write(pipe_w, b"\x00")
+                    except Exception:
+                        pass
+
+            try:
+                old_sigwinch = signal.signal(signal.SIGWINCH, on_sigwinch)
+            except Exception:
+                pass
+
+            old_term_settings = termios.tcgetattr(stdin_fd)
+            tty.setcbreak(stdin_fd)
+
+            # Enter alternate screen buffer: isolates from shell scrollback history,
+            # prevents mouse scrolling from dragging shell history into the viewport,
+            # and leaves user's terminal completely pristine upon exit.
+            sys.stdout.write(Ansi.ENTER_ALT_SCREEN + Ansi.CURSOR_HIDE + Ansi.CLEAR_SCREEN + Ansi.HOME)
             sys.stdout.flush()
         except Exception:
             is_tty = False
@@ -739,33 +773,106 @@ def run_watch_mode(telemetry: TelemetryCollector, interval: float = 1.0):
         while True:
             t_start = time.time()
 
-            term_cols = shutil.get_terminal_size(fallback=(80, 24)).columns
+            term_size = shutil.get_terminal_size(fallback=(80, 24))
+            term_cols = term_size.columns
+            term_rows = term_size.lines
+
+            if is_tty and resized:
+                resized = False
+                sys.stdout.write(Ansi.CLEAR_SCREEN + Ansi.HOME)
+                sys.stdout.flush()
+
             data = telemetry.collect_all(sample_interval=0.0)
             output = DashboardRenderer.render(data, width=term_cols)
 
             if is_tty:
-                hint = "Press 'q' to quit, 's' for shell (Ctrl+C to exit)"
-                sys.stdout.write(Ansi.HOME + output + "\n" + c(hint, Ansi.DIM))
-                sys.stdout.flush()
+                raw_lines = output.split("\n")
+                min_required_rows = len(raw_lines) + 2  # rendered box + hint + safety line
+                min_required_cols = 80
+
+                # Guard against terminals smaller than required dimensions
+                # Avoids wrapping lines (which breaks borders and triggers runaway vertical scrolling)
+                if term_cols < min_required_cols or term_rows < min_required_rows:
+                    warn_lines = [
+                        "",
+                        c(f"Terminal too small: {term_cols}x{term_rows}", Ansi.BOLD, Ansi.BRIGHT_YELLOW),
+                        f"Minimum required: {min_required_cols}x{min_required_rows} to render telemetry dashboard.",
+                        "",
+                        c("Please resize / enlarge your terminal window.", Ansi.DIM),
+                        c("Press 'q' to quit, 's' for shell (Ctrl+C to exit)", Ansi.DIM),
+                    ]
+                    frame = Ansi.HOME + "\n".join(fit_cell(l, term_cols, align="^") + Ansi.CLEAR_LINE for l in warn_lines) + Ansi.CLEAR_TO_END
+                    sys.stdout.write(frame)
+                    sys.stdout.flush()
+                else:
+                    # Clear each line to end-of-line (Ansi.CLEAR_LINE) so columns > 80
+                    # on wide screens are cleanly cleared without ghost characters
+                    framed_lines = [line + Ansi.CLEAR_LINE for line in raw_lines]
+                    frame_body = "\n".join(framed_lines)
+
+                    hint = "Press 'q' to quit, 's' for shell (Ctrl+C to exit)"
+                    frame_body += "\n" + c(hint, Ansi.DIM) + Ansi.CLEAR_LINE
+
+                    # Clear to end of screen (Ansi.CLEAR_TO_END) to wipe any lines below
+                    # Omit trailing newline to prevent scrolling the bottom terminal row
+                    sys.stdout.write(Ansi.HOME + frame_body + Ansi.CLEAR_TO_END)
+                    sys.stdout.flush()
             else:
                 print(output)
 
             while True:
                 elapsed = time.time() - t_start
                 remaining = max(0.0, interval - elapsed)
-                if remaining <= 0.0:
+                if remaining <= 0.0 or resized:
                     break
 
-                if is_tty:
+                if is_tty and stdin_fd is not None:
                     import select
-                    r, _, _ = select.select([sys.stdin], [], [], min(remaining, 0.2))
-                    if r:
-                        ch = sys.stdin.read(1)
-                        if ch in ("s", "S"):
+                    poll_fds = [stdin_fd]
+                    if pipe_r is not None:
+                        poll_fds.append(pipe_r)
+
+                    r, _, _ = select.select(poll_fds, [], [], remaining)
+
+                    if pipe_r is not None and pipe_r in r:
+                        try:
+                            os.read(pipe_r, 1024)
+                        except Exception:
+                            pass
+                        if resized:
+                            break
+
+                    if stdin_fd in r:
+                        try:
+                            # Read raw bytes directly from fd to avoid Python TextIOWrapper buffer eating multi-byte escape sequences
+                            data_bytes = os.read(stdin_fd, 64)
+                        except Exception:
+                            data_bytes = b""
+
+                        if not data_bytes:
+                            continue
+
+                        if b"q" in data_bytes or b"Q" in data_bytes or b"\x03" in data_bytes:  # q, Ctrl+C
+                            return
+                        elif b"s" in data_bytes or b"S" in data_bytes:
                             drop_shell = True
                             return
-                        elif ch in ("q", "Q", "\x03", "\x1b"):  # q, Ctrl+C, Esc
-                            return
+                        elif data_bytes == b"\x1b":
+                            # Check if further bytes follow immediately (e.g. arrow keys \x1b[A arriving in pieces)
+                            r_esc, _, _ = select.select([stdin_fd], [], [], 0.03)
+                            if r_esc:
+                                try:
+                                    os.read(stdin_fd, 64)
+                                except Exception:
+                                    pass
+                                # Multi-byte escape sequence (arrow keys, mouse), swallow and continue
+                                continue
+                            else:
+                                # Standalone Escape press -> quit
+                                return
+                        elif data_bytes.startswith(b"\x1b"):
+                            # Multi-byte escape sequence (e.g. \x1b[A, \x1b[B, \x1b[<...), swallow and continue
+                            continue
                 else:
                     time.sleep(remaining)
                     break
@@ -773,14 +880,35 @@ def run_watch_mode(telemetry: TelemetryCollector, interval: float = 1.0):
     except KeyboardInterrupt:
         pass
     finally:
-        if is_tty and old_term_settings:
+        if is_tty and stdin_fd is not None:
+            if old_term_settings:
+                try:
+                    import termios
+                    termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_term_settings)
+                except Exception:
+                    pass
+            # Exit alternate screen buffer and restore cursor
+            sys.stdout.write(Ansi.CURSOR_SHOW + Ansi.EXIT_ALT_SCREEN)
+            sys.stdout.flush()
+
+        if old_sigwinch is not None:
             try:
-                import termios
-                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_term_settings)
-                sys.stdout.write(Ansi.CURSOR_SHOW + "\n")
-                sys.stdout.flush()
+                import signal
+                signal.signal(signal.SIGWINCH, old_sigwinch)
             except Exception:
                 pass
+
+        if pipe_r is not None:
+            try:
+                os.close(pipe_r)
+            except Exception:
+                pass
+        if pipe_w is not None:
+            try:
+                os.close(pipe_w)
+            except Exception:
+                pass
+
         if drop_shell:
             user_sh = get_user_shell()
             sh_name = os.path.basename(user_sh)
