@@ -782,43 +782,56 @@ def run_watch_mode(telemetry: TelemetryCollector, interval: float = 1.0):
                 sys.stdout.write(Ansi.CLEAR_SCREEN + Ansi.HOME)
                 sys.stdout.flush()
 
-            data = telemetry.collect_all(sample_interval=0.0)
-            output = DashboardRenderer.render(data, width=term_cols)
-
-            if is_tty:
-                raw_lines = output.split("\n")
-                min_required_rows = len(raw_lines) + 2  # rendered box + hint + safety line
-                min_required_cols = 80
-
-                # Guard against terminals smaller than required dimensions
-                # Avoids wrapping lines (which breaks borders and triggers runaway vertical scrolling)
-                if term_cols < min_required_cols or term_rows < min_required_rows:
-                    warn_lines = [
-                        "",
-                        c(f"Terminal too small: {term_cols}x{term_rows}", Ansi.BOLD, Ansi.BRIGHT_YELLOW),
-                        f"Minimum required: {min_required_cols}x{min_required_rows} to render telemetry dashboard.",
-                        "",
-                        c("Please resize / enlarge your terminal window.", Ansi.DIM),
-                        c("Press 'q' to quit, 's' for shell (Ctrl+C to exit)", Ansi.DIM),
-                    ]
-                    frame = Ansi.HOME + "\n".join(fit_cell(l, term_cols, align="^") + Ansi.CLEAR_LINE for l in warn_lines) + Ansi.CLEAR_TO_END
-                    sys.stdout.write(frame)
-                    sys.stdout.flush()
-                else:
-                    # Clear each line to end-of-line (Ansi.CLEAR_LINE) so columns > 80
-                    # on wide screens are cleanly cleared without ghost characters
-                    framed_lines = [line + Ansi.CLEAR_LINE for line in raw_lines]
-                    frame_body = "\n".join(framed_lines)
-
-                    hint = "Press 'q' to quit, 's' for shell (Ctrl+C to exit)"
-                    frame_body += "\n" + c(hint, Ansi.DIM) + Ansi.CLEAR_LINE
-
-                    # Clear to end of screen (Ansi.CLEAR_TO_END) to wipe any lines below
-                    # Omit trailing newline to prevent scrolling the bottom terminal row
-                    sys.stdout.write(Ansi.HOME + frame_body + Ansi.CLEAR_TO_END)
-                    sys.stdout.flush()
+            # Guard against terminals smaller than base minimum dimensions (80x18)
+            # Skips expensive sysfs/NVML telemetry polling completely when the window is too small
+            if is_tty and (term_cols < 80 or term_rows < 18):
+                warn_lines = [
+                    "",
+                    c(f"Terminal too small: {term_cols}x{term_rows}", Ansi.BOLD, Ansi.BRIGHT_YELLOW),
+                    "Minimum required: 80x18 to render telemetry dashboard.",
+                    "",
+                    c("Please resize / enlarge your terminal window.", Ansi.DIM),
+                    c("Press 'q' to quit, 's' for shell (Ctrl+C to exit)", Ansi.DIM),
+                ]
+                frame = Ansi.HOME + "\n".join(fit_cell(l, term_cols, align="^") + Ansi.CLEAR_LINE for l in warn_lines) + Ansi.CLEAR_TO_END
+                sys.stdout.write(frame)
+                sys.stdout.flush()
             else:
-                print(output)
+                data = telemetry.collect_all(sample_interval=0.0)
+                output = DashboardRenderer.render(data, width=term_cols)
+
+                if is_tty:
+                    raw_lines = output.split("\n")
+                    min_required_rows = len(raw_lines) + 2  # dynamic: rendered box + hint + safety line
+
+                    # Secondary guard: dynamically checks if multi-monitor displays need more vertical rows
+                    if term_rows < min_required_rows:
+                        warn_lines = [
+                            "",
+                            c(f"Terminal too small: {term_cols}x{term_rows}", Ansi.BOLD, Ansi.BRIGHT_YELLOW),
+                            f"Minimum required: 80x{min_required_rows} for extended display layout.",
+                            "",
+                            c("Please resize / enlarge your terminal window.", Ansi.DIM),
+                            c("Press 'q' to quit, 's' for shell (Ctrl+C to exit)", Ansi.DIM),
+                        ]
+                        frame = Ansi.HOME + "\n".join(fit_cell(l, term_cols, align="^") + Ansi.CLEAR_LINE for l in warn_lines) + Ansi.CLEAR_TO_END
+                        sys.stdout.write(frame)
+                        sys.stdout.flush()
+                    else:
+                        # Clear each line to end-of-line (Ansi.CLEAR_LINE) so columns > 80
+                        # on wide screens are cleanly cleared without ghost characters
+                        framed_lines = [line + Ansi.CLEAR_LINE for line in raw_lines]
+                        frame_body = "\n".join(framed_lines)
+
+                        hint = "Press 'q' to quit, 's' for shell (Ctrl+C to exit)"
+                        frame_body += "\n" + c(hint, Ansi.DIM) + Ansi.CLEAR_LINE
+
+                        # Clear to end of screen (Ansi.CLEAR_TO_END) to wipe any lines below
+                        # Omit trailing newline to prevent scrolling the bottom terminal row
+                        sys.stdout.write(Ansi.HOME + frame_body + Ansi.CLEAR_TO_END)
+                        sys.stdout.flush()
+                else:
+                    print(output)
 
             while True:
                 elapsed = time.time() - t_start
@@ -852,27 +865,30 @@ def run_watch_mode(telemetry: TelemetryCollector, interval: float = 1.0):
                         if not data_bytes:
                             continue
 
-                        if b"q" in data_bytes or b"Q" in data_bytes or b"\x03" in data_bytes:  # q, Ctrl+C
+                        # 1. Escape sequences (multi-byte, e.g. arrow keys \x1b[A, mouse reporting \x1b[<...)
+                        if data_bytes.startswith(b"\x1b"):
+                            if data_bytes == b"\x1b":
+                                # Check if further bytes follow immediately (e.g. fragmented escape sequence)
+                                r_esc, _, _ = select.select([stdin_fd], [], [], 0.03)
+                                if r_esc:
+                                    try:
+                                        os.read(stdin_fd, 64)
+                                    except Exception:
+                                        pass
+                                    continue
+                                else:
+                                    # Standalone Escape press -> quit
+                                    return
+                            else:
+                                # Multi-byte escape sequence (arrow keys, mouse clicks, function keys), swallow and continue
+                                continue
+
+                        # 2. Direct single keystrokes
+                        if data_bytes in (b"q", b"Q", b"\x03"):  # q, Ctrl+C
                             return
-                        elif b"s" in data_bytes or b"S" in data_bytes:
+                        elif data_bytes in (b"s", b"S"):
                             drop_shell = True
                             return
-                        elif data_bytes == b"\x1b":
-                            # Check if further bytes follow immediately (e.g. arrow keys \x1b[A arriving in pieces)
-                            r_esc, _, _ = select.select([stdin_fd], [], [], 0.03)
-                            if r_esc:
-                                try:
-                                    os.read(stdin_fd, 64)
-                                except Exception:
-                                    pass
-                                # Multi-byte escape sequence (arrow keys, mouse), swallow and continue
-                                continue
-                            else:
-                                # Standalone Escape press -> quit
-                                return
-                        elif data_bytes.startswith(b"\x1b"):
-                            # Multi-byte escape sequence (e.g. \x1b[A, \x1b[B, \x1b[<...), swallow and continue
-                            continue
                 else:
                     time.sleep(remaining)
                     break
