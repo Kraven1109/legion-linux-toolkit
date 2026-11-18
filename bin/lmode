@@ -3,6 +3,7 @@ set -euo pipefail
 
 NODE="/sys/firmware/acpi/platform_profile"
 CHOICES_NODE="/sys/firmware/acpi/platform_profile_choices"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 
 if [[ ! -f "$NODE" ]]; then
     echo "[ERROR] ACPI platform_profile node not found at: $NODE" >&2
@@ -20,6 +21,22 @@ get_choices() {
 get_fans() {
     if command -v sensors >/dev/null 2>&1; then
         sensors 2>/dev/null | grep -E "fan[124]:" | awk '{print $1, $2, $3}' | tr '\n' ' | ' | sed 's/ | $//' || true
+    fi
+}
+
+get_rapl_status() {
+    if command -v python3 >/dev/null 2>&1 && [[ -f "$SCRIPT_DIR/legion_core.py" ]]; then
+        python3 -c '
+import sys
+sys.path.insert(0, sys.argv[1])
+from legion_core import get_rapl_mmio_limits, is_ac_online
+info = get_rapl_mmio_limits()
+pl1 = info.get("pl1_w")
+pl2 = info.get("pl2_w")
+if info.get("available") and pl1 is not None and pl2 is not None:
+    pwr = "AC" if is_ac_online() else "Battery"
+    print(f"MMIO PL1: {pl1:.0f}W | PL2: {pl2:.0f}W ({pwr})")
+' "$SCRIPT_DIR" || true
     fi
 }
 
@@ -91,6 +108,12 @@ get_status() {
         echo -e "  Fans:         🌀 $fans"
     fi
 
+    local rapl
+    rapl=$(get_rapl_status)
+    if [[ -n "$rapl" ]]; then
+        echo -e "  CPU Limits:   ⚡ $rapl"
+    fi
+
     echo "────────────────────────────────────────────────────────────────────"
     echo -e "  \033[1mAvailable Profiles on this Device:\033[0m"
     for c in "${choices[@]}"; do
@@ -142,7 +165,23 @@ set_mode() {
     else
         echo "$target" > "$NODE"
     fi
-    echo -e "Switched to: \033[1m$target\033[0m"
+
+    local rapl_msg=""
+    if command -v python3 >/dev/null 2>&1 && [[ -f "$SCRIPT_DIR/legion_core.py" ]]; then
+        rapl_msg=$(python3 -c '
+import sys
+sys.path.insert(0, sys.argv[1])
+from legion_core import sync_rapl_mmio
+res = sync_rapl_mmio(profile_id=sys.argv[2])
+if res.get("applied"):
+    pwr = "AC" if res.get("ac_online") else "Battery"
+    pl1 = res.get("pl1_w")
+    pl2 = res.get("pl2_w")
+    print(f" (MMIO PL1: {pl1}W / PL2: {pl2}W [{pwr}])")
+' "$SCRIPT_DIR" "$target" || true)
+    fi
+
+    echo -e "Switched to: \033[1m$target\033[0m${rapl_msg}"
 }
 
 cycle_next() {

@@ -26,7 +26,6 @@ import struct
 import time
 import glob
 import fcntl
-import json
 import shlex
 import shutil
 import threading
@@ -43,14 +42,13 @@ from legion_core import (
     PLATFORM_PROFILE_NODE as NODE,
     PLATFORM_PROFILES as PROFILES,
     HOTKEY_NODE,
-    CONFIG_DIR,
     ICON_DIR,
     ensure_gui_environment,
+    load_config,
+    sync_rapl_mmio,
 )
 
 KBD_SYMLINK = "/dev/input/by-path/pci-0000:80:14.0-usb-0:4:1.0-event-kbd"
-CONFIG_JSONC_PATH = os.path.join(CONFIG_DIR, "config.jsonc")
-CONFIG_JSON_PATH = os.path.join(CONFIG_DIR, "config.json")
 DEFAULT_COPILOT_CMD = {"action": "smart_terminal", "exec": "alacritty", "process": "alacritty"}
 LHZ_BIN = os.path.expanduser("~/.local/bin/lhz")
 LCOLOR_BIN = os.path.expanduser("~/.local/bin/lcolor")
@@ -185,33 +183,23 @@ def handle_drm_hotplug(force: bool = False):
     t = threading.Thread(target=_worker, daemon=True)
     t.start()
 
-def parse_jsonc(text):
-    """
-    Parses JSON with single-line (//) and multi-line (/* */) comments,
-    preserving string literals and stripping trailing commas.
-    """
-    pattern = r'("(?:\\.|[^"\\])*")|//[^\n]*|/\*.*?\*/'
-    def replace(match):
-        if match.group(1):
-            return match.group(1)
-        return ""
-    cleaned = re.sub(pattern, replace, text, flags=re.DOTALL)
-    cleaned = re.sub(r",\s*([\]}])", r"\1", cleaned)
-    return json.loads(cleaned)
+def apply_rapl_mmio(profile_id=None, source="PROFILE"):
+    """Synchronizes MMIO RAPL PL1/PL2 limits for the active profile and AC state."""
+    res = sync_rapl_mmio(profile_id=profile_id)
+    if res.get("changed"):
+        pwr_state = "AC" if res.get("ac_online") else "Battery"
+        print(
+            f"[POWER/{source}] {res.get('profile')} ({pwr_state}) ➔ "
+            f"MMIO RAPL PL1={res.get('pl1_w')}W, PL2={res.get('pl2_w')}W",
+            flush=True,
+        )
+    elif res.get("reason") == "permission_denied":
+        print(
+            "[POWER] Notice: intel-rapl-mmio:0 power limit nodes are not writable "
+            "(install tmpfiles.d/lenovo_rapl_mmio.conf).",
+            flush=True,
+        )
 
-def load_config():
-    """
-    Reads configuration dynamically from ~/.config/legion/config.jsonc (or config.json).
-    Returns (config_dict, error_or_None).
-    """
-    for path in (CONFIG_JSONC_PATH, CONFIG_JSON_PATH):
-        if os.path.isfile(path):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    return parse_jsonc(f.read()), None
-            except Exception as e:
-                return {}, f"{os.path.basename(path)} error: {e}"
-    return {}, None
 
 def get_copilot_config():
     """
@@ -1097,6 +1085,7 @@ def main():
             profile_file = open(NODE, "r")
             last_profile_state = profile_file.read().strip()
             poller.register(profile_file, select.POLLPRI | select.POLLERR)
+            apply_rapl_mmio(last_profile_state, source="INIT")
         except Exception:
             pass
 
@@ -1163,6 +1152,7 @@ def main():
                     profile_file.seek(0)
                     curr = profile_file.read().strip()
                     if curr and curr != last_profile_state:
+                        apply_rapl_mmio(curr, source="PROFILE")
                         send_profile_osd(curr)
                         last_profile_state = curr
 
@@ -1263,9 +1253,10 @@ def main():
                             print(f"[COPILOT] Unexpected read error: {e}", flush=True)
                             break
 
-                # Handle DRM Kernel Uevents (Display Hotplug / Unplug)
+                # Handle Kernel Uevents (DRM Display Hotplug & Power Supply AC/Battery/Resume)
                 elif nl_sock and fd == nl_sock.fileno():
                     has_drm_event = False
+                    has_psy_event = False
                     while True:
                         try:
                             data = nl_sock.recv(4096)
@@ -1273,10 +1264,15 @@ def main():
                                 break
                             if b"SUBSYSTEM=drm" in data:
                                 has_drm_event = True
+                            if b"SUBSYSTEM=power_supply" in data:
+                                has_psy_event = True
                         except BlockingIOError:
                             break
                         except Exception:
                             break
+
+                    if has_psy_event:
+                        apply_rapl_mmio(source="UEVENT")
 
                     if has_drm_event:
                         curr_external = check_external_displays_connected()

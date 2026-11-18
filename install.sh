@@ -57,10 +57,11 @@ systemctl --user enable --now legion-profile-osd.service
 #   /etc/udev/rules.d/ → ALL /dev/input/ devices (tmpfiles 'z' does NOT follow symlinks)
 echo "🔒 Configuring hardware permissions (/etc/tmpfiles.d/ and /etc/udev/rules.d/)..."
 if [[ $EUID -ne 0 ]]; then
-    # sysfs nodes: battery conservation & platform profile
+    # sysfs nodes: battery conservation, platform profile & MMIO RAPL limits
     sudo cp -v "$DIR"/tmpfiles.d/*.conf /etc/tmpfiles.d/
-    sudo systemd-tmpfiles --create /etc/tmpfiles.d/lenovo_conservation.conf
-    sudo systemd-tmpfiles --create /etc/tmpfiles.d/lenovo_platform_profile.conf
+    for conf in "$DIR"/tmpfiles.d/*.conf; do
+        sudo systemd-tmpfiles --create "/etc/tmpfiles.d/$(basename "$conf")"
+    done
 
     # /dev/input/ devices: ITE Keyboard (Copilot) + Ideapad Hotkeys (Fn+R, Fn+L)
     if [[ -d "$DIR/udev" ]]; then
@@ -69,8 +70,9 @@ if [[ $EUID -ne 0 ]]; then
     fi
 else
     cp -v "$DIR"/tmpfiles.d/*.conf /etc/tmpfiles.d/
-    systemd-tmpfiles --create /etc/tmpfiles.d/lenovo_conservation.conf
-    systemd-tmpfiles --create /etc/tmpfiles.d/lenovo_platform_profile.conf
+    for conf in "$DIR"/tmpfiles.d/*.conf; do
+        systemd-tmpfiles --create "/etc/tmpfiles.d/$(basename "$conf")"
+    done
 
     if [[ -d "$DIR/udev" ]]; then
         cp -v "$DIR"/udev/*.rules /etc/udev/rules.d/

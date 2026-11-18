@@ -46,6 +46,7 @@ from legion_core import (
     get_battery_info,
     get_platform_profile,
     get_daemon_status,
+    get_rapl_mmio_limits,
 )
 
 
@@ -216,6 +217,7 @@ class TelemetryCollector:
 
     def get_cpu_info(self, sample_interval: float = 0.05) -> Dict[str, Any]:
         """Reads CPU model, cores, frequencies, load, coretemp, and live RAPL power."""
+        mmio = get_rapl_mmio_limits()
         res = {
             "model": "Intel Processor",
             "logical_cores": 0,
@@ -224,6 +226,8 @@ class TelemetryCollector:
             "load_avg": list(os.getloadavg()),
             "temperature_c": get_cpu_package_temp(),
             "package_power_w": None,
+            "power_limit_pl1_w": mmio.get("pl1_w"),
+            "power_limit_pl2_w": mmio.get("pl2_w"),
         }
 
         # Model and core count from /proc/cpuinfo
@@ -470,13 +474,21 @@ class DashboardRenderer:
         # 3. Compute & Acceleration
         lines.append(divider(" COMPUTE & ACCELERATION ", Ansi.BRIGHT_GREEN))
         cpu = data["cpu"]
-        c_power = f"{cpu['package_power_w']:.1f} W" if cpu["package_power_w"] is not None else "N/A"
+        c_p_num = cpu.get("package_power_w")
+        pl1_w = cpu.get("power_limit_pl1_w")
+        pl2_w = cpu.get("power_limit_pl2_w")
+        eff_limit_w = min(pl1_w, pl2_w) if (pl1_w is not None and pl2_w is not None) else pl1_w
+        if c_p_num is not None:
+            c_draw_val = f"{c_p_num:.0f}" if c_p_num >= 100 else f"{c_p_num:.1f}"
+        else:
+            c_draw_val = "N/A"
+        c_limit_val = f"/{eff_limit_w:.0f}W" if eff_limit_w is not None else (" W" if c_p_num is not None else "")
         c_freq = f"{cpu['avg_frequency_mhz']} MHz" if cpu["avg_frequency_mhz"] else "N/A"
         cpu_pct = max(0.0, min(100.0, cpu.get("usage_percent", 0.0)))
         c_bar = make_bar(cpu_pct, 6)
 
         cpu_col1 = fit_cell(f"CPU  {c(cpu['model'], Ansi.BOLD)}", 20)
-        cpu_col2 = fit_cell(f"Power: {c(c_power, Ansi.BOLD, Ansi.BRIGHT_YELLOW)}", 16)
+        cpu_col2 = fit_cell(f"Power: {c(c_draw_val, Ansi.BOLD, Ansi.BRIGHT_YELLOW)}{c_limit_val}", 16)
         cpu_col3 = fit_cell(f"Clk: {c_freq}", 13)
         cpu_col4 = fit_cell(f"Load {c_bar} {c(f'{cpu_pct:5.1f}%', Ansi.BOLD, pct_color(cpu_pct))}", 18)
         lines.append(row(f"{cpu_col1} │ {cpu_col2} │ {cpu_col3} │ {cpu_col4}"))

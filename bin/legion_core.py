@@ -29,15 +29,32 @@ PLATFORM_PROFILE_CHOICES_NODE = "/sys/firmware/acpi/platform_profile_choices"
 CONSERVATION_MODE_NODE = "/sys/devices/pci0000:00/0000:00:1f.0/PNP0C09:00/VPC2004:00/conservation_mode"
 BATTERY_DIR = "/sys/class/power_supply/BAT0"
 RAPL_ENERGY_NODE = "/sys/class/powercap/intel-rapl:0/energy_uj"
+RAPL_MMIO_DIR = "/sys/devices/virtual/powercap/intel-rapl-mmio/intel-rapl-mmio:0"
+RAPL_MMIO_PL1_NODE = os.path.join(RAPL_MMIO_DIR, "constraint_0_power_limit_uw")
+RAPL_MMIO_PL2_NODE = os.path.join(RAPL_MMIO_DIR, "constraint_1_power_limit_uw")
 HOTKEY_NODE = "/dev/input/by-path/pci-0000:00:1f.0-platform-VPC2004:00-event"
 
 EXPECTED_PANEL_ID = "SDC420B"
 
 CONFIG_DIR = os.path.expanduser("~/.config/legion")
+CONFIG_JSONC_PATH = os.path.join(CONFIG_DIR, "config.jsonc")
+CONFIG_JSON_PATH = os.path.join(CONFIG_DIR, "config.json")
 CACHE_DIR = os.path.expanduser("~/.cache/legion")
 GPU_CACHE_FILE = os.path.join(CACHE_DIR, "gpu_info.json")
 ICON_DIR = os.path.expanduser("~/.local/share/icons/legion")
 COLOR_PROFILE_DIR = os.path.expanduser("~/.local/share/color/icc")
+
+# Conservative default MMIO RAPL limits (Watts) per ACPI platform_profile on AC power.
+# Addresses Linux kernel boot clamping on Arrow Lake-HX where intel-rapl-mmio:0 defaults to 30W/30W.
+DEFAULT_RAPL_MMIO_PROFILES: Dict[str, Dict[str, int]] = {
+    "low-power": {"pl1_w": 30, "pl2_w": 30},
+    "balanced": {"pl1_w": 45, "pl2_w": 55},
+    "performance": {"pl1_w": 55, "pl2_w": 65},
+    "max-power": {"pl1_w": 65, "pl2_w": 85},
+}
+DEFAULT_RAPL_MMIO_BATTERY: Dict[str, int] = {"pl1_w": 30, "pl2_w": 30}
+RAPL_MMIO_PL1_BOUNDS_W = (15, 165)
+RAPL_MMIO_PL2_BOUNDS_W = (15, 210)
 
 # --- Platform Power & Thermal Profile Definitions ---
 
@@ -502,6 +519,179 @@ def get_platform_profile() -> Dict[str, Any]:
         "desc": raw,
     })
     return prof
+
+
+def parse_jsonc(text: str) -> Dict[str, Any]:
+    """
+    Parses JSON with single-line (//) and multi-line (/* */) comments,
+    preserving string literals and stripping trailing commas.
+    """
+    pattern = r'("(?:\\.|[^"\\])*")|//[^\n]*|/\*.*?\*/'
+
+    def _replace(match):
+        if match.group(1):
+            return match.group(1)
+        return ""
+
+    cleaned = re.sub(pattern, _replace, text, flags=re.DOTALL)
+    cleaned = re.sub(r",\s*([\]}])", r"\1", cleaned)
+    return json.loads(cleaned)
+
+
+def load_config() -> Tuple[Dict[str, Any], Optional[str]]:
+    """
+    Reads configuration dynamically from ~/.config/legion/config.jsonc (or config.json).
+    Returns (config_dict, error_or_None).
+    """
+    for path in (CONFIG_JSONC_PATH, CONFIG_JSON_PATH):
+        if os.path.isfile(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    return parse_jsonc(f.read()), None
+            except Exception as e:
+                return {}, f"{os.path.basename(path)} error: {e}"
+    return {}, None
+
+
+def is_ac_online() -> bool:
+    """Returns True if any Mains AC power supply reports online=1, or True if none found."""
+    mains_found = False
+    for psy_dir in sorted(glob.glob("/sys/class/power_supply/*")):
+        type_p = os.path.join(psy_dir, "type")
+        online_p = os.path.join(psy_dir, "online")
+        if os.path.isfile(type_p) and os.path.isfile(online_p):
+            try:
+                with open(type_p, "r") as ft:
+                    if ft.read().strip().lower() == "mains":
+                        mains_found = True
+                        with open(online_p, "r") as fo:
+                            if fo.read().strip() == "1":
+                                return True
+            except Exception:
+                pass
+    return not mains_found
+
+
+def get_rapl_mmio_limits() -> Dict[str, Any]:
+    """Reads active MMIO RAPL PL1/PL2 power limits (Watts) from intel-rapl-mmio:0."""
+    res: Dict[str, Any] = {
+        "available": os.path.isdir(RAPL_MMIO_DIR),
+        "enabled": None,
+        "pl1_w": None,
+        "pl2_w": None,
+        "writable": False,
+    }
+    if not res["available"]:
+        return res
+
+    try:
+        en_p = os.path.join(RAPL_MMIO_DIR, "enabled")
+        if os.path.isfile(en_p):
+            with open(en_p, "r") as f:
+                res["enabled"] = f.read().strip() == "1"
+        if os.path.isfile(RAPL_MMIO_PL1_NODE):
+            with open(RAPL_MMIO_PL1_NODE, "r") as f:
+                res["pl1_w"] = round(int(f.read().strip()) / 1_000_000.0, 1)
+        if os.path.isfile(RAPL_MMIO_PL2_NODE):
+            with open(RAPL_MMIO_PL2_NODE, "r") as f:
+                res["pl2_w"] = round(int(f.read().strip()) / 1_000_000.0, 1)
+        res["writable"] = os.access(RAPL_MMIO_PL1_NODE, os.W_OK) and os.access(RAPL_MMIO_PL2_NODE, os.W_OK)
+    except Exception:
+        pass
+    return res
+
+
+def _clamp_watts(val: Any, bounds: Tuple[int, int], fallback: int) -> int:
+    try:
+        num = int(round(float(val)))
+    except (TypeError, ValueError):
+        num = fallback
+    return max(bounds[0], min(bounds[1], num))
+
+
+def sync_rapl_mmio(profile_id: Optional[str] = None, cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Synchronizes intel-rapl-mmio:0 PL1/PL2 constraints to match the active ACPI platform_profile
+    and AC/battery power state. Safe, idempotent, and zero-overhead.
+    """
+    if not os.path.isfile(RAPL_MMIO_PL1_NODE) or not os.path.isfile(RAPL_MMIO_PL2_NODE):
+        return {"applied": False, "changed": False, "reason": "sysfs_missing"}
+
+    if cfg is None:
+        cfg, _ = load_config()
+
+    rapl_cfg = cfg.get("rapl_mmio", {}) if isinstance(cfg, dict) else {}
+    if isinstance(rapl_cfg, dict) and rapl_cfg.get("enabled", True) is False:
+        return {"applied": False, "changed": False, "reason": "disabled"}
+
+    if not profile_id and os.path.isfile(PLATFORM_PROFILE_NODE):
+        try:
+            with open(PLATFORM_PROFILE_NODE, "r") as f:
+                profile_id = f.read().strip()
+        except Exception:
+            profile_id = ""
+
+    default_entry = DEFAULT_RAPL_MMIO_PROFILES.get(profile_id or "")
+    if not default_entry:
+        return {"applied": False, "changed": False, "reason": "unsupported_profile", "profile": profile_id}
+
+    profiles_cfg = rapl_cfg.get("profiles", {}) if isinstance(rapl_cfg, dict) else {}
+    prof_override = profiles_cfg.get(profile_id, {}) if isinstance(profiles_cfg, dict) else {}
+    if not isinstance(prof_override, dict):
+        prof_override = {}
+
+    pl1_w = _clamp_watts(prof_override.get("pl1_w", default_entry["pl1_w"]), RAPL_MMIO_PL1_BOUNDS_W, default_entry["pl1_w"])
+    pl2_w = _clamp_watts(prof_override.get("pl2_w", default_entry["pl2_w"]), RAPL_MMIO_PL2_BOUNDS_W, default_entry["pl2_w"])
+
+    ac_online = is_ac_online()
+    if not ac_online:
+        bat_cfg = rapl_cfg.get("battery", {}) if isinstance(rapl_cfg, dict) else {}
+        if not isinstance(bat_cfg, dict):
+            bat_cfg = {}
+        bat_pl1 = _clamp_watts(bat_cfg.get("pl1_w", DEFAULT_RAPL_MMIO_BATTERY["pl1_w"]), RAPL_MMIO_PL1_BOUNDS_W, DEFAULT_RAPL_MMIO_BATTERY["pl1_w"])
+        bat_pl2 = _clamp_watts(bat_cfg.get("pl2_w", DEFAULT_RAPL_MMIO_BATTERY["pl2_w"]), RAPL_MMIO_PL2_BOUNDS_W, DEFAULT_RAPL_MMIO_BATTERY["pl2_w"])
+        pl1_w = min(pl1_w, bat_pl1)
+        pl2_w = min(pl2_w, bat_pl2)
+
+    if pl2_w < pl1_w:
+        pl2_w = pl1_w
+
+    if not (os.access(RAPL_MMIO_PL1_NODE, os.W_OK) and os.access(RAPL_MMIO_PL2_NODE, os.W_OK)):
+        return {"applied": False, "changed": False, "reason": "permission_denied", "profile": profile_id}
+
+    target_pl1_uw = pl1_w * 1_000_000
+    target_pl2_uw = pl2_w * 1_000_000
+
+    try:
+        with open(RAPL_MMIO_PL1_NODE, "r") as f1, open(RAPL_MMIO_PL2_NODE, "r") as f2:
+            cur_pl1_uw = int(f1.read().strip())
+            cur_pl2_uw = int(f2.read().strip())
+
+        if cur_pl1_uw == target_pl1_uw and cur_pl2_uw == target_pl2_uw:
+            return {
+                "applied": True,
+                "changed": False,
+                "profile": profile_id,
+                "ac_online": ac_online,
+                "pl1_w": pl1_w,
+                "pl2_w": pl2_w,
+            }
+
+        with open(RAPL_MMIO_PL1_NODE, "w") as f1:
+            f1.write(str(target_pl1_uw))
+        with open(RAPL_MMIO_PL2_NODE, "w") as f2:
+            f2.write(str(target_pl2_uw))
+
+        return {
+            "applied": True,
+            "changed": True,
+            "profile": profile_id,
+            "ac_online": ac_online,
+            "pl1_w": pl1_w,
+            "pl2_w": pl2_w,
+        }
+    except Exception as e:
+        return {"applied": False, "changed": False, "reason": str(e), "profile": profile_id}
 
 
 def get_hwmon_by_name(name: str) -> Optional[str]:

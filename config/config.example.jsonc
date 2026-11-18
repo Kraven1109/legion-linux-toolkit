@@ -56,5 +56,21 @@
   "fn_l": {
     "action": "cycle",
     "exec": "lcolor cycle"
+  },
+
+  // CPU MMIO RAPL Synchronization (intel-rapl-mmio:0 PL1/PL2 in Watts)
+  // Synchronizes constraint_0 (PL1) and constraint_1 (PL2) when platform_profile
+  // or AC/battery power state changes, preventing Linux boot defaults (30W/30W)
+  // from throttling Performance / Extreme profiles.
+  "rapl_mmio": {
+    "enabled": true,
+    "profiles": {
+      "low-power":   { "pl1_w": 30, "pl2_w": 30 },
+      "balanced":    { "pl1_w": 45, "pl2_w": 55 },
+      "performance": { "pl1_w": 55, "pl2_w": 65 },
+      "max-power":   { "pl1_w": 65, "pl2_w": 85 }
+    },
+    // Maximum limits enforced while running on battery (ADP* offline)
+    "battery": { "pl1_w": 30, "pl2_w": 30 }
   }
 }
