@@ -1596,6 +1596,23 @@ class IntelIgpuTelemetry:
 
 # --- Native NVML Engine via ctypes ---
 
+def is_nvidia_idle_with_no_outputs() -> bool:
+    """
+    Returns True if all NVIDIA DRM display connectors (card0-*) are disconnected.
+    When True, NvmlTelemetry closes its NVML handle immediately after querying (or skips
+    NVML entirely during idle cooldown) so it does not hold a kernel reference count on
+    /dev/nvidia0 that prevents the PCIe runtime PM governor from entering D3cold sleep.
+    """
+    for st_path in glob.glob("/sys/class/drm/card0-*/status"):
+        try:
+            with open(st_path, "r") as f:
+                if f.read().strip().lower() == "connected":
+                    return False
+        except Exception:
+            pass
+    return True
+
+
 class NvmlTelemetry:
     """Zero-overhead NVIDIA telemetry querying libnvidia-ml.so.1 in sub-milliseconds."""
 
@@ -1609,22 +1626,25 @@ class NvmlTelemetry:
         self.memory_total_mib: Optional[int] = None
         self.power_limit_w: Optional[float] = None
         self._allow_wake = allow_wake
+        self._idle_cooldown_until: float = 0.0
+
+        cache = _load_gpu_cache()
+        if cache and cache.get("name"):
+            self.name = cache.get("name", self.name)
+            self.driver_version = cache.get("driver", self.driver_version)
+            self.memory_total_mib = cache.get("memory_total_mib")
+            self.power_limit_w = cache.get("power_limit_w")
+        else:
+            proc_info = _probe_nvidia_procfs()
+            self.name = proc_info.get("name", self.name)
+            self.driver_version = proc_info.get("driver", self.driver_version)
 
         if not allow_wake and is_nvidia_gpu_suspended():
             self.suspended = True
-            cache = _load_gpu_cache()
-            if cache and cache.get("name"):
-                self.name = cache.get("name", self.name)
-                self.driver_version = cache.get("driver", self.driver_version)
-                self.memory_total_mib = cache.get("memory_total_mib")
-                self.power_limit_w = cache.get("power_limit_w")
-            else:
-                proc_info = _probe_nvidia_procfs()
-                self.name = proc_info.get("name", self.name)
-                self.driver_version = proc_info.get("driver", self.driver_version)
             return
 
-        self._init_nvml()
+        if not is_nvidia_idle_with_no_outputs():
+            self._init_nvml()
 
     def _init_nvml(self):
         """Initializes NVML bindings via ctypes."""
@@ -1673,13 +1693,17 @@ class NvmlTelemetry:
             self.available = False
 
     def query(self) -> Dict[str, Any]:
-        """Queries current GPU metrics."""
+        """Queries current GPU metrics without preventing PCIe D3cold autosuspend when idle."""
+        now = time.monotonic()
+        no_outputs = is_nvidia_idle_with_no_outputs()
+
         if not self._allow_wake and is_nvidia_gpu_suspended():
             if not self.suspended:
                 self.close()
                 self._dev = None
                 self.available = False
                 self.suspended = True
+            self._idle_cooldown_until = 0.0
             return {
                 "name": self.name,
                 "driver": self.driver_version,
@@ -1696,11 +1720,48 @@ class NvmlTelemetry:
                 "state": "suspended",
             }
 
-        if self.suspended:
+        # If an external display is connected, cancel any idle cooldown
+        if not no_outputs:
+            self._idle_cooldown_until = 0.0
+
+        # During idle cooldown (no external dGPU displays & zero compute/3D load),
+        # keep NVML closed so the kernel PCIe runtime PM timer can enter D3cold undisturbed.
+        if not self._allow_wake and no_outputs and now < self._idle_cooldown_until:
+            if self.available:
+                self.close()
+            return dict(self._last_idle_sample) if hasattr(self, "_last_idle_sample") else {
+                "name": self.name,
+                "driver": self.driver_version,
+                "temperature_c": None,
+                "power_draw_w": 0.0,
+                "power_limit_w": self.power_limit_w,
+                "memory_used_mib": 0,
+                "memory_total_mib": self.memory_total_mib,
+                "memory_percent": 0.0,
+                "utilization_gpu": 0,
+                "utilization_mem": 0,
+                "clock_graphics_mhz": 0,
+                "clock_memory_mhz": 0,
+            }
+
+        if self.suspended or not self.available or not self._dev:
             self._init_nvml()
 
         if not self.available or not self._dev:
-            return self._fallback_query()
+            return {
+                "name": self.name,
+                "driver": self.driver_version,
+                "temperature_c": None,
+                "power_draw_w": None,
+                "power_limit_w": self.power_limit_w,
+                "memory_used_mib": None,
+                "memory_total_mib": self.memory_total_mib,
+                "memory_percent": 0.0,
+                "utilization_gpu": None,
+                "utilization_mem": None,
+                "clock_graphics_mhz": None,
+                "clock_memory_mhz": None,
+            }
 
         res = {
             "name": self.name,
@@ -1760,51 +1821,22 @@ class NvmlTelemetry:
         except Exception:
             pass
 
-        return res
-
-    def _fallback_query(self) -> Dict[str, Any]:
-        """Fallback to nvidia-smi if NVML C-library fails."""
-        res = {
-            "name": "NVIDIA GPU", "driver": "N/A", "temperature_c": None,
-            "power_draw_w": None, "power_limit_w": None, "memory_used_mib": None,
-            "memory_total_mib": None, "memory_percent": 0.0, "utilization_gpu": None,
-            "utilization_mem": None, "clock_graphics_mhz": None, "clock_memory_mhz": None,
-        }
-        if not shutil.which("nvidia-smi"):
-            return res
-
-        try:
-            cmd = [
-                "nvidia-smi",
-                "--query-gpu=name,driver_version,temperature.gpu,power.draw,power.limit,utilization.gpu,memory.used,memory.total,clocks.current.graphics,clocks.current.memory",
-                "--format=csv,noheader,nounits",
-            ]
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1)
-            if proc.returncode == 0 and proc.stdout.strip():
-                parts = [p.strip() for p in proc.stdout.strip().split(",")]
-                if len(parts) >= 8:
-                    res["name"] = parts[0]
-                    res["driver"] = parts[1]
-                    res["temperature_c"] = float(parts[2]) if parts[2] != "[N/A]" else None
-                    res["power_draw_w"] = float(parts[3]) if parts[3] != "[N/A]" else None
-                    res["power_limit_w"] = float(parts[4]) if parts[4] != "[N/A]" else None
-                    res["utilization_gpu"] = int(parts[5]) if parts[5] != "[N/A]" else None
-                    res["memory_used_mib"] = int(float(parts[6])) if parts[6] != "[N/A]" else None
-                    res["memory_total_mib"] = int(float(parts[7])) if parts[7] != "[N/A]" else None
-                    if res["memory_used_mib"] and res["memory_total_mib"]:
-                        res["memory_percent"] = round((res["memory_used_mib"] / res["memory_total_mib"]) * 100.0, 1)
-                if len(parts) >= 10:
-                    res["clock_graphics_mhz"] = int(float(parts[8])) if parts[8] != "[N/A]" else None
-                    res["clock_memory_mhz"] = int(float(parts[9])) if parts[9] != "[N/A]" else None
-        except Exception:
-            pass
+        # When no external display is connected to dGPU and utilization is 0% at idle clocks/VRAM,
+        # immediately release the NVML file descriptors and start a 5s cooldown so PCIe runtime PM
+        # can transition 0000:02:00.0 into D3cold sleep without being held awake by lstats -w.
+        if no_outputs and (res.get("utilization_gpu") or 0) == 0 and (res.get("memory_used_mib") or 0) < 600:
+            self.close()
+            self._last_idle_sample = dict(res)
+            self._idle_cooldown_until = now + 5.0
 
         return res
 
     def close(self):
-        """Releases NVML resources."""
+        """Releases NVML resources and closes /dev/nvidia* file descriptors."""
         if self._nvml and self.available:
             try:
                 self._nvml.nvmlShutdown()
             except Exception:
                 pass
+        self._dev = None
+        self.available = False
