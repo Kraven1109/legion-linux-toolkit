@@ -43,6 +43,7 @@ from legion_core import (
     PLATFORM_PROFILES as PROFILES,
     HOTKEY_NODE,
     ICON_DIR,
+    IPC_SOCKET_PATH,
     ensure_gui_environment,
     load_config,
     sync_rapl_mmio,
@@ -87,15 +88,22 @@ def send_error_osd(title, msg):
     except Exception:
         pass
 
+_detached_pids = set()
+_detached_lock = threading.Lock()
+
+
 def reap_zombies():
-    """Reaps terminated child processes to prevent defunct/zombie processes."""
-    try:
-        while True:
-            pid, _ = os.waitpid(-1, os.WNOHANG)
-            if pid <= 0:
-                break
-    except OSError:
-        pass
+    """Reaps terminated detached child processes without stealing waitpid from subprocess.run()."""
+    with _detached_lock:
+        for pid in list(_detached_pids):
+            try:
+                waited_pid, _ = os.waitpid(pid, os.WNOHANG)
+                if waited_pid == pid:
+                    _detached_pids.discard(pid)
+            except ChildProcessError:
+                _detached_pids.discard(pid)
+            except OSError:
+                pass
 
 def check_external_displays_connected() -> bool:
     """Checks sysfs to determine if any non-eDP DRM display connector is currently connected."""
@@ -267,6 +275,8 @@ def run_executable(cmd_str, source_name="Copilot", env_extra=None):
             )
         else:
             proc = subprocess.Popen(args, start_new_session=True, env=full_env)
+        with _detached_lock:
+            _detached_pids.add(proc.pid)
         print(f"[{source_name}] Executed successfully: {cmd_str}", flush=True)
         return proc.pid
     except Exception as e:
@@ -1069,12 +1079,28 @@ def find_keyboard_fd():
             pass
     return None, None
 
+def trigger_copilot_tap(source="COPILOT"):
+    """Dispatches Copilot short-tap action or dismisses an open candidate picker menu."""
+    if _menu_open.is_set():
+        dismiss_copilot_menu()
+        return
+    print(f"[{source}] Short tap triggered ➔ Dispatching Default Action", flush=True)
+    cfg, err = get_copilot_config()
+    if err:
+        send_error_osd("Copilot Key — Config Warning", err)
+    dispatch_hotkey("Copilot Tap", cfg.get("tap"), DEFAULT_COPILOT_CMD)
+
+
+def trigger_fn_n(source="Fn+N"):
+    """Dispatches configurable Fn+N smart toggle / launcher action."""
+    cfg, _ = load_config()
+    cfg_n = cfg.get("fn_n") if "fn_n" in cfg else cfg.get("fn_n_command")
+    default_n = {"action": "toggle", "exec": "alacritty -e nvtop", "process": "nvtop"}
+    dispatch_hotkey(source, cfg_n, default_n)
+
+
 def main():
     ensure_gui_environment()
-    try:
-        signal.signal(signal.SIGCHLD, signal.SIG_IGN)
-    except Exception:
-        pass
     poller = select.poll()
 
     # 1. Register ACPI platform_profile for Fn+Q & lmode
@@ -1118,6 +1144,21 @@ def main():
     except Exception as e:
         print(f"[INIT] Notice: Could not bind DRM netlink socket: {e}", flush=True)
 
+    # 5. Register local UNIX datagram IPC socket for zero-overhead CLI/external-keyboard triggers
+    ipc_sock = None
+    try:
+        os.makedirs(os.path.dirname(IPC_SOCKET_PATH), exist_ok=True)
+        if os.path.exists(IPC_SOCKET_PATH):
+            os.unlink(IPC_SOCKET_PATH)
+        ipc_sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        ipc_sock.bind(IPC_SOCKET_PATH)
+        os.chmod(IPC_SOCKET_PATH, 0o600)
+        ipc_sock.setblocking(False)
+        poller.register(ipc_sock.fileno(), select.POLLIN | select.POLLERR)
+        print(f"[INIT] IPC socket listening at {IPC_SOCKET_PATH}", flush=True)
+    except Exception as e:
+        print(f"[INIT] Notice: Could not bind IPC socket: {e}", flush=True)
+
     last_toggle_time = 0
     last_fn_l_time = 0
     last_fn_n_time = 0
@@ -1125,12 +1166,18 @@ def main():
     copilot_is_hold = False
     last_scancode = 0
 
+    def _handle_sigterm(_signum, _frame):
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+
     global _deferred_drm_recovery
     try:
         while True:
             # Sleep indefinitely in kernel wait queue (0% CPU), or 1s timeout if deferred recovery is pending
             timeout = 1000 if _deferred_drm_recovery else None
             events = poller.poll(timeout)
+            reap_zombies()
 
             # Check deferred recovery: runs if screen woke up / unlocked after an external disconnect
             if _deferred_drm_recovery:
@@ -1200,10 +1247,7 @@ def main():
                                 elif code == KEY_FN_N or last_scancode == SCANCODE_FN_N:
                                     if now - last_fn_n_time > 0.4:
                                         last_fn_n_time = now
-                                        cfg, _ = load_config()
-                                        cfg_n = cfg.get("fn_n") if "fn_n" in cfg else cfg.get("fn_n_command")
-                                        default_n = {"action": "toggle", "exec": "alacritty -e nvtop", "process": "nvtop"}
-                                        dispatch_hotkey("Fn+N", cfg_n, default_n)
+                                        trigger_fn_n("Fn+N")
 
                                 last_scancode = 0
 
@@ -1237,14 +1281,7 @@ def main():
                                         now = time.time()
                                         if now - last_tap_time > 0.3:
                                             last_tap_time = now
-                                            if _menu_open.is_set():
-                                                dismiss_copilot_menu()
-                                            else:
-                                                print("[COPILOT] Short tap detected ➔ Dispatching Default Action", flush=True)
-                                                cfg, err = get_copilot_config()
-                                                if err:
-                                                    send_error_osd("Copilot Key — Config Warning", err)
-                                                dispatch_hotkey("Copilot Tap", cfg.get("tap"), DEFAULT_COPILOT_CMD)
+                                            trigger_copilot_tap("COPILOT")
                                     copilot_is_hold = False
 
                         except BlockingIOError:
@@ -1286,8 +1323,42 @@ def main():
                                 _deferred_drm_recovery = False
                         last_external_connected = curr_external
 
-    except KeyboardInterrupt:
-        sys.exit(0)
+                # Handle local IPC triggers (e.g. lcopilot for external keyboards)
+                elif ipc_sock and fd == ipc_sock.fileno():
+                    while True:
+                        try:
+                            cmd_bytes = ipc_sock.recv(256)
+                            if not cmd_bytes:
+                                break
+                            ipc_cmd = cmd_bytes.decode("utf-8", errors="ignore").strip().lower()
+                            if ipc_cmd == "copilot_tap":
+                                trigger_copilot_tap("IPC/COPILOT")
+                            elif ipc_cmd == "copilot_menu":
+                                print("[IPC/COPILOT] Quick Launch menu requested", flush=True)
+                                launch_copilot_menu()
+                            elif ipc_cmd == "fn_n":
+                                trigger_fn_n("IPC/Fn+N")
+                            elif ipc_cmd == "sync_rapl":
+                                apply_rapl_mmio(source="IPC")
+                        except BlockingIOError:
+                            break
+                        except Exception as e:
+                            print(f"[IPC] Command error: {e}", flush=True)
+                            break
+
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        if ipc_sock:
+            try:
+                ipc_sock.close()
+            except Exception:
+                pass
+        if os.path.exists(IPC_SOCKET_PATH):
+            try:
+                os.unlink(IPC_SOCKET_PATH)
+            except Exception:
+                pass
 
 if __name__ == "__main__":
     main()

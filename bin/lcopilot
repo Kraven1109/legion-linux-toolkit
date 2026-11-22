@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+"""
+lcopilot — External Keyboard Trigger & CLI for Legion Copilot & Quick Launch Actions
+Sends zero-overhead datagram commands to the running legion-profile-osd daemon.
+"""
+
+import os
+import sys
+import socket
+import subprocess
+
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+
+from legion_core import IPC_SOCKET_PATH, load_config
+
+
+def send_ipc(command: str) -> bool:
+    """Sends a single command datagram to legion-profile-osd."""
+    if not os.path.exists(IPC_SOCKET_PATH):
+        return False
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    try:
+        sock.settimeout(1.0)
+        sock.sendto(command.encode("utf-8"), IPC_SOCKET_PATH)
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+def ensure_daemon_and_send(command: str) -> int:
+    """Sends an IPC command, attempting to start legion-profile-osd if inactive."""
+    if send_ipc(command):
+        return 0
+
+    try:
+        subprocess.run(
+            ["systemctl", "--user", "start", "legion-profile-osd.service"],
+            capture_output=True,
+            timeout=3,
+        )
+    except Exception:
+        pass
+
+    import time
+    for _ in range(15):
+        if send_ipc(command):
+            return 0
+        time.sleep(0.1)
+
+    print(
+        "[ERROR] legion-profile-osd daemon is not listening on IPC socket: "
+        f"{IPC_SOCKET_PATH}\n"
+        "Run: systemctl --user status legion-profile-osd.service",
+        file=sys.stderr,
+    )
+    return 1
+
+
+def show_status() -> int:
+    """Displays Copilot IPC socket status and configured actions."""
+    cfg, err = load_config()
+    sock_up = os.path.exists(IPC_SOCKET_PATH)
+    tap_cfg = cfg.get("copilot_tap") if "copilot_tap" in cfg else cfg.get("copilot_command", {})
+    candidates = cfg.get("copilot_candidates", [])
+
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print(" ✦ Legion Copilot & Quick Launch Trigger (lcopilot)")
+    print("────────────────────────────────────────────────────────────────────")
+    state_str = "\033[1;32mActive\033[0m" if sock_up else "\033[1;31mInactive\033[0m"
+    print(f"  Daemon IPC Socket : {state_str} ({IPC_SOCKET_PATH})")
+    if err:
+        print(f"  Config Warning    : \033[1;33m{err}\033[0m")
+
+    if isinstance(tap_cfg, dict):
+        tap_desc = f"{tap_cfg.get('exec', 'alacritty')} [{tap_cfg.get('action', 'smart_terminal')}]"
+    elif isinstance(tap_cfg, str):
+        tap_desc = tap_cfg
+    else:
+        tap_desc = "alacritty [smart_terminal]"
+    print(f"  Tap Action        : {tap_desc}")
+    print(f"  Quick Launch Apps : {len(candidates)} candidate(s) configured")
+    for item in candidates:
+        print(f"    • {item.get('name', 'Application')} -> {item.get('exec', '')}")
+    print("────────────────────────────────────────────────────────────────────")
+    print("  Commands: lcopilot tap  |  lcopilot menu  |  lcopilot fn-n")
+    print("  External Keyboard Tip (KDE Plasma 6):")
+    print("    System Settings -> Keyboard -> Shortcuts -> Add New -> Command:")
+    print("      • Quick Launch Menu : lcopilot menu   (e.g. Meta+Space / Alt+Space)")
+    print("      • Copilot Tap       : lcopilot tap    (e.g. F13 / Pause)")
+    print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    return 0
+
+
+def show_help() -> int:
+    print(
+        "Usage: lcopilot [command]\n\n"
+        "Commands:\n"
+        "  tap, (none)     Trigger Copilot short-tap action (or dismiss open menu)\n"
+        "  menu, quick     Toggle Copilot hold Quick Launch menu (Rofi / Kdialog)\n"
+        "  fn-n, n         Trigger Fn+N smart window toggle / launcher\n"
+        "  status          Show IPC socket state and configured actions\n"
+        "  help, -h        Show this help message"
+    )
+    return 0
+
+
+def main() -> int:
+    cmd = sys.argv[1].strip().lower() if len(sys.argv) > 1 else "tap"
+    if cmd in ("tap", "run"):
+        return ensure_daemon_and_send("copilot_tap")
+    if cmd in ("menu", "quick", "hold", "launcher"):
+        return ensure_daemon_and_send("copilot_menu")
+    if cmd in ("fn-n", "fn_n", "n"):
+        return ensure_daemon_and_send("fn_n")
+    if cmd in ("status", "info"):
+        return show_status()
+    if cmd in ("help", "-h", "--help"):
+        return show_help()
+
+    print(f"[ERROR] Unknown command: '{cmd}'", file=sys.stderr)
+    show_help()
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

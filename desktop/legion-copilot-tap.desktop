@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Legion Copilot Tap
+Comment=Trigger Legion Copilot short-tap action (Smart Terminal / configured app)
+Exec=lcopilot tap
+Icon=utilities-terminal
+Terminal=false
+Categories=Utility;
+StartupNotify=false

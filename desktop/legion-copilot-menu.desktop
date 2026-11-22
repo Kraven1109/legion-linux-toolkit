@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Legion Quick Launch (Copilot Menu)
+Comment=Toggle Legion Quick Launch candidate menu (external keyboard trigger)
+Exec=lcopilot menu
+Icon=system-run
+Terminal=false
+Categories=Utility;
+StartupNotify=false

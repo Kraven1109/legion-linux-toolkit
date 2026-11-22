@@ -43,6 +43,10 @@ CACHE_DIR = os.path.expanduser("~/.cache/legion")
 GPU_CACHE_FILE = os.path.join(CACHE_DIR, "gpu_info.json")
 ICON_DIR = os.path.expanduser("~/.local/share/icons/legion")
 COLOR_PROFILE_DIR = os.path.expanduser("~/.local/share/color/icc")
+IPC_SOCKET_PATH = os.path.join(
+    os.environ.get("XDG_RUNTIME_DIR") or f"/tmp",
+    f"legion-profile-osd-{os.getuid()}.sock",
+)
 
 # Conservative default MMIO RAPL limits (Watts) per ACPI platform_profile on AC power.
 # Addresses Linux kernel boot clamping on Arrow Lake-HX where intel-rapl-mmio:0 defaults to 30W/30W.
@@ -173,15 +177,25 @@ COLOR_PROFILES: List[Dict[str, str]] = [
 
 def ensure_gui_environment() -> None:
     """
-    Ensures WAYLAND_DISPLAY, DISPLAY, and XDG session variables are set in os.environ.
-    Essential when scripts/daemons are executed from minimal environments (systemd, udev, SSH).
+    Ensures WAYLAND_DISPLAY, DISPLAY, DBUS_SESSION_BUS_ADDRESS, and ~/.local/bin PATH
+    are set in os.environ. Essential when scripts/daemons run from minimal environments.
     """
-    if os.environ.get("WAYLAND_DISPLAY") and os.environ.get("DISPLAY"):
-        return
+    local_bin = os.path.expanduser("~/.local/bin")
+    cur_path = os.environ.get("PATH", "")
+    if local_bin not in cur_path.split(os.pathsep):
+        os.environ["PATH"] = f"{local_bin}{os.pathsep}{cur_path}" if cur_path else local_bin
 
     uid = os.getuid()
     runtime_dir = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{uid}")
     os.environ["XDG_RUNTIME_DIR"] = runtime_dir
+
+    if not os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
+        bus_path = f"{runtime_dir}/bus"
+        if os.path.exists(bus_path):
+            os.environ["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={bus_path}"
+
+    if os.environ.get("WAYLAND_DISPLAY") and os.environ.get("DISPLAY"):
+        return
 
     try:
         res = subprocess.run(
@@ -194,7 +208,8 @@ def ensure_gui_environment() -> None:
                     k, v = line.split("=", 1)
                     if k in (
                         "WAYLAND_DISPLAY", "DISPLAY", "XDG_CURRENT_DESKTOP",
-                        "XDG_SESSION_TYPE", "XAUTHORITY", "PATH", "QT_WAYLAND_RECONNECT"
+                        "XDG_SESSION_TYPE", "XAUTHORITY", "PATH",
+                        "QT_WAYLAND_RECONNECT", "DBUS_SESSION_BUS_ADDRESS",
                     ):
                         os.environ[k] = v
     except Exception:
@@ -304,7 +319,10 @@ def parse_edid(data: bytes) -> Optional[Dict[str, str]]:
         if mfg_code == "SDC" and hw_id == "SDC420B":
             display_title = "Samsung SDC420B"
         elif model_name:
-            display_title = f"{vendor_name} {model_name}"
+            if model_name.lower().startswith(vendor_name.lower()):
+                display_title = model_name
+            else:
+                display_title = f"{vendor_name} {model_name}"
         else:
             display_title = f"{vendor_name} {hw_id}"
 
@@ -319,17 +337,22 @@ def parse_edid(data: bytes) -> Optional[Dict[str, str]]:
         return None
 
 
-def get_active_display_info() -> Dict[str, Any]:
+_EDID_CACHE: Dict[str, Dict[str, str]] = {}
+_DISPLAY_INFO_CACHE: Optional[Tuple[float, Dict[str, Any]]] = None
+
+
+def get_active_display_info(ttl: float = 0.0) -> Dict[str, Any]:
     """
     Queries kscreen-doctor -j for all connected and enabled outputs.
     Supports single-display, extended multi-display, and mirrored/cloned setups.
-    Returns dictionary with:
-      - display_mode: 'single' | 'extended' | 'mirrored'
-      - count: int (number of active displays)
-      - displays: List[Dict[str, Any]] (per-display metadata)
-      - output_name, is_internal, vendor, model, hw_id, display_title,
-        icc_profile_path, refresh_rate_hz, resolution, scale (primary display flattened)
+    When ttl > 0 (e.g. in continuous watch loops), reuses cached display state for up to ttl seconds.
     """
+    global _DISPLAY_INFO_CACHE
+    if ttl > 0.0 and _DISPLAY_INFO_CACHE is not None:
+        ts, cached_res = _DISPLAY_INFO_CACHE
+        if (time.monotonic() - ts) < ttl:
+            return cached_res
+
     ensure_gui_environment()
     default_disp = {
         "output_name": "eDP-1",
@@ -396,6 +419,7 @@ def get_active_display_info() -> Dict[str, Any]:
                 }
 
                 # Find mode details
+                mode_matched = False
                 curr_mode_id = str(out.get("currentModeId"))
                 for m in out.get("modes", []):
                     if str(m.get("id")) == curr_mode_id:
@@ -405,24 +429,29 @@ def get_active_display_info() -> Dict[str, Any]:
                         h = size.get("height")
                         if w and h:
                             d_info["resolution"] = f"{w}x{h}"
+                        mode_matched = True
                         break
+                d_info["_mode_matched"] = mode_matched
 
-                # Resolve EDID for this connector
-                edid_matches = glob.glob(f"/sys/class/drm/*-{out_name}/edid")
-                for edid_p in edid_matches:
-                    try:
-                        with open(edid_p, "rb") as f:
-                            edid_data = f.read()
-                        if len(edid_data) >= 128:
-                            edid_parsed = parse_edid(edid_data)
-                            if edid_parsed:
-                                d_info["vendor"] = edid_parsed["vendor"]
-                                d_info["model"] = edid_parsed["model"]
-                                d_info["hw_id"] = edid_parsed["hw_id"]
-                                d_info["display_title"] = edid_parsed["display_title"]
-                                break
-                    except Exception:
-                        continue
+                # Resolve EDID for this connector (cached per connector path)
+                edid_parsed = _EDID_CACHE.get(out_name)
+                if edid_parsed is None:
+                    for edid_p in glob.glob(f"/sys/class/drm/*-{out_name}/edid"):
+                        try:
+                            with open(edid_p, "rb") as f:
+                                edid_data = f.read()
+                            if len(edid_data) >= 128:
+                                edid_parsed = parse_edid(edid_data)
+                                if edid_parsed:
+                                    _EDID_CACHE[out_name] = edid_parsed
+                                    break
+                        except Exception:
+                            continue
+                if edid_parsed:
+                    d_info["vendor"] = edid_parsed["vendor"]
+                    d_info["model"] = edid_parsed["model"]
+                    d_info["hw_id"] = edid_parsed["hw_id"]
+                    d_info["display_title"] = edid_parsed["display_title"]
 
                 active_displays.append(d_info)
     except Exception:
@@ -436,22 +465,28 @@ def get_active_display_info() -> Dict[str, Any]:
 
     primary = active_displays[0]
 
-    # Fast regex fallback for primary refresh rate if still unparsed
-    if primary["refresh_rate_hz"] == 240.0 and shutil.which("kscreen-doctor"):
+    # Regex fallback only when JSON mode lookup failed for the primary output
+    if not primary.get("_mode_matched", True) and shutil.which("kscreen-doctor"):
         try:
             proc_o = subprocess.run(["kscreen-doctor", "-o"], capture_output=True, text=True, timeout=1)
             if proc_o.returncode == 0:
-                m = re.search(r"@([0-9.]+)\*", proc_o.stdout)
-                if m:
-                    primary["refresh_rate_hz"] = round(float(m.group(1)), 2)
+                out_pat = rf"Output:\s+\d+\s+{re.escape(primary['output_name'])}\b.*?(?=\nOutput:|\Z)"
+                block = re.search(out_pat, proc_o.stdout, flags=re.DOTALL)
+                if block:
+                    m = re.search(r"@([0-9.]+)\*", block.group(0))
+                    if m:
+                        primary["refresh_rate_hz"] = round(float(m.group(1)), 2)
         except Exception:
             pass
+    for d in active_displays:
+        d.pop("_mode_matched", None)
 
     res = dict(primary)
     res["display_mode"] = display_mode
     res["count"] = len(active_displays)
     res["displays"] = active_displays
     res["internal_display"] = next((d for d in active_displays if d.get("is_internal")), default_disp)
+    _DISPLAY_INFO_CACHE = (time.monotonic(), res)
     return res
 
 
@@ -694,18 +729,34 @@ def sync_rapl_mmio(profile_id: Optional[str] = None, cfg: Optional[Dict[str, Any
         return {"applied": False, "changed": False, "reason": str(e), "profile": profile_id}
 
 
-def get_hwmon_by_name(name: str) -> Optional[str]:
-    """Finds the first sysfs hwmon directory matching the given device name."""
-    for p in glob.glob("/sys/class/hwmon/hwmon*"):
+_HWMON_BY_NAME_CACHE: Dict[str, List[str]] = {}
+
+
+def get_hwmons_by_name(name: str) -> List[str]:
+    """Finds all sysfs hwmon directories matching the given device name, with validation cache."""
+    cached = _HWMON_BY_NAME_CACHE.get(name)
+    if cached and all(os.path.isdir(p) for p in cached):
+        return cached
+
+    matches: List[str] = []
+    for p in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
         name_file = os.path.join(p, "name")
         if os.path.isfile(name_file):
             try:
                 with open(name_file, "r") as f:
                     if f.read().strip() == name:
-                        return p
+                        matches.append(p)
             except Exception:
                 pass
-    return None
+    if matches:
+        _HWMON_BY_NAME_CACHE[name] = matches
+    return matches
+
+
+def get_hwmon_by_name(name: str) -> Optional[str]:
+    """Finds the first sysfs hwmon directory matching the given device name."""
+    matches = get_hwmons_by_name(name)
+    return matches[0] if matches else None
 
 
 def get_cooling_fans() -> Dict[str, Any]:
@@ -757,16 +808,12 @@ def get_cooling_fans() -> Dict[str, Any]:
 def get_spd_ram_temps() -> List[float]:
     """Reads DDR5 SPD thermal sensors (spd5118) in degrees Celsius."""
     temps: List[float] = []
-    for hdir in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
-        name_file = os.path.join(hdir, "name")
-        if os.path.isfile(name_file):
+    for hdir in get_hwmons_by_name("spd5118"):
+        temp_file = os.path.join(hdir, "temp1_input")
+        if os.path.isfile(temp_file):
             try:
-                with open(name_file, "r") as f:
-                    if f.read().strip() == "spd5118":
-                        temp_file = os.path.join(hdir, "temp1_input")
-                        if os.path.isfile(temp_file):
-                            with open(temp_file, "r") as tf:
-                                temps.append(round(int(tf.read().strip()) / 1000.0, 1))
+                with open(temp_file, "r") as tf:
+                    temps.append(round(int(tf.read().strip()) / 1000.0, 1))
             except Exception:
                 pass
     return temps
@@ -775,16 +822,12 @@ def get_spd_ram_temps() -> List[float]:
 def get_nvme_temps() -> List[float]:
     """Reads composite NVMe drive temperatures in degrees Celsius."""
     temps: List[float] = []
-    for hdir in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
-        name_file = os.path.join(hdir, "name")
-        if os.path.isfile(name_file):
+    for hdir in get_hwmons_by_name("nvme"):
+        temp_file = os.path.join(hdir, "temp1_input")
+        if os.path.isfile(temp_file):
             try:
-                with open(name_file, "r") as f:
-                    if f.read().strip() == "nvme":
-                        temp_file = os.path.join(hdir, "temp1_input")
-                        if os.path.isfile(temp_file):
-                            with open(temp_file, "r") as tf:
-                                temps.append(round(int(tf.read().strip()) / 1000.0, 1))
+                with open(temp_file, "r") as tf:
+                    temps.append(round(int(tf.read().strip()) / 1000.0, 1))
             except Exception:
                 pass
     return temps
@@ -859,38 +902,80 @@ def get_battery_info() -> Dict[str, Any]:
     return res
 
 
-def get_daemon_status() -> Dict[str, Any]:
-    """Checks legion-profile-osd systemd user service status."""
-    res = {"active": False, "pid": None, "rss_mib": None}
+_CACHED_DAEMON_PID: Optional[int] = None
+
+
+def _read_daemon_rss_if_alive(pid: int) -> Optional[Tuple[int, Optional[float]]]:
+    """Verifies pid belongs to a live legion-profile-osd process and returns (pid, rss_mib)."""
     try:
-        proc = subprocess.run(
-            ["systemctl", "--user", "is-active", "legion-profile-osd.service"],
+        with open(f"/proc/{pid}/stat", "r") as sf:
+            st = sf.read()
+        rparen = st.rfind(")")
+        if rparen != -1 and len(st) > rparen + 2 and st[rparen + 2] == "Z":
+            return None
+        with open(f"/proc/{pid}/cmdline", "rb") as cf:
+            cmd = cf.read().decode("utf-8", errors="ignore")
+        if "legion-profile-osd" not in cmd:
+            return None
+        rss_mib = None
+        with open(f"/proc/{pid}/status", "r") as status_f:
+            for line in status_f:
+                if line.startswith("VmRSS:"):
+                    rss_mib = round(int(line.split()[1]) / 1024.0, 1)
+                    break
+        return pid, rss_mib
+    except Exception:
+        return None
+
+
+def get_daemon_status() -> Dict[str, Any]:
+    """Checks legion-profile-osd systemd user service status with fast procfs caching."""
+    global _CACHED_DAEMON_PID
+    res = {"active": False, "pid": None, "rss_mib": None}
+
+    if _CACHED_DAEMON_PID is not None:
+        alive = _read_daemon_rss_if_alive(_CACHED_DAEMON_PID)
+        if alive is not None:
+            res["active"] = True
+            res["pid"], res["rss_mib"] = alive
+            return res
+        _CACHED_DAEMON_PID = None
+
+    try:
+        pid_proc = subprocess.run(
+            ["systemctl", "--user", "show", "-p", "MainPID", "-p", "ActiveState", "--value", "legion-profile-osd.service"],
             capture_output=True, text=True, timeout=0.5
         )
-        res["active"] = proc.stdout.strip() == "active"
-        if res["active"]:
-            pid_proc = subprocess.run(
-                ["systemctl", "--user", "show", "-p", "MainPID", "--value", "legion-profile-osd.service"],
-                capture_output=True, text=True, timeout=0.5
-            )
-            pid_str = pid_proc.stdout.strip()
-            if pid_str.isdigit() and int(pid_str) > 0:
-                pid = int(pid_str)
-                res["pid"] = pid
-                status_path = f"/proc/{pid}/status"
-                if os.path.isfile(status_path):
-                    with open(status_path, "r") as sf:
-                        for line in sf:
-                            if line.startswith("VmRSS:"):
-                                res["rss_mib"] = round(int(line.split()[1]) / 1024.0, 1)
-                                break
+        lines = [l.strip() for l in pid_proc.stdout.splitlines() if l.strip()]
+        if len(lines) >= 2:
+            # systemctl show outputs properties in unit definition order: MainPID then ActiveState (or vice versa)
+            pid_str = next((x for x in lines if x.isdigit()), "0")
+            is_act = "active" in lines
+            if is_act and pid_str.isdigit() and int(pid_str) > 0:
+                alive = _read_daemon_rss_if_alive(int(pid_str))
+                if alive is not None:
+                    _CACHED_DAEMON_PID = alive[0]
+                    res["active"] = True
+                    res["pid"], res["rss_mib"] = alive
+                    return res
     except Exception:
         pass
     return res
 
 
+_NVIDIA_RUNTIME_STATUS_NODE: Optional[str] = None
+
+
 def is_nvidia_gpu_suspended() -> bool:
     """Checks sysfs to determine if the discrete NVIDIA GPU is in PCIe runtime suspend (D3cold)."""
+    global _NVIDIA_RUNTIME_STATUS_NODE
+    if _NVIDIA_RUNTIME_STATUS_NODE and os.path.isfile(_NVIDIA_RUNTIME_STATUS_NODE):
+        try:
+            with open(_NVIDIA_RUNTIME_STATUS_NODE, "r") as sf:
+                return sf.read().strip().lower() in ("suspended", "suspending")
+        except Exception:
+            _NVIDIA_RUNTIME_STATUS_NODE = None
+
     for v_path in glob.glob("/sys/bus/pci/devices/*/vendor"):
         try:
             with open(v_path, "r") as f:
@@ -901,6 +986,7 @@ def is_nvidia_gpu_suspended() -> bool:
                         if cf.read().strip().startswith("0x03"):
                             st_path = os.path.join(dev_dir, "power", "runtime_status")
                             if os.path.isfile(st_path):
+                                _NVIDIA_RUNTIME_STATUS_NODE = st_path
                                 with open(st_path, "r") as sf:
                                     return sf.read().strip().lower() in ("suspended", "suspending")
         except Exception:
@@ -1039,25 +1125,30 @@ class NvmlTelemetry:
 
     def query(self) -> Dict[str, Any]:
         """Queries current GPU metrics."""
+        if not self._allow_wake and is_nvidia_gpu_suspended():
+            if not self.suspended:
+                self.close()
+                self._dev = None
+                self.available = False
+                self.suspended = True
+            return {
+                "name": self.name,
+                "driver": self.driver_version,
+                "temperature_c": None,
+                "power_draw_w": 0.0,
+                "power_limit_w": self.power_limit_w,
+                "memory_used_mib": 0,
+                "memory_total_mib": self.memory_total_mib,
+                "memory_percent": 0.0,
+                "utilization_gpu": 0,
+                "utilization_mem": 0,
+                "clock_graphics_mhz": 0,
+                "clock_memory_mhz": 0,
+                "state": "suspended",
+            }
+
         if self.suspended:
-            if not is_nvidia_gpu_suspended():
-                self._init_nvml()
-            else:
-                return {
-                    "name": self.name,
-                    "driver": self.driver_version,
-                    "temperature_c": None,
-                    "power_draw_w": 0.0,
-                    "power_limit_w": self.power_limit_w,
-                    "memory_used_mib": 0,
-                    "memory_total_mib": self.memory_total_mib,
-                    "memory_percent": 0.0,
-                    "utilization_gpu": 0,
-                    "utilization_mem": 0,
-                    "clock_graphics_mhz": 0,
-                    "clock_memory_mhz": 0,
-                    "state": "suspended",
-                }
+            self._init_nvml()
 
         if not self.available or not self._dev:
             return self._fallback_query()
@@ -1089,6 +1180,7 @@ class NvmlTelemetry:
             plimit = ctypes.c_uint()
             if self._nvml.nvmlDeviceGetEnforcedPowerLimit(self._dev, ctypes.byref(plimit)) == 0:
                 res["power_limit_w"] = round(plimit.value / 1000.0, 1)
+                self.power_limit_w = res["power_limit_w"]
 
             class _NvmlMemory(ctypes.Structure):
                 _fields_ = [

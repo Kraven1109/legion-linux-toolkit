@@ -12,11 +12,27 @@ if [[ -z "${WAYLAND_DISPLAY:-}" && -z "${DISPLAY:-}" ]]; then
     export DISPLAY="${DISPLAY:-:0}"
 fi
 
-# Dynamically discover the internal eDP panel
+KSCREEN_JSON_CACHE=""
+
+get_kscreen_json() {
+    if [[ -z "$KSCREEN_JSON_CACHE" ]]; then
+        KSCREEN_JSON_CACHE=$(kscreen-doctor -j 2>/dev/null || true)
+    fi
+    printf '%s' "$KSCREEN_JSON_CACHE"
+}
+
+# Dynamically discover the internal eDP panel (prefer enabled, fallback to connected)
 get_internal_output() {
     local out=""
     if command -v jq >/dev/null 2>&1; then
-        out=$(kscreen-doctor -j 2>/dev/null | jq -r '.outputs[] | select(.connected and .enabled and (.name | startswith("eDP"))) | .name' 2>/dev/null | head -n 1)
+        local kjson
+        kjson=$(get_kscreen_json)
+        if [[ -n "$kjson" ]]; then
+            out=$(jq -r '.outputs[] | select(.connected and .enabled and (.name | startswith("eDP"))) | .name' <<< "$kjson" 2>/dev/null | head -n 1)
+            if [[ -z "$out" || "$out" == "null" ]]; then
+                out=$(jq -r '.outputs[] | select(.connected and (.name | startswith("eDP"))) | .name' <<< "$kjson" 2>/dev/null | head -n 1)
+            fi
+        fi
     fi
     if [[ -z "$out" || "$out" == "null" ]]; then
         out=$(kscreen-doctor -o 2>/dev/null | grep -oE "eDP-[0-9]+" | head -n 1 || true)
@@ -24,16 +40,30 @@ get_internal_output() {
     echo "${out:-eDP-1}"
 }
 
+is_internal_enabled() {
+    local edp="$1"
+    if command -v jq >/dev/null 2>&1; then
+        local kjson en
+        kjson=$(get_kscreen_json)
+        en=$(jq -r --arg out "$edp" '.outputs[] | select(.name == $out) | .enabled' <<< "$kjson" 2>/dev/null | head -n 1 || true)
+        [[ "$en" == "true" ]]
+        return
+    fi
+    return 0
+}
+
 # Query current active rate on internal display
 get_current_rate() {
-    local edp
-    edp=$(get_internal_output)
+    local edp="${1:-}"
+    [[ -z "$edp" ]] && edp=$(get_internal_output)
     local rate=""
     if command -v jq >/dev/null 2>&1; then
-        rate=$(kscreen-doctor -j 2>/dev/null | jq -r --arg out "$edp" '
+        local kjson
+        kjson=$(get_kscreen_json)
+        rate=$(jq -r --arg out "$edp" '
             .outputs[] | select(.name == $out) as $o |
             $o.modes[] | select((.id | tostring) == ($o.currentModeId | tostring)) | .refreshRate
-        ' 2>/dev/null | head -n 1 || true)
+        ' <<< "$kjson" 2>/dev/null | head -n 1 || true)
     fi
     if [[ -n "$rate" && "$rate" != "null" ]]; then
         printf "%.2f\n" "$rate" 2>/dev/null || echo "$rate"
@@ -68,14 +98,16 @@ set_rate() {
     local mode_id=""
 
     if command -v jq >/dev/null 2>&1; then
+        local kjson
+        kjson=$(get_kscreen_json)
         if [[ "$target" == "240" ]]; then
-            mode_id=$(kscreen-doctor -j 2>/dev/null | jq -r --arg out "$edp" '
+            mode_id=$(jq -r --arg out "$edp" '
                 .outputs[] | select(.name == $out) | .modes[] | select((.refreshRate >= 239) and (.refreshRate <= 241) and .size.width == 2560) | .id
-            ' 2>/dev/null | head -n 1 || true)
+            ' <<< "$kjson" 2>/dev/null | head -n 1 || true)
         elif [[ "$target" == "60" ]]; then
-            mode_id=$(kscreen-doctor -j 2>/dev/null | jq -r --arg out "$edp" '
+            mode_id=$(jq -r --arg out "$edp" '
                 .outputs[] | select(.name == $out) | .modes[] | select((.refreshRate >= 59) and (.refreshRate <= 61) and .size.width == 2560) | .id
-            ' 2>/dev/null | head -n 1 || true)
+            ' <<< "$kjson" 2>/dev/null | head -n 1 || true)
         fi
     fi
 
@@ -112,12 +144,15 @@ show_status() {
     local edp
     edp=$(get_internal_output)
     local current
-    current=$(get_current_rate)
+    current=$(get_current_rate "$edp")
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo -e " 🖥️  \033[1mDisplay Refresh Rate Controller (lhz)\033[0m"
     echo "────────────────────────────────────────────────────────────────────"
     echo -e "  Internal Panel (${edp}):"
-    if [[ "$current" =~ 240 ]]; then
+    if ! is_internal_enabled "$edp"; then
+        echo -e "    State:        \033[0;90m● Disabled (Lid Closed / External Only)\033[0m"
+        echo "    Last Rate:    ${current:-N/A} Hz (2560x1600 WQXGA OLED)"
+    elif [[ "$current" =~ 240 ]]; then
         echo -e "    Active Rate:  \033[1;32m● 240.00 Hz (Max Smoothness)\033[0m"
         echo "    Resolution :  2560x1600 WQXGA OLED @ 240 Hz"
     elif [[ "$current" =~ 60 ]]; then
@@ -129,8 +164,9 @@ show_status() {
 
     # Display external outputs if present
     if command -v jq >/dev/null 2>&1; then
-        local ext_lines
-        ext_lines=$(kscreen-doctor -j 2>/dev/null | jq -r '
+        local ext_lines kjson
+        kjson=$(get_kscreen_json)
+        ext_lines=$(jq -r '
             [.outputs[] | select(.connected and .enabled and (.name | startswith("eDP") | not))] as $ext |
             if ($ext | length) > 0 then
                 "────────────────────────────────────────────────────────────────────\n  External Displays (" + (($ext | length) | tostring) + " connected):\n" +
@@ -142,7 +178,7 @@ show_status() {
             else
                 ""
             end
-        ' 2>/dev/null || true)
+        ' <<< "$kjson" 2>/dev/null || true)
         if [[ -n "$ext_lines" ]]; then
             echo -e "$ext_lines"
         fi

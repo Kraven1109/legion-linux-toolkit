@@ -210,17 +210,53 @@ class TelemetryCollector:
     """Aggregates CPU, GPU, memory, power, thermals, and display telemetry."""
 
     def __init__(self):
-        self.nvml = NvmlTelemetry()
         self._last_rapl_energy: Optional[int] = None
         self._last_rapl_time: Optional[float] = None
+        self._rapl_max_energy: int = 262143328850
         self._last_cpu_ticks: Optional[tuple] = None
+        self._cpu_model: str = "Intel Processor"
+        self._logical_cores: int = 0
+        self._freq_nodes: List[str] = sorted(glob.glob("/sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq"))
+        try:
+            with open("/proc/cpuinfo", "r") as f:
+                for line in f:
+                    if line.startswith("model name") and self._cpu_model == "Intel Processor":
+                        self._cpu_model = line.split(":", 1)[1].strip().replace("Intel(R) Core(TM) ", "").replace(" CPU", "")
+                    elif line.startswith("processor"):
+                        self._logical_cores += 1
+        except Exception:
+            pass
+        # Prime baseline counters before NVML init so frame 1 has an elapsed measurement window
+        max_rapl_node = os.path.join(os.path.dirname(RAPL_ENERGY_NODE), "max_energy_range_uj")
+        if os.path.isfile(max_rapl_node):
+            try:
+                with open(max_rapl_node, "r") as f:
+                    val = int(f.read().strip())
+                    if val > 0:
+                        self._rapl_max_energy = val
+            except Exception:
+                pass
+        if os.path.isfile(RAPL_ENERGY_NODE):
+            try:
+                with open(RAPL_ENERGY_NODE, "r") as f:
+                    self._last_rapl_energy = int(f.read().strip())
+                self._last_rapl_time = time.monotonic()
+            except Exception:
+                pass
+        try:
+            with open("/proc/stat", "r") as sf:
+                parts = [float(x) for x in sf.readline().split()[1:]]
+            self._last_cpu_ticks = (sum(parts), parts[3] + parts[4])
+        except Exception:
+            pass
+        self.nvml = NvmlTelemetry()
 
     def get_cpu_info(self, sample_interval: float = 0.05) -> Dict[str, Any]:
         """Reads CPU model, cores, frequencies, load, coretemp, and live RAPL power."""
         mmio = get_rapl_mmio_limits()
         res = {
-            "model": "Intel Processor",
-            "logical_cores": 0,
+            "model": self._cpu_model,
+            "logical_cores": self._logical_cores,
             "avg_frequency_mhz": None,
             "max_frequency_mhz": None,
             "load_avg": list(os.getloadavg()),
@@ -230,20 +266,9 @@ class TelemetryCollector:
             "power_limit_pl2_w": mmio.get("pl2_w"),
         }
 
-        # Model and core count from /proc/cpuinfo
-        try:
-            with open("/proc/cpuinfo", "r") as f:
-                for line in f:
-                    if line.startswith("model name") and res["model"] == "Intel Processor":
-                        res["model"] = line.split(":", 1)[1].strip().replace("Intel(R) Core(TM) ", "").replace(" CPU", "")
-                    elif line.startswith("processor"):
-                        res["logical_cores"] += 1
-        except Exception:
-            pass
-
         # CPU Frequencies
         freqs: List[int] = []
-        for fpath in glob.glob("/sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq"):
+        for fpath in self._freq_nodes:
             try:
                 with open(fpath, "r") as fp:
                     freqs.append(int(fp.read().strip()))
@@ -266,45 +291,51 @@ class TelemetryCollector:
                 return 0.0, 0.0
 
         c_stat1 = _read_cpu_ticks()
+        if self._last_cpu_ticks is None:
+            self._last_cpu_ticks = c_stat1
+
         if os.path.isfile(RAPL_ENERGY_NODE):
             try:
                 with open(RAPL_ENERGY_NODE, "r") as f:
                     e1 = int(f.read().strip())
-                t1 = time.time()
+                t1 = time.monotonic()
 
+                used_prev = False
                 if self._last_rapl_energy is not None and self._last_rapl_time is not None:
                     dt = t1 - self._last_rapl_time
                     de = e1 - self._last_rapl_energy
-                    if dt > 0.1 and de >= 0:
+                    if de < 0 and self._rapl_max_energy > 0:
+                        de += self._rapl_max_energy
+                    if dt >= 0.04 and de >= 0:
                         res["package_power_w"] = round(de / (dt * 1e6), 1)
-                elif sample_interval > 0:
-                    time.sleep(sample_interval)
+                        used_prev = True
+                if not used_prev:
+                    wait_s = sample_interval if sample_interval > 0 else 0.04
+                    time.sleep(wait_s)
                     with open(RAPL_ENERGY_NODE, "r") as f:
                         e2 = int(f.read().strip())
-                    t2 = time.time()
+                    t2 = time.monotonic()
                     dt = t2 - t1
                     de = e2 - e1
+                    if de < 0 and self._rapl_max_energy > 0:
+                        de += self._rapl_max_energy
                     if dt > 0 and de >= 0:
                         res["package_power_w"] = round(de / (dt * 1e6), 1)
+                    e1, t1 = e2, t2
+                    c_stat1 = _read_cpu_ticks()
 
                 self._last_rapl_energy = e1
                 self._last_rapl_time = t1
             except Exception:
                 pass
-        elif sample_interval > 0 and self._last_cpu_ticks is None:
+        elif c_stat1 == self._last_cpu_ticks and sample_interval > 0:
             time.sleep(sample_interval)
+            c_stat1 = _read_cpu_ticks()
 
-        if self._last_cpu_ticks is not None:
-            dt_tot = c_stat1[0] - self._last_cpu_ticks[0]
-            di_idle = c_stat1[1] - self._last_cpu_ticks[1]
-            res["usage_percent"] = round(100.0 * (dt_tot - di_idle) / dt_tot, 1) if dt_tot > 0 else 0.0
-            self._last_cpu_ticks = c_stat1
-        else:
-            c_stat2 = _read_cpu_ticks()
-            dt_tot = c_stat2[0] - c_stat1[0]
-            di_idle = c_stat2[1] - c_stat1[1]
-            res["usage_percent"] = round(100.0 * (dt_tot - di_idle) / dt_tot, 1) if dt_tot > 0 else 0.0
-            self._last_cpu_ticks = c_stat2
+        dt_tot = c_stat1[0] - self._last_cpu_ticks[0]
+        di_idle = c_stat1[1] - self._last_cpu_ticks[1]
+        res["usage_percent"] = round(100.0 * (dt_tot - di_idle) / dt_tot, 1) if dt_tot > 0 else 0.0
+        self._last_cpu_ticks = c_stat1
 
         return res
 
@@ -336,9 +367,9 @@ class TelemetryCollector:
             pass
         return res
 
-    def get_display_info(self) -> Dict[str, Any]:
+    def get_display_info(self, ttl: float = 0.0) -> Dict[str, Any]:
         """Reads display panel ID, refresh rate, and matches active color profiles for all displays."""
-        disp_info = get_active_display_info()
+        disp_info = get_active_display_info(ttl=ttl)
 
         def _resolve_profile(icc_path: str, is_int: bool):
             if not icc_path:
@@ -381,6 +412,7 @@ class TelemetryCollector:
 
     def collect_all(self, sample_interval: float = 0.05) -> Dict[str, Any]:
         """Aggregates full system metrics tree."""
+        display_ttl = 2.0 if sample_interval == 0.0 else 0.0
         return {
             "timestamp": time.time(),
             "platform_profile": get_platform_profile(),
@@ -391,7 +423,7 @@ class TelemetryCollector:
             "memory": self.get_memory_info(),
             "storage": {"nvme_temps_c": get_nvme_temps()},
             "power_battery": get_battery_info(),
-            "display": self.get_display_info(),
+            "display": self.get_display_info(ttl=display_ttl),
         }
 
     def close(self):
@@ -477,7 +509,17 @@ class DashboardRenderer:
         c_p_num = cpu.get("package_power_w")
         pl1_w = cpu.get("power_limit_pl1_w")
         pl2_w = cpu.get("power_limit_pl2_w")
-        eff_limit_w = min(pl1_w, pl2_w) if (pl1_w is not None and pl2_w is not None) else pl1_w
+        if pl1_w is not None and pl2_w is not None:
+            if pl2_w < pl1_w:
+                # Abnormal clamp where short-term PL2 is lower than long-term PL1
+                eff_limit_w = pl2_w
+            elif c_p_num is not None and c_p_num > pl1_w:
+                # Active short-term turbo burst between PL1 and PL2: show PL2 burst ceiling
+                eff_limit_w = pl2_w
+            else:
+                eff_limit_w = pl1_w
+        else:
+            eff_limit_w = pl1_w if pl1_w is not None else pl2_w
         if c_p_num is not None:
             c_draw_val = f"{c_p_num:.0f}" if c_p_num >= 100 else f"{c_p_num:.1f}"
         else:
@@ -783,7 +825,7 @@ def run_watch_mode(telemetry: TelemetryCollector, interval: float = 1.0):
 
     try:
         while True:
-            t_start = time.time()
+            t_start = time.monotonic()
 
             term_size = shutil.get_terminal_size(fallback=(80, 24))
             term_cols = term_size.columns
@@ -846,7 +888,7 @@ def run_watch_mode(telemetry: TelemetryCollector, interval: float = 1.0):
                     print(output)
 
             while True:
-                elapsed = time.time() - t_start
+                elapsed = time.monotonic() - t_start
                 remaining = max(0.0, interval - elapsed)
                 if remaining <= 0.0 or resized:
                     break

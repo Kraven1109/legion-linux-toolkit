@@ -11,7 +11,7 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo "📦 Installing CLI tools to ~/.local/bin/..."
 mkdir -p "$HOME/.local/bin"
 find "$DIR/bin" -maxdepth 1 -type f -exec cp -v {} "$HOME/.local/bin/" \;
-chmod +x "$HOME"/.local/bin/{lbat,lmode,lhz,lcolor,lstats,legion-profile-osd,test-hotkey}
+chmod +x "$HOME"/.local/bin/{lbat,lmode,lhz,lcolor,lstats,lcopilot,legion-profile-osd,test-hotkey}
 
 # 2. Deploy default configuration (only if not already present)
 echo "⚙️  Ensuring ~/.config/legion/config.jsonc exists..."
@@ -44,7 +44,14 @@ else
     echo "   Skipped: ~/.config/rofi/legion-launcher.rasi already exists (user-customized)"
 fi
 
-# 5. Deploy systemd user service
+# 5. Deploy desktop shortcuts & systemd user service
+if [[ -d "$DIR/desktop" ]]; then
+    echo "🖥️  Installing desktop shortcut entries to ~/.local/share/applications/..."
+    mkdir -p "$HOME/.local/share/applications"
+    cp -v "$DIR"/desktop/*.desktop "$HOME/.local/share/applications/" 2>/dev/null || true
+    command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$HOME/.local/share/applications" >/dev/null 2>&1 || true
+fi
+
 echo "⚙️  Deploying legion-profile-osd user service..."
 mkdir -p "$HOME/.config/systemd/user"
 cp -v "$DIR"/systemd/*.service "$HOME/.config/systemd/user/"
@@ -87,6 +94,7 @@ echo "   - lmode        : Power & Thermal Profiles (Quiet, Balanced, Perf, Extre
 echo "   - lhz          : Display Refresh Rate (240Hz / 60Hz)"
 echo "   - lcolor       : Display Color Profile Manager (sRGB, Display P3, DCI-P3...)"
 echo "   - lstats       : Hardware & Platform Telemetry CLI (Live Dashboard)"
+echo "   - lcopilot     : External keyboard trigger for Copilot Tap / Quick Launch"
 echo "   - Fn + Q       : Hardware 3-mode power loop + OSD banner"
 echo "   - Fn + R       : Hardware refresh rate toggle + OSD banner"
 echo "   - Fn + L       : Display color profile cycle (EDID-validated) + OSD banner"

@@ -18,26 +18,33 @@ get_choices() {
     fi
 }
 
-get_fans() {
-    if command -v sensors >/dev/null 2>&1; then
-        sensors 2>/dev/null | grep -E "fan[124]:" | awk '{print $1, $2, $3}' | tr '\n' ' | ' | sed 's/ | $//' || true
-    fi
-}
-
-get_rapl_status() {
+get_hw_telemetry() {
     if command -v python3 >/dev/null 2>&1 && [[ -f "$SCRIPT_DIR/legion_core.py" ]]; then
         python3 -c '
 import sys
 sys.path.insert(0, sys.argv[1])
-from legion_core import get_rapl_mmio_limits, is_ac_online
+from legion_core import get_cooling_fans, get_rapl_mmio_limits, is_ac_online
+f = get_cooling_fans()
+c_rpm = f["cpu_fan"]["rpm"]
+g_rpm = f["gpu_fan"]["rpm"]
+a_rpm = f["aux_fan"]["rpm"]
+fans_str = f"fan1: {c_rpm} RPM | fan2: {g_rpm} RPM | fan4: {a_rpm} RPM"
 info = get_rapl_mmio_limits()
-pl1 = info.get("pl1_w")
-pl2 = info.get("pl2_w")
+pl1, pl2 = info.get("pl1_w"), info.get("pl2_w")
+rapl_str = ""
 if info.get("available") and pl1 is not None and pl2 is not None:
     pwr = "AC" if is_ac_online() else "Battery"
-    print(f"MMIO PL1: {pl1:.0f}W | PL2: {pl2:.0f}W ({pwr})")
-' "$SCRIPT_DIR" || true
+    rapl_str = f"MMIO PL1: {pl1:.0f}W | PL2: {pl2:.0f}W ({pwr})"
+print(fans_str)
+print(rapl_str)
+' "$SCRIPT_DIR" && return
     fi
+    if command -v sensors >/dev/null 2>&1; then
+        sensors 2>/dev/null | grep -E "fan[124]:" | awk '{print $1, $2, $3}' | tr '\n' ' | ' | sed 's/ | $//' || true
+    else
+        echo ""
+    fi
+    echo ""
 }
 
 get_mode_desc() {
@@ -67,8 +74,12 @@ get_mode_desc() {
 get_status() {
     local current
     current=$(cat "$NODE")
-    local fans
-    fans=$(get_fans)
+    local fans=""
+    local rapl=""
+    {
+        IFS= read -r fans || true
+        IFS= read -r rapl || true
+    } < <(get_hw_telemetry)
     local choices_str
     choices_str=$(get_choices)
     read -ra choices <<< "$choices_str"
@@ -108,8 +119,6 @@ get_status() {
         echo -e "  Fans:         🌀 $fans"
     fi
 
-    local rapl
-    rapl=$(get_rapl_status)
     if [[ -n "$rapl" ]]; then
         echo -e "  CPU Limits:   ⚡ $rapl"
     fi
