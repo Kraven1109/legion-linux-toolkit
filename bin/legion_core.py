@@ -448,10 +448,10 @@ def get_active_display_info(ttl: float = 0.0) -> Dict[str, Any]:
                     try:
                         with open(status_p, "r") as sf:
                             if sf.read().strip().lower() == "connected":
-                                card_dir = os.path.dirname(os.path.dirname(status_p))
-                                vend_p = os.path.join(os.path.dirname(status_p), "device", "vendor")
-                                if not os.path.isfile(vend_p):
-                                    vend_p = os.path.join(card_dir, "device", "vendor")
+                                conn_dir = os.path.dirname(status_p)
+                                card_name = os.path.basename(conn_dir).split("-", 1)[0]
+                                card_dev_dir = os.path.join("/sys/class/drm", card_name, "device")
+                                vend_p = os.path.join(card_dev_dir, "vendor")
                                 if os.path.isfile(vend_p):
                                     with open(vend_p, "r") as vf:
                                         v_id = vf.read().strip().lower()
@@ -459,6 +459,13 @@ def get_active_display_info(ttl: float = 0.0) -> Dict[str, Any]:
                                             gpu_source = "dGPU"
                                         elif v_id == "0x8086":
                                             gpu_source = "iGPU"
+                                        elif v_id == "0x1002":
+                                            b_vga_p = os.path.join(card_dev_dir, "boot_vga")
+                                            is_boot = False
+                                            if os.path.isfile(b_vga_p):
+                                                with open(b_vga_p, "r") as bf:
+                                                    is_boot = bf.read().strip() == "1"
+                                            gpu_source = "iGPU" if is_boot else "dGPU"
                                 break
                     except Exception:
                         pass
