@@ -16,6 +16,7 @@ import sys
 import glob
 import json
 import time
+import struct
 import shutil
 import ctypes
 import subprocess
@@ -256,6 +257,12 @@ def get_panel_info() -> Tuple[Optional[str], Optional[str]]:
 PNP_MANUFACTURERS: Dict[str, str] = {
     "SDC": "Samsung",
     "SAM": "Samsung",
+    "BOE": "BOE",
+    "AUO": "AUO",
+    "CMN": "Innolux",
+    "CSO": "CSOT",
+    "SHP": "Sharp",
+    "IVM": "Iiyama",
     "DEL": "Dell",
     "GSM": "LG",
     "LGD": "LG",
@@ -433,7 +440,28 @@ def get_active_display_info(ttl: float = 0.0) -> Dict[str, Any]:
                         break
                 d_info["_mode_matched"] = mode_matched
 
-                # Resolve EDID for this connector (cached per connector path)
+                # Resolve EDID and GPU source (dGPU vs iGPU) for this connector
+                gpu_source = "iGPU" if is_internal else "dGPU"
+                for status_p in glob.glob(f"/sys/class/drm/card*-{out_name}/status"):
+                    try:
+                        with open(status_p, "r") as sf:
+                            if sf.read().strip().lower() == "connected":
+                                card_dir = os.path.dirname(os.path.dirname(status_p))
+                                vend_p = os.path.join(os.path.dirname(status_p), "device", "vendor")
+                                if not os.path.isfile(vend_p):
+                                    vend_p = os.path.join(card_dir, "device", "vendor")
+                                if os.path.isfile(vend_p):
+                                    with open(vend_p, "r") as vf:
+                                        v_id = vf.read().strip().lower()
+                                        if v_id == "0x10de":
+                                            gpu_source = "dGPU"
+                                        elif v_id == "0x8086":
+                                            gpu_source = "iGPU"
+                                break
+                    except Exception:
+                        pass
+                d_info["gpu_source"] = gpu_source
+
                 edid_parsed = _EDID_CACHE.get(out_name)
                 if edid_parsed is None:
                     for edid_p in glob.glob(f"/sys/class/drm/*-{out_name}/edid"):
@@ -761,52 +789,57 @@ def get_hwmon_by_name(name: str) -> Optional[str]:
 
 def get_cooling_fans() -> Dict[str, Any]:
     """
-    Queries Lenovo triple-fan configuration via lenovo_wmi_other hwmon.
-    CPU Fan (fan1), GPU Fan (fan2), Aux/Rear Fan (fan4).
+    Queries Lenovo cooling fan telemetry via lenovo_wmi_other or legon_laptop hwmon.
+    Supports both triple-fan (CPU fan1, GPU fan2, Aux fan4/fan3) and dual-fan laptops.
     """
     res = {
-        "cpu_fan": {"rpm": 0, "max_rpm": 5200, "percent": 0.0},
-        "gpu_fan": {"rpm": 0, "max_rpm": 5400, "percent": 0.0},
-        "aux_fan": {"rpm": 0, "max_rpm": 6500, "percent": 0.0},
+        "cpu_fan": {"rpm": 0, "max_rpm": 5200, "percent": 0.0, "present": False},
+        "gpu_fan": {"rpm": 0, "max_rpm": 5400, "percent": 0.0, "present": False},
+        "aux_fan": {"rpm": 0, "max_rpm": 6500, "percent": 0.0, "present": False},
     }
 
-    wmi_dir = get_hwmon_by_name("lenovo_wmi_other")
+    wmi_dir = get_hwmon_by_name("lenovo_wmi_other") or get_hwmon_by_name("legion")
     if wmi_dir:
         fan_mappings = [
-            ("fan1", "cpu_fan", 5200),
-            ("fan2", "gpu_fan", 5400),
-            ("fan4", "aux_fan", 6500),
+            (["fan1"], "cpu_fan", 5200),
+            (["fan2"], "gpu_fan", 5400),
+            (["fan4", "fan3"], "aux_fan", 6500),
         ]
-        for prefix, key, default_max in fan_mappings:
-            inp = os.path.join(wmi_dir, f"{prefix}_input")
-            max_f = os.path.join(wmi_dir, f"{prefix}_max")
-            rpm = 0
-            max_rpm = default_max
-
-            if os.path.isfile(inp):
+        for prefixes, key, default_max in fan_mappings:
+            for prefix in prefixes:
+                inp = os.path.join(wmi_dir, f"{prefix}_input")
+                if not os.path.isfile(inp):
+                    continue
+                max_f = os.path.join(wmi_dir, f"{prefix}_max")
+                rpm = 0
+                max_rpm = default_max
                 try:
                     with open(inp, "r") as f:
                         rpm = int(f.read().strip())
                 except Exception:
                     pass
-
-            if os.path.isfile(max_f):
-                try:
-                    with open(max_f, "r") as f:
-                        val = int(f.read().strip())
-                        if val > 0:
-                            max_rpm = val
-                except Exception:
-                    pass
-
-            pct = round((rpm / max_rpm) * 100.0, 1) if max_rpm > 0 else 0.0
-            res[key] = {"rpm": rpm, "max_rpm": max_rpm, "percent": pct}
+                if os.path.isfile(max_f):
+                    try:
+                        with open(max_f, "r") as f:
+                            val = int(f.read().strip())
+                            if val > 0:
+                                max_rpm = val
+                    except Exception:
+                        pass
+                pct = round((rpm / max_rpm) * 100.0, 1) if max_rpm > 0 else 0.0
+                res[key] = {"rpm": rpm, "max_rpm": max_rpm, "percent": pct, "present": True}
+                break
 
     return res
 
 
-def get_spd_ram_temps() -> List[float]:
-    """Reads DDR5 SPD thermal sensors (spd5118) in degrees Celsius."""
+def get_spd_ram_temps(ttl: float = 0.0) -> List[float]:
+    """Reads DDR5 SPD thermal sensors (spd5118) in degrees Celsius (with optional TTL cache to reduce SMBus I2C traffic)."""
+    global _CACHED_SPD_TEMPS, _CACHED_SPD_TIME
+    now = time.monotonic()
+    if ttl > 0.0 and _CACHED_SPD_TEMPS is not None and (now - _CACHED_SPD_TIME) < ttl:
+        return _CACHED_SPD_TEMPS
+
     temps: List[float] = []
     for hdir in get_hwmons_by_name("spd5118"):
         temp_file = os.path.join(hdir, "temp1_input")
@@ -816,11 +849,262 @@ def get_spd_ram_temps() -> List[float]:
                     temps.append(round(int(tf.read().strip()) / 1000.0, 1))
             except Exception:
                 pass
+    _CACHED_SPD_TEMPS = temps
+    _CACHED_SPD_TIME = now
     return temps
+
+
+_CACHED_SYSTEM_MODEL: Optional[str] = None
+_CACHED_MEMORY_HARDWARE: Optional[Dict[str, Any]] = None
+
+
+def get_system_model() -> str:
+    """
+    Dynamically reads laptop product version and type from DMI sysfs
+    (e.g. 'Pro 7 16IAX10H' or 'Legion 5 16IRX9').
+    """
+    global _CACHED_SYSTEM_MODEL
+    if _CACHED_SYSTEM_MODEL is not None:
+        return _CACHED_SYSTEM_MODEL
+
+    ver = ""
+    name = ""
+    for node, attr in (
+        ("/sys/class/dmi/id/product_version", "ver"),
+        ("/sys/class/dmi/id/product_family", "fam"),
+        ("/sys/class/dmi/id/product_name", "name"),
+    ):
+        if os.path.isfile(node):
+            try:
+                with open(node, "r") as f:
+                    val = f.read().strip()
+                    if val and val.lower() not in ("invalid", "none", "to be filled by o.e.m."):
+                        if attr in ("ver", "fam") and not ver:
+                            ver = val
+                        elif attr == "name":
+                            name = val
+            except Exception:
+                pass
+
+    clean = ver.replace("Lenovo ", "").replace("Legion ", "").strip()
+    if not clean:
+        clean = name or "Lenovo Legion"
+    _CACHED_SYSTEM_MODEL = clean
+    return clean
+
+
+def get_memory_hardware_info() -> Dict[str, Any]:
+    """
+    Dynamically inspects SMBIOS Type 17 Memory Device entries (/sys/firmware/dmi/entries/17-*/raw)
+    to extract populated DIMM count, per-DIMM capacity, DDR generation, speed (MT/s), and vendor.
+    Falls back gracefully when SMBIOS entries are not world-readable.
+    """
+    global _CACHED_MEMORY_HARDWARE
+    if _CACHED_MEMORY_HARDWARE is not None:
+        return _CACHED_MEMORY_HARDWARE
+
+    mem_type_map = {
+        0x18: "DDR3",
+        0x1A: "DDR4",
+        0x1E: "LPDDR4",
+        0x22: "DDR5",
+        0x23: "LPDDR5",
+    }
+
+    dimms: List[Dict[str, Any]] = []
+    for raw_path in sorted(glob.glob("/sys/firmware/dmi/entries/17-*/raw")):
+        if not os.access(raw_path, os.R_OK):
+            continue
+        try:
+            with open(raw_path, "rb") as f:
+                data = f.read()
+            if len(data) < 0x18:
+                continue
+            hdr_len = data[1]
+            size_raw = struct.unpack("<H", data[0x0C:0x0E])[0]
+            if size_raw == 0 or size_raw == 0xFFFF:
+                continue
+            if size_raw == 0x7FFF and hdr_len >= 0x20 and len(data) >= 0x20:
+                ext_mb = struct.unpack("<I", data[0x1C:0x20])[0] & 0x7FFFFFFF
+                size_gb = max(1, int(round(ext_mb / 1024.0)))
+            else:
+                if size_raw & 0x8000:
+                    size_gb = max(1, int(round((size_raw & 0x7FFF) / (1024 * 1024))))
+                else:
+                    size_gb = max(1, int(round(size_raw / 1024.0)))
+
+            mtype_code = data[0x12]
+            mem_type = mem_type_map.get(mtype_code, "DDR5")
+            speed_mts = struct.unpack("<H", data[0x15:0x17])[0]
+            conf_speed = struct.unpack("<H", data[0x20:0x22])[0] if (hdr_len >= 0x22 and len(data) >= 0x22) else 0
+            eff_speed = conf_speed or speed_mts
+
+            raw_strs = [s.decode("utf-8", errors="replace").strip() for s in data[hdr_len:].split(b"\x00") if s.strip()]
+            vendor = ""
+            for s in raw_strs:
+                sl = s.lower()
+                if any(v in sl for v in ("micron", "samsung", "hynix", "sk hynix", "kingston", "crucial", "corsair", "g.skill")):
+                    vendor = s.replace(" Technology", "").replace(" Semiconductor", "").strip()
+                    break
+
+            dimms.append({
+                "size_gb": size_gb,
+                "type": mem_type,
+                "speed_mts": eff_speed,
+                "vendor": vendor,
+            })
+        except Exception:
+            pass
+
+    spd_count = len(get_hwmons_by_name("spd5118"))
+    if dimms:
+        d0 = dimms[0]
+        count = len(dimms)
+        mtype = d0["type"]
+        speed = d0["speed_mts"]
+        size_gb = d0["size_gb"]
+        vendor = d0["vendor"]
+        type_speed = f"{mtype}-{speed}" if speed > 0 else mtype
+        slot_summary = f"{count}x{size_gb}GB"
+        summary = f"{type_speed} ({slot_summary} {vendor})".strip() if vendor else f"{type_speed} ({slot_summary})"
+        short_summary = f"{type_speed} ({slot_summary})"
+    else:
+        mtype = "DDR5" if spd_count > 0 else "RAM"
+        count = spd_count if spd_count > 0 else 0
+        type_speed = mtype
+        slot_summary = f"{count}x SODIMM" if count > 0 else "SODIMM"
+        summary = f"{type_speed} ({slot_summary})"
+        short_summary = summary
+
+    _CACHED_MEMORY_HARDWARE = {
+        "type": mtype,
+        "speed_mts": dimms[0]["speed_mts"] if dimms else None,
+        "dimm_count": len(dimms) if dimms else count,
+        "dimm_size_gb": dimms[0]["size_gb"] if dimms else None,
+        "vendor": dimms[0]["vendor"] if dimms else "",
+        "type_speed": type_speed,
+        "slot_summary": slot_summary,
+        "summary": summary,
+        "short_summary": short_summary,
+    }
+    return _CACHED_MEMORY_HARDWARE
+
+
+_CACHED_NVME_META: Optional[List[Dict[str, Any]]] = None
+_CACHED_NVME_DRIVES: Optional[List[Dict[str, Any]]] = None
+_CACHED_NVME_TIME: float = 0.0
+_CACHED_SPD_TEMPS: Optional[List[float]] = None
+_CACHED_SPD_TIME: float = 0.0
+_CACHED_BATTERY_INFO: Optional[Dict[str, Any]] = None
+_CACHED_BATTERY_TIME: float = 0.0
+
+
+def get_nvme_drives(ttl: float = 0.0) -> List[Dict[str, Any]]:
+    """
+    Reads per-drive NVMe telemetry (device name, model, capacity, PCIe link speed/width, temperatures).
+    Caches static drive metadata and hwmon paths, and supports optional TTL caching so watch-mode loops
+    avoid waking NVMe controllers via admin SMART log commands on every sub-second tick.
+    """
+    global _CACHED_NVME_META, _CACHED_NVME_DRIVES, _CACHED_NVME_TIME
+    now = time.monotonic()
+    if ttl > 0.0 and _CACHED_NVME_DRIVES is not None and (now - _CACHED_NVME_TIME) < ttl:
+        return _CACHED_NVME_DRIVES
+
+    if _CACHED_NVME_META is None:
+        meta_list: List[Dict[str, Any]] = []
+        for nvme_dir in sorted(glob.glob("/sys/class/nvme/nvme[0-9]*")):
+            dev_name = os.path.basename(nvme_dir)
+            model = dev_name.upper()
+            model_p = os.path.join(nvme_dir, "model")
+            if os.path.isfile(model_p):
+                try:
+                    with open(model_p, "r") as mf:
+                        raw_m = " ".join(mf.read().strip().split())
+                        if raw_m:
+                            model = raw_m
+                except Exception:
+                    pass
+            short_model = (
+                model.replace("Samsung SSD ", "")
+                .replace("Western Digital ", "WD ")
+                .replace("WD_BLACK ", "WD ")
+                .replace("KINGSTON ", "Kingston ")
+                .strip()
+            )
+
+            pcie_tag = ""
+            dev_link = os.path.realpath(os.path.join(nvme_dir, "device"))
+            spd_p = os.path.join(dev_link, "current_link_speed")
+            wid_p = os.path.join(dev_link, "current_link_width")
+            if os.path.isfile(spd_p) and os.path.isfile(wid_p):
+                try:
+                    raw_spd = open(spd_p).read().strip()
+                    raw_wid = open(wid_p).read().strip()
+                    if "32.0" in raw_spd:
+                        gen = "Gen5"
+                    elif "16.0" in raw_spd:
+                        gen = "Gen4"
+                    elif "8.0" in raw_spd:
+                        gen = "Gen3"
+                    else:
+                        gen = "PCIe"
+                    pcie_tag = f"{gen} x{raw_wid}"
+                except Exception:
+                    pass
+
+            if not any(u in short_model.upper() for u in ("TB", "GB")):
+                ns_dirs = sorted(glob.glob(os.path.join(nvme_dir, f"{dev_name}n*")))
+                if ns_dirs and os.path.isfile(os.path.join(ns_dirs[0], "size")):
+                    try:
+                        sectors = int(open(os.path.join(ns_dirs[0], "size")).read().strip())
+                        gb = (sectors * 512) / 1e9
+                        size_tag = f"{gb / 1000.0:.0f}TB" if gb >= 950 else f"{gb:.0f}GB"
+                        short_model = f"{short_model} {size_tag}"
+                    except Exception:
+                        pass
+
+            temp1_node: Optional[str] = None
+            for hdir in sorted(glob.glob(os.path.join(nvme_dir, "hwmon*"))):
+                tp = os.path.join(hdir, "temp1_input")
+                if os.path.isfile(tp):
+                    temp1_node = tp
+                    break
+            if temp1_node:
+                meta_list.append({
+                    "device": dev_name,
+                    "model": model,
+                    "short_model": short_model,
+                    "pcie_tag": pcie_tag,
+                    "temp1_node": temp1_node,
+                })
+        _CACHED_NVME_META = meta_list
+
+    drives: List[Dict[str, Any]] = []
+    for m in _CACHED_NVME_META:
+        comp_c: Optional[float] = None
+        try:
+            with open(m["temp1_node"], "r") as tf:
+                comp_c = round(int(tf.read().strip()) / 1000.0, 1)
+        except Exception:
+            pass
+        if comp_c is not None:
+            drives.append({
+                "device": m["device"],
+                "model": m["model"],
+                "short_model": m["short_model"],
+                "pcie_tag": m["pcie_tag"],
+                "composite_c": comp_c,
+            })
+    _CACHED_NVME_DRIVES = drives
+    _CACHED_NVME_TIME = now
+    return drives
 
 
 def get_nvme_temps() -> List[float]:
     """Reads composite NVMe drive temperatures in degrees Celsius."""
+    drives = get_nvme_drives()
+    if drives:
+        return [d["composite_c"] for d in drives if d.get("composite_c") is not None]
     temps: List[float] = []
     for hdir in get_hwmons_by_name("nvme"):
         temp_file = os.path.join(hdir, "temp1_input")
@@ -834,21 +1118,30 @@ def get_nvme_temps() -> List[float]:
 
 
 def get_cpu_package_temp() -> Optional[float]:
-    """Reads CPU Package 0 temperature from coretemp hwmon."""
-    ct_dir = get_hwmon_by_name("coretemp")
-    if ct_dir:
-        t_file = os.path.join(ct_dir, "temp1_input")
-        if os.path.isfile(t_file):
-            try:
-                with open(t_file, "r") as f:
-                    return round(int(f.read().strip()) / 1000.0, 1)
-            except Exception:
-                pass
+    """Reads CPU Package temperature from coretemp (Intel) or k10temp/zenpower (AMD) hwmon."""
+    for drv in ("coretemp", "k10temp", "zenpower", "acpitz"):
+        ct_dir = get_hwmon_by_name(drv)
+        if ct_dir:
+            t_file = os.path.join(ct_dir, "temp1_input")
+            if os.path.isfile(t_file):
+                try:
+                    with open(t_file, "r") as f:
+                        return round(int(f.read().strip()) / 1000.0, 1)
+                except Exception:
+                    pass
     return None
 
 
-def get_battery_info() -> Dict[str, Any]:
-    """Reads comprehensive battery telemetry, health, cycles, and conservation mode."""
+def get_battery_info(ttl: float = 0.0) -> Dict[str, Any]:
+    """Reads comprehensive battery telemetry, health, cycles, and conservation mode (with optional TTL cache to avoid 65ms ACPI EC stalls)."""
+    global _CACHED_BATTERY_INFO, _CACHED_BATTERY_TIME
+    now = time.monotonic()
+    if ttl > 0.0 and _CACHED_BATTERY_INFO is not None and (now - _CACHED_BATTERY_TIME) < ttl:
+        # Always refresh conservation_mode (<0.15ms) so interactive [c] toggle reflects immediately
+        cons_active, _ = get_conservation_mode()
+        _CACHED_BATTERY_INFO["conservation_mode"] = cons_active
+        return dict(_CACHED_BATTERY_INFO)
+
     res = {
         "present": False,
         "capacity_percent": None,
@@ -899,7 +1192,9 @@ def get_battery_info() -> Dict[str, Any]:
 
     cons_active, _ = get_conservation_mode()
     res["conservation_mode"] = cons_active
-    return res
+    _CACHED_BATTERY_INFO = res
+    _CACHED_BATTERY_TIME = now
+    return dict(res)
 
 
 _CACHED_DAEMON_PID: Optional[int] = None
@@ -1043,6 +1338,260 @@ def _probe_nvidia_procfs() -> Dict[str, Any]:
         except Exception:
             pass
     return info
+
+
+class _PerfEventAttr(ctypes.Structure):
+    """Linux perf_event_attr structure for zero-overhead i915/xe PMU engine counters."""
+    _fields_ = [
+        ("type", ctypes.c_uint32),
+        ("size", ctypes.c_uint32),
+        ("config", ctypes.c_uint64),
+        ("sample_period", ctypes.c_uint64),
+        ("sample_type", ctypes.c_uint64),
+        ("read_format", ctypes.c_uint64),
+        ("flags", ctypes.c_uint64),
+        ("wakeup_events", ctypes.c_uint32),
+        ("bp_type", ctypes.c_uint32),
+        ("config1", ctypes.c_uint64),
+        ("config2", ctypes.c_uint64),
+        ("branch_sample_type", ctypes.c_uint64),
+        ("sample_regs_user", ctypes.c_uint64),
+        ("sample_stack_user", ctypes.c_uint32),
+        ("clockid", ctypes.c_int32),
+        ("sample_regs_intr", ctypes.c_uint64),
+        ("aux_watermark", ctypes.c_uint32),
+        ("sample_max_stack", ctypes.c_uint16),
+        ("__reserved_2", ctypes.c_uint16),
+        ("aux_sample_size", ctypes.c_uint32),
+        ("__reserved_3", ctypes.c_uint32),
+    ]
+
+
+class IntelIgpuTelemetry:
+    """
+    Zero-overhead integrated GPU telemetry via kernel PMU & sysfs (Intel i915/xe DRM & RAPL PP1, or AMD amdgpu).
+    - Reads true hardware engine busyness (Render/3D rcs0, Compute ccs0, Video vcs0, Copy bcs0) in <5µs
+      via Linux perf_event_open() on the i915 PMU (same source as intel_gpu_top), avoiding false 90-100%
+      readings from display-wake RC6 counters.
+    - Tracks live actual/max GT frequency (MHz) and PP1 uncore/iGPU power draw (Watts).
+    """
+
+    def __init__(self):
+        self.card_dir: Optional[str] = None
+        self.vendor: str = "Intel"
+        self.name: str = "Intel Graphics"
+        self.gt_dir: Optional[str] = None
+        self.act_freq_node: Optional[str] = None
+        self.cur_freq_node: Optional[str] = None
+        self.max_freq_node: Optional[str] = None
+        self.rc6_node: Optional[str] = None
+        self.amd_busy_node: Optional[str] = None
+        self.rapl_pp1_node: Optional[str] = "/sys/class/powercap/intel-rapl:0:1/energy_uj"
+        self._pmu_fds: Dict[str, int] = {}
+        self._last_pmu_ns: Dict[str, int] = {}
+        self._last_pmu_time: Optional[float] = None
+        self._last_rc6_ms: Optional[int] = None
+        self._last_rc6_time: Optional[float] = None
+        self._last_pp1_uj: Optional[int] = None
+        self._last_pp1_time: Optional[float] = None
+
+        for cdir in sorted(glob.glob("/sys/class/drm/card[0-9]*")):
+            if "-" in os.path.basename(cdir):
+                continue
+            vend_p = os.path.join(cdir, "device", "vendor")
+            if os.path.isfile(vend_p):
+                try:
+                    with open(vend_p, "r") as vf:
+                        vid = vf.read().strip().lower()
+                        if vid == "0x8086":
+                            self.card_dir = cdir
+                            self.vendor = "Intel"
+                            self.name = "Intel Graphics"
+                            break
+                        elif vid == "0x1002":
+                            self.card_dir = cdir
+                            self.vendor = "AMD"
+                            self.name = "Radeon Graphics"
+                except Exception:
+                    pass
+
+        if self.card_dir:
+            if self.vendor == "Intel":
+                gt0 = os.path.join(self.card_dir, "gt", "gt0")
+                if os.path.isdir(gt0):
+                    self.gt_dir = gt0
+                    self.act_freq_node = os.path.join(gt0, "rps_act_freq_mhz")
+                    self.cur_freq_node = os.path.join(gt0, "rps_cur_freq_mhz")
+                    self.max_freq_node = os.path.join(gt0, "rps_max_freq_mhz")
+                    self.rc6_node = os.path.join(gt0, "rc6_residency_ms")
+                else:
+                    self.act_freq_node = os.path.join(self.card_dir, "gt_act_freq_mhz")
+                    self.cur_freq_node = os.path.join(self.card_dir, "gt_cur_freq_mhz")
+                    self.max_freq_node = os.path.join(self.card_dir, "gt_max_freq_mhz")
+                    self.rc6_node = os.path.join(self.card_dir, "power", "rc6_residency_ms")
+                self._init_i915_pmu()
+            else:
+                self.amd_busy_node = os.path.join(self.card_dir, "device", "gpu_busy_percent")
+
+        # Prime counters
+        now = time.monotonic()
+        if self._pmu_fds:
+            self._last_pmu_ns = self._read_pmu_ns()
+            self._last_pmu_time = now
+        elif self.rc6_node and os.path.isfile(self.rc6_node):
+            try:
+                with open(self.rc6_node, "r") as f:
+                    self._last_rc6_ms = int(f.read().strip())
+                self._last_rc6_time = now
+            except Exception:
+                pass
+        if self.rapl_pp1_node and os.path.isfile(self.rapl_pp1_node):
+            try:
+                with open(self.rapl_pp1_node, "r") as f:
+                    self._last_pp1_uj = int(f.read().strip())
+                self._last_pp1_time = now
+            except Exception:
+                pass
+
+    def _init_i915_pmu(self):
+        """Opens direct kernel perf_event descriptors for i915 engine busyness counters."""
+        pmu_type_path = "/sys/bus/event_source/devices/i915/type"
+        if not os.path.isfile(pmu_type_path):
+            return
+        try:
+            with open(pmu_type_path, "r") as f:
+                pmu_type = int(f.read().strip())
+            libc = ctypes.CDLL("libc.so.6", use_errno=True)
+            sys_perf_event_open = 298  # x86_64 __NR_perf_event_open
+            # Engine busy configs from /sys/bus/event_source/devices/i915/events/*-busy
+            engines = [("rcs0", 0x0), ("bcs0", 0x1000), ("vcs0", 0x2000), ("ccs0", 0x4000)]
+            for eng_name, cfg in engines:
+                attr = _PerfEventAttr()
+                attr.type = pmu_type
+                attr.size = ctypes.sizeof(_PerfEventAttr)
+                attr.config = cfg
+                fd = libc.syscall(sys_perf_event_open, ctypes.byref(attr), -1, 0, -1, 0)
+                if fd >= 0:
+                    self._pmu_fds[eng_name] = int(fd)
+        except Exception:
+            pass
+
+    def _read_pmu_ns(self) -> Dict[str, int]:
+        out: Dict[str, int] = {}
+        for eng, fd in self._pmu_fds.items():
+            try:
+                raw = os.read(fd, 8)
+                if len(raw) == 8:
+                    out[eng] = struct.unpack("<Q", raw)[0]
+            except Exception:
+                pass
+        return out
+
+    def query(self) -> Dict[str, Any]:
+        res: Dict[str, Any] = {
+            "available": self.card_dir is not None,
+            "vendor": self.vendor,
+            "name": self.name,
+            "clock_mhz": None,
+            "max_clock_mhz": 1900 if self.vendor == "Intel" else None,
+            "utilization_pct": 0.0,
+            "power_draw_w": None,
+        }
+        if not self.card_dir:
+            return res
+
+        now = time.monotonic()
+        if self.amd_busy_node and os.path.isfile(self.amd_busy_node):
+            try:
+                with open(self.amd_busy_node, "r") as f:
+                    res["utilization_pct"] = float(f.read().strip())
+            except Exception:
+                pass
+
+        for node, key in ((self.act_freq_node, "clock_mhz"), (self.max_freq_node, "max_clock_mhz")):
+            if node and os.path.isfile(node):
+                try:
+                    with open(node, "r") as f:
+                        res[key] = int(f.read().strip())
+                except Exception:
+                    pass
+        if not res["clock_mhz"] and self.cur_freq_node and os.path.isfile(self.cur_freq_node):
+            try:
+                with open(self.cur_freq_node, "r") as f:
+                    res["clock_mhz"] = int(f.read().strip())
+            except Exception:
+                pass
+
+        # 1. Primary: Exact kernel PMU engine busyness (Render/Compute/Video/Copy)
+        # Scale time-active busyness by (clock_mhz / max_clock_mhz) so execution at base clock
+        # (e.g. 60% time active at 550 MHz out of 1900 MHz) reports true hardware capacity load (~17%)
+        # rather than alarming 60-90% idle time-active figures during multi-GPU display blits.
+        cur_clk = res.get("clock_mhz") or 550
+        max_clk = res.get("max_clock_mhz") or 1900
+        freq_scale = min(1.0, max(0.25, cur_clk / max(1, max_clk)))
+        if self._pmu_fds:
+            cur_ns = self._read_pmu_ns()
+            if self._last_pmu_ns and self._last_pmu_time is not None:
+                dt_ns = (now - self._last_pmu_time) * 1e9
+                if dt_ns >= 1e7:  # >= 10ms window
+                    max_eng_pct = 0.0
+                    for eng, val_now in cur_ns.items():
+                        val_prev = self._last_pmu_ns.get(eng)
+                        if val_prev is not None and val_now >= val_prev:
+                            pct = min(100.0, max(0.0, ((val_now - val_prev) / dt_ns) * 100.0))
+                            if pct > max_eng_pct:
+                                max_eng_pct = pct
+                    res["engine_busy_pct"] = round(max_eng_pct, 1)
+                    res["utilization_pct"] = round(min(100.0, max_eng_pct * freq_scale), 1)
+                    self._last_pmu_ns = cur_ns
+                    self._last_pmu_time = now
+            else:
+                self._last_pmu_ns = cur_ns
+                self._last_pmu_time = now
+        # 2. Fallback: RC6 residency counter if PMU is unavailable
+        elif self.rc6_node and os.path.isfile(self.rc6_node):
+            try:
+                with open(self.rc6_node, "r") as f:
+                    rc6_now = int(f.read().strip())
+                if self._last_rc6_ms is not None and self._last_rc6_time is not None:
+                    dt_ms = (now - self._last_rc6_time) * 1000.0
+                    d_rc6 = rc6_now - self._last_rc6_ms
+                    if dt_ms >= 200.0 and d_rc6 >= 0:
+                        busy = max(0.0, min(100.0, (1.0 - (d_rc6 / dt_ms)) * 100.0))
+                        res["engine_busy_pct"] = round(busy, 1)
+                        res["utilization_pct"] = round(min(100.0, busy * freq_scale), 1)
+                        self._last_rc6_ms = rc6_now
+                        self._last_rc6_time = now
+                else:
+                    self._last_rc6_ms = rc6_now
+                    self._last_rc6_time = now
+            except Exception:
+                pass
+
+        if self.rapl_pp1_node and os.path.isfile(self.rapl_pp1_node):
+            try:
+                with open(self.rapl_pp1_node, "r") as f:
+                    pp1_now = int(f.read().strip())
+                if self._last_pp1_uj is not None and self._last_pp1_time is not None:
+                    dt = now - self._last_pp1_time
+                    de = pp1_now - self._last_pp1_uj
+                    if dt >= 0.015 and de >= 0:
+                        res["power_draw_w"] = round(de / (dt * 1e6), 1)
+                self._last_pp1_uj = pp1_now
+                self._last_pp1_time = now
+            except Exception:
+                pass
+
+        return res
+
+    def close(self):
+        """Closes open perf_event PMU file descriptors."""
+        for fd in self._pmu_fds.values():
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+        self._pmu_fds.clear()
 
 
 # --- Native NVML Engine via ctypes ---

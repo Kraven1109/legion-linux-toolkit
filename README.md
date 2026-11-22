@@ -21,25 +21,27 @@ Native, zero-overhead hardware control suite and event-driven OSD daemon for the
 
 | Command | Purpose | Options / Modes |
 | :--- | :--- | :--- |
-| **`lstats`** | Hardware & Platform Telemetry CLI | `lstats` (TUI dashboard), `-w` (Live watch), `-j` (JSON), `-s` (Short) |
+| **`lstats`** | Hardware & Platform Telemetry CLI | `lstats` (2×2 TUI dashboard), `-w` (Interactive live TUI), `-j` (JSON), `-s` (Short) |
 | **`lbat`** | Battery Conservation Mode | `status`, `on` (~80% cap), `off` (100% full), `toggle` |
 | **`lmode`** | Power & Thermal Manager | `status`, `next` (Fn+Q loop), `quiet`, `balanced`, `perf`, `extreme` |
-| **`lhz`** | Display Refresh Rate | `status`, `toggle` (240Hz $\leftrightarrow$ 60Hz), `240`, `60` |
+| **`lhz`** | Display Refresh Rate | `status`, `toggle` (240Hz $\leftrightarrow$ 60Hz), `240`, `60`, `fix` |
 | **`lcolor`** | Display Color Profile Manager | `status`, `cycle` (Fn+L), `set <name>`, `list` |
+| **`lcopilot`** | External Keyboard & CLI Copilot Trigger | `tap` (Smart Terminal), `hold` / `menu` (Quick Launch), `fn-n` |
 | **`test-hotkey`** | Hardware Event Sniffer | Real-time evdev scancode & keycode diagnostic tool |
 
 ---
 
 ### 📊 `lstats` — Hardware & Platform Telemetry Dashboard
 
-`lstats` is a zero-bloat, native Python CLI dashboard that runs with sub-15ms execution time using pure standard library (`ctypes`, `os`, `sys`, `json`). It aggregates telemetry across all Legion subsystems:
+`lstats` is a zero-bloat, native Python CLI dashboard using pure standard library modules (`ctypes`, `os`, `sys`, `struct`, `json`). It renders a responsive **2×2 card grid** (`THERMAL & COOLING`, `POWER & BATTERY`, `COMPUTE & MEMORY`, `DISPLAYS & CALIBRATION`) that adapts cleanly from 76 to 136+ columns with segmented progress gauges, live trend arrows (`↑` / `↓`), and interactive single-key controls in watch mode (`[p]` Profile, `[1-4]` Direct Mode, `[c]` 80% Cap, `[r]` 240/60Hz, `[l]` Color Profile, `[s]` Drop to Shell, `[q]` Quit):
 
-* **CPU (Core Ultra 9 275HX):** Package temperature, frequency, system load, and **live RAPL package power draw (W)**.
-* **GPU (RTX 5090 Mobile 24GB):** Native NVML via `ctypes` querying temperature, live wattage vs. TGP (150W/175W), VRAM used/total, GPU utilization %, and graphics/memory clocks.
-* **Triple Independent PWM Fans:** Native `lenovo_wmi_other` readings for CPU Fan (max 5200 RPM), GPU Fan (max 5400 RPM), and Aux/Rear Fan (max 6500 RPM) with micro percentage gauges.
-* **Thermals & Storage:** DDR5 SPD thermal sensors (`spd5118`), NVMe composite temperatures, and CPU package thermals.
-* **Power & Battery:** Battery charge %, status, health %, cycle count, voltage, and Conservation Mode (~80% cap vs. 100%).
-* **Display & Calibration:** Primary eDP panel (`SDC420B`), refresh rate (240Hz/60Hz), scaling factor, and active factory ICC color profile (sRGB, Display P3, DCI-P3, Adobe RGB, Rec.709, Native).
+* **CPU (Intel & AMD):** Package temperature (`coretemp` / `k10temp`), average & peak boost frequency, system utilization %, **live RAPL package power draw (W)**, and synchronized **MMIO RAPL PL1/PL2 limits**.
+* **dGPU (NVIDIA RTX 30/40/50 Series):** Native NVML via `ctypes` querying temperature, live wattage vs. active TGP (`150W` / `175W`), VRAM used/total/free GiB, GPU utilization %, graphics clock, and automatic **PCIe D3cold Sleep (`0.0 W`)** detection without waking suspended GPUs.
+* **iGPU (Intel i915/xe & AMD Radeon):** Direct kernel PMU engine busyness via `perf_event_open()` (`rcs0` Render/3D, `ccs0` Compute, `vcs0` Video, `bcs0` Copy) scaled by actual/max GT frequency (`MHz`), plus live **RAPL PP1 power draw (W)**.
+* **Cooling Fans (Triple & Dual Fan Topologies):** Native `lenovo_wmi_other` readings for CPU Fan (max 5200 RPM), GPU Fan (max 5400 RPM), and Hyperchamber Aux Fan (max 6500 RPM, automatically hidden on dual-fan laptops).
+* **Memory & Per-Drive NVMe Storage:** DDR5 SPD thermal sensors (`spd5118`) paired with live **SMBIOS Type 17** bus speed and DIMM topology (e.g., `DDR5-6400 (2x32GB Micron)`), plus individual NVMe SSD telemetry (`SSD1`, `SSD2`) reporting model, capacity, and active PCIe link generation/width (`Gen4 x4`, `Gen5 x4`).
+* **Power & Battery:** Battery charge %, AC/Battery source, health %, cycle count, voltage, and Conservation Mode (~80% cap vs. 100%).
+* **Displays, Color Calibration & GPU MUX Routing:** Multi-monitor EDID parser, column-aligned resolution/scale/refresh rate, active factory ICC color profile (`sRGB`, `Display P3`, `DCI-P3`, `Adobe RGB`, `Rec.709`, `Native`), and per-connector hardware **GPU MUX routing** (`DP-3 ➔ dGPU`, `eDP-1 ➔ iGPU`).
 
 ```bash
 lstats         # Instant snapshot TUI dashboard (<15ms)
@@ -89,7 +91,8 @@ legion-linux-toolkit/
 │   └── legion-profile-osd.service
 ├── tmpfiles.d/              # Boot-time permission configurations (/etc/tmpfiles.d/)
 │   ├── lenovo_conservation.conf
-│   └── lenovo_platform_profile.conf
+│   ├── lenovo_platform_profile.conf
+│   └── lenovo_rapl_mmio.conf
 ├── udev/                    # Udev rules for sudo-less hardware evdev access (/etc/udev/rules.d/)
 │   └── 99-lenovo-input.rules
 └── install.sh               # 1-click installer and deployer

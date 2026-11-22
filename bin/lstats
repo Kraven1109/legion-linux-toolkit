@@ -16,7 +16,8 @@ import subprocess
 import argparse
 import re
 import unicodedata
-from typing import Dict, Any, Optional, List
+from collections import deque
+from typing import Dict, Any, Optional, List, Deque, Tuple
 
 # Ensure local script directory is in sys.path for direct repository execution
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
@@ -32,21 +33,29 @@ except Exception:
     pass
 
 from legion_core import (
+    PLATFORM_PROFILE_NODE,
     PLATFORM_PROFILES,
     COLOR_PROFILES,
     EXPECTED_PANEL_ID,
     RAPL_ENERGY_NODE,
     NvmlTelemetry,
+    IntelIgpuTelemetry,
     get_panel_info,
     get_active_display_info,
     get_cooling_fans,
     get_spd_ram_temps,
+    get_system_model,
+    get_memory_hardware_info,
     get_nvme_temps,
+    get_nvme_drives,
     get_cpu_package_temp,
     get_battery_info,
+    get_conservation_mode,
     get_platform_profile,
     get_daemon_status,
     get_rapl_mmio_limits,
+    is_ac_online,
+    sync_rapl_mmio,
 )
 
 
@@ -159,18 +168,59 @@ def pct_color(percent: float) -> str:
         return Ansi.BRIGHT_CYAN
     return Ansi.BRIGHT_GREEN
 
-def make_bar(percent: float, width: int = 6) -> str:
-    """Creates an adaptive colorized progress bar: ▰▰▱▱."""
+def make_bar(percent: float, width: int = 10, color_override: Optional[str] = None) -> str:
+    """Creates a high-contrast progress bar with a visible dim track."""
     percent = max(0.0, min(100.0, percent))
     filled_len = int(round(width * (percent / 100.0)))
-    empty_len = width - filled_len
-    bar_color = pct_color(percent)
+    if percent > 0.5 and filled_len == 0:
+        filled_len = 1
+    empty_len = max(0, width - filled_len)
+    bar_color = color_override or pct_color(percent)
 
     filled = "▰" * filled_len
     empty = "▱" * empty_len
     if COLOR_ENABLED:
-        return f"{bar_color}{filled}{Ansi.BRIGHT_BLACK}{empty}{Ansi.RESET}"
+        return f"{bar_color}{filled}{Ansi.RESET}{Ansi.DIM}{empty}{Ansi.RESET}"
     return f"{filled}{empty}"
+
+
+SPARK_CHARS = "▁▂▃▄▅▆▇█"
+
+
+def make_gauge_with_trend(
+    values: List[float],
+    low: float,
+    high: float,
+    width: int = 10,
+    color_style: str = Ansi.BRIGHT_GREEN,
+    watch_mode: bool = False,
+) -> str:
+    """
+    Renders a segmented progress gauge bar (`▰▰▰▱▱▱▱▱▱`) so steady values never
+    merge horizontally into a solid 100%-full block in terminal fonts, plus a
+    live trend arrow (`↑`, `↓`, or ` `) when history is available in watch mode.
+    """
+    clean_vals = [float(v) for v in values if v is not None]
+    if not clean_vals:
+        return c("·" * width, Ansi.DIM)
+
+    span = max(1.0, high - low)
+    cur = clean_vals[-1]
+    pct = max(0.0, min(100.0, ((cur - low) / span) * 100.0))
+
+    if watch_mode and len(clean_vals) >= 2 and width >= 5:
+        bar_w = width - 1
+        delta = cur - clean_vals[0]
+        thresh = max(0.4, span * 0.015)
+        if delta >= thresh:
+            trend = c("↑", Ansi.BOLD, Ansi.BRIGHT_YELLOW)
+        elif delta <= -thresh:
+            trend = c("↓", Ansi.BOLD, Ansi.BRIGHT_CYAN)
+        else:
+            trend = " "
+        return f"{make_bar(pct, width=bar_w, color_override=color_style)}{trend}"
+
+    return make_bar(pct, width=width, color_override=color_style)
 
 def temp_color(t: float, comp: str = "cpu") -> str:
     """Returns an adaptive ANSI color string based on hardware thermal limits."""
@@ -217,6 +267,19 @@ class TelemetryCollector:
         self._cpu_model: str = "Intel Processor"
         self._logical_cores: int = 0
         self._freq_nodes: List[str] = sorted(glob.glob("/sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq"))
+        self.history: Dict[str, Deque[float]] = {
+            "cpu_temp": deque(maxlen=12),
+            "gpu_temp": deque(maxlen=12),
+            "dimm_temp": deque(maxlen=12),
+            "ssd1_temp": deque(maxlen=12),
+            "ssd2_temp": deque(maxlen=12),
+            "cpu_power": deque(maxlen=12),
+            "gpu_power": deque(maxlen=12),
+            "igpu_power": deque(maxlen=12),
+            "cpu_load": deque(maxlen=12),
+            "gpu_util": deque(maxlen=12),
+            "igpu_util": deque(maxlen=12),
+        }
         try:
             with open("/proc/cpuinfo", "r") as f:
                 for line in f:
@@ -249,6 +312,7 @@ class TelemetryCollector:
             self._last_cpu_ticks = (sum(parts), parts[3] + parts[4])
         except Exception:
             pass
+        self.igpu = IntelIgpuTelemetry()
         self.nvml = NvmlTelemetry()
 
     def get_cpu_info(self, sample_interval: float = 0.05) -> Dict[str, Any]:
@@ -339,14 +403,16 @@ class TelemetryCollector:
 
         return res
 
-    def get_memory_info(self) -> Dict[str, Any]:
-        """Reads system RAM and SPD temperatures."""
+    def get_memory_info(self, ttl: float = 0.0) -> Dict[str, Any]:
+        """Reads system RAM, SPD temperatures, and SMBIOS Type 17 DIMM hardware metadata."""
+        hw = get_memory_hardware_info()
         res = {
             "total_gib": 0.0,
             "used_gib": 0.0,
             "available_gib": 0.0,
             "percent": 0.0,
-            "spd_temps_c": get_spd_ram_temps(),
+            "spd_temps_c": get_spd_ram_temps(ttl=ttl),
+            "hardware": hw,
         }
         try:
             mem = {}
@@ -410,268 +476,683 @@ class TelemetryCollector:
 
         return res
 
-    def collect_all(self, sample_interval: float = 0.05) -> Dict[str, Any]:
-        """Aggregates full system metrics tree."""
-        display_ttl = 2.0 if sample_interval == 0.0 else 0.0
+    def collect_all(self, sample_interval: float = 0.05, force_display: bool = False) -> Dict[str, Any]:
+        """Aggregates full system metrics tree and records rolling history."""
+        is_watch = sample_interval == 0.0
+        display_ttl = 0.0 if (force_display or not is_watch) else 2.0
+        slow_sensor_ttl = 2.0 if is_watch else 0.0
+        bat_ttl = 4.0 if is_watch else 0.0
+        cpu_info = self.get_cpu_info(sample_interval=sample_interval)
+        gpu_info = self.nvml.query()
+        igpu_info = self.igpu.query()
+        mem_info = self.get_memory_info(ttl=slow_sensor_ttl)
+        nvme_drives = get_nvme_drives(ttl=slow_sensor_ttl)
+        nvme_temps = [d["composite_c"] for d in nvme_drives if d.get("composite_c") is not None] or get_nvme_temps()
+        bat_info = get_battery_info(ttl=bat_ttl)
+        bat_info["ac_online"] = is_ac_online()
+
+        if cpu_info.get("temperature_c") is not None:
+            self.history["cpu_temp"].append(float(cpu_info["temperature_c"]))
+        if gpu_info.get("temperature_c") is not None:
+            self.history["gpu_temp"].append(float(gpu_info["temperature_c"]))
+        if mem_info.get("spd_temps_c"):
+            self.history["dimm_temp"].append(float(max(mem_info["spd_temps_c"])))
+        if len(nvme_drives) >= 1 and nvme_drives[0].get("composite_c") is not None:
+            self.history["ssd1_temp"].append(float(nvme_drives[0]["composite_c"]))
+        elif nvme_temps:
+            self.history["ssd1_temp"].append(float(nvme_temps[0]))
+        if len(nvme_drives) >= 2 and nvme_drives[1].get("composite_c") is not None:
+            self.history["ssd2_temp"].append(float(nvme_drives[1]["composite_c"]))
+        elif len(nvme_temps) >= 2:
+            self.history["ssd2_temp"].append(float(nvme_temps[1]))
+        if cpu_info.get("package_power_w") is not None:
+            self.history["cpu_power"].append(float(cpu_info["package_power_w"]))
+        if gpu_info.get("power_draw_w") is not None:
+            self.history["gpu_power"].append(float(gpu_info["power_draw_w"]))
+        if igpu_info.get("power_draw_w") is not None:
+            self.history["igpu_power"].append(float(igpu_info["power_draw_w"]))
+        if cpu_info.get("usage_percent") is not None:
+            self.history["cpu_load"].append(float(cpu_info["usage_percent"]))
+        if gpu_info.get("utilization_gpu") is not None:
+            self.history["gpu_util"].append(float(gpu_info["utilization_gpu"]))
+        if igpu_info.get("utilization_pct") is not None:
+            self.history["igpu_util"].append(float(igpu_info["utilization_pct"]))
+
         return {
             "timestamp": time.time(),
+            "system_model": get_system_model(),
             "platform_profile": get_platform_profile(),
             "daemon": get_daemon_status(),
             "fans": get_cooling_fans(),
-            "cpu": self.get_cpu_info(sample_interval=sample_interval),
-            "gpu": self.nvml.query(),
-            "memory": self.get_memory_info(),
-            "storage": {"nvme_temps_c": get_nvme_temps()},
-            "power_battery": get_battery_info(),
+            "cpu": cpu_info,
+            "gpu": gpu_info,
+            "igpu": igpu_info,
+            "memory": mem_info,
+            "storage": {"nvme_temps_c": nvme_temps, "drives": nvme_drives},
+            "power_battery": bat_info,
             "display": self.get_display_info(ttl=display_ttl),
         }
 
     def close(self):
-        """Releases NVML."""
+        """Releases NVML and iGPU PMU descriptors."""
         self.nvml.close()
+        self.igpu.close()
 
 
 # --- TUI Dashboard Renderer ---
 
 class DashboardRenderer:
-    """Formats telemetry data into an ultra-clean, high-density terminal dashboard with laser-straight borders."""
+    """Formats telemetry data into a responsive 2x2 card grid (or compact 1-column fallback on narrow panes)."""
 
     @staticmethod
-    def render(data: Dict[str, Any], width: int = 80) -> str:
-        box_w = 80
-        inner_w = box_w - 4  # Exactly 76 content cells between '│ ' and ' │'
+    def _build_card(title: str, rows: List[str], card_w: int, right_title: str = "") -> List[str]:
+        inner_w = card_w - 4
+        t_str = f" {title} "
+        if right_title:
+            rt_plain = f" {strip_ansi(right_title)} "
+            if len(t_str) + len(rt_plain) + 3 <= inner_w + 2:
+                dashes = max(1, inner_w + 2 - len(t_str) - len(rt_plain) - 2)
+                top = (
+                    f"{c('╭─', Ansi.DIM)}{c(t_str, Ansi.BOLD, Ansi.WHITE)}"
+                    f"{c('─' * dashes, Ansi.DIM)} {right_title} {c('─╮', Ansi.DIM)}"
+                )
+            else:
+                dashes = max(0, inner_w + 2 - len(t_str) - 1)
+                top = f"{c('╭─', Ansi.DIM)}{c(t_str, Ansi.BOLD, Ansi.WHITE)}{c('─' * dashes + '╮', Ansi.DIM)}"
+        else:
+            dashes = max(0, inner_w + 2 - len(t_str) - 1)
+            top = f"{c('╭─', Ansi.DIM)}{c(t_str, Ansi.BOLD, Ansi.WHITE)}{c('─' * dashes + '╮', Ansi.DIM)}"
+        bot = c(f"╰{'─' * (card_w - 2)}╯", Ansi.DIM)
+        b_l = c("│", Ansi.DIM)
+        b_r = c("│", Ansi.DIM)
+        out = [top]
+        for r in rows:
+            cell = fit_cell(r, inner_w)
+            out.append(f"{b_l} {cell} {b_r}")
+        out.append(bot)
+        return out
 
-        def row(content: str) -> str:
-            vlen = visible_width(content)
-            if vlen > inner_w:
-                content = fit_cell(content, inner_w)
-                vlen = inner_w
-            pad = max(0, inner_w - vlen)
-            return f"│ {content}{' ' * pad} │"
+    @staticmethod
+    def render(
+        data: Dict[str, Any],
+        width: int = 100,
+        height: int = 28,
+        history: Optional[Dict[str, Deque[float]]] = None,
+        watch_mode: bool = False,
+        status_msg: str = "",
+    ) -> str:
+        hist = history or {}
+        # Prefer 2x2 side-by-side grid at >= 86 cols (or >= 76 cols when terminal height < 28 rows)
+        two_col = width >= 86 or (width >= 76 and height < 28)
+        if two_col:
+            total_w = max(76, min(width, 136))
+            if total_w % 2 != 0:
+                total_w -= 1
+            card_w = (total_w - 2) // 2
+        else:
+            total_w = max(56, min(width, 86))
+            card_w = total_w
 
-        def split_row(left: str, right: str) -> str:
-            v_l = visible_width(left)
-            v_r = visible_width(right)
-            pad = max(1, inner_w - (v_l + v_r))
-            return f"│ {left}{' ' * pad}{right} │"
+        inner_w = card_w - 4
+        if inner_w >= 46:
+            spark_w = 10
+        elif inner_w >= 38:
+            spark_w = 8
+        else:
+            spark_w = 6
+        val_w = 7
+        gap_after_bar = "  " if inner_w >= 42 else " "
+        right_w = max(12, inner_w - (4 + 1 + val_w + 1 + spark_w + len(gap_after_bar)))
 
-        def divider(title: str, color_style: str) -> str:
-            dashes = max(0, inner_w - len(title))
-            return f"├─{c(title, Ansi.BOLD, color_style)}{'─' * dashes}─┤"
+        def metric_row(label: str, val_plain: str, val_color: Optional[str], visual: str, detail: str) -> str:
+            lbl_cell = fit_cell(c(label, Ansi.BOLD, Ansi.WHITE), 4)
+            val_pad = fit_cell(val_plain, val_w, align=">")
+            val_cell = c(val_pad, Ansi.BOLD, val_color) if val_color else c(val_pad, Ansi.DIM)
+            det_cell = fit_cell(detail, right_w)
+            return f"{lbl_cell} {val_cell} {visual}{gap_after_bar}{det_cell}"
 
-        lines: List[str] = []
-
-        # Header
-        title = " LEGION LINUX TOOLKIT "
-        model_str = " Pro 7 16IAX10H "
-        pad_top = inner_w - len(title) - len(model_str)
-        lines.append(f"╭─{c(title, Ansi.BOLD, Ansi.BRIGHT_CYAN)}{'─' * max(0, pad_top)}{c(model_str, Ansi.DIM)}─╮")
-
-        # 1. Platform Profile & Daemon Status
+        # ── Header Bar ────────────────────────────────────────────────────────
+        sys_model = data.get("system_model") or get_system_model()
         prof = data["platform_profile"]
         led_color = prof.get("led_color_code", Ansi.WHITE)
         plat_title = prof["title"].replace(" Mode", "")
-        plat_text = f"Profile: {c('[●] ' + plat_title + ' (' + prof['led'] + ' LED)', Ansi.BOLD, led_color)}"
+        if total_w >= 82:
+            prof_badge = c(f"● {plat_title} ({prof['led']})", Ansi.BOLD, led_color)
+        else:
+            prof_badge = c(f"● {plat_title}", Ansi.BOLD, led_color)
+
         daemon = data["daemon"]
         if daemon["active"]:
-            d_rss = f" ({daemon['rss_mib']} MB)" if daemon["rss_mib"] else ""
-            daemon_text = f"Daemon: {c('Active', Ansi.BRIGHT_GREEN)} {c('[PID ' + str(daemon['pid']) + d_rss + ']', Ansi.DIM)}"
+            d_rss = f" {daemon['rss_mib']}M" if (daemon.get("rss_mib") and total_w >= 76) else ""
+            daemon_badge = f"{c('● Daemon OK', Ansi.BRIGHT_GREEN)}{c(d_rss, Ansi.DIM)}"
         else:
-            daemon_text = f"Daemon: {c('Inactive', Ansi.BRIGHT_YELLOW)}"
-        lines.append(split_row(plat_text, daemon_text))
+            daemon_badge = c("○ Daemon Off", Ansi.BRIGHT_YELLOW)
 
-        # 2. Cooling & Thermals
-        lines.append(divider(" COOLING & THERMAL ENVELOPE ", Ansi.YELLOW))
+        if total_w >= 78:
+            hdr_left = f" {c('LEGION LINUX TOOLKIT', Ansi.BOLD, Ansi.BRIGHT_CYAN)} {c('· ' + sys_model, Ansi.DIM)}"
+        else:
+            hdr_left = f" {c('LEGION ' + sys_model.split()[0].upper(), Ansi.BOLD, Ansi.BRIGHT_CYAN)}"
+        hdr_right = f"{prof_badge}  {c('·', Ansi.DIM)}  {daemon_badge} "
+        hdr_pad = max(1, total_w - visible_width(hdr_left) - visible_width(hdr_right))
+        header_line = f"{hdr_left}{' ' * hdr_pad}{hdr_right}"
+
+        # ── Card 1: THERMAL & COOLING (5 rows + Aux Fan in top border) ────────
+        cpu = data["cpu"]
+        gpu = data["gpu"]
+        igpu = data.get("igpu") or {}
         fans = data["fans"]
         cpu_f = fans["cpu_fan"]
         gpu_f = fans["gpu_fan"]
         aux_f = fans["aux_fan"]
-
-        fan_line = f"Fans CPU: {cpu_f['rpm']:4d}/{cpu_f['max_rpm']} RPM  │  GPU: {gpu_f['rpm']:4d}/{gpu_f['max_rpm']} RPM  │  AUX: {aux_f['rpm']:4d}/{aux_f['max_rpm']} RPM"
-        lines.append(row(fan_line))
-
-        cpu_t = data["cpu"]["temperature_c"]
-        gpu_t = data["gpu"]["temperature_c"]
-        spd_t = data["memory"]["spd_temps_c"]
+        mem_info = data["memory"]
+        spd_t = mem_info["spd_temps_c"]
+        mem_hw = mem_info.get("hardware") or get_memory_hardware_info()
+        nvme_drives = data["storage"].get("drives") or []
         nvme_t = data["storage"]["nvme_temps_c"]
 
-        cpu_str = f"{c(str(cpu_t) + '°C', temp_color(cpu_t, 'cpu'))}" if cpu_t else "N/A"
-        gpu_str = f"{c(str(gpu_t) + '°C', temp_color(gpu_t, 'gpu'))}" if gpu_t else c("Sleep", Ansi.DIM)
-        spd_str = "/".join(f"{c(str(t), temp_color(t, 'ram'))}" for t in spd_t) + ("°C" if spd_t else "") if spd_t else "N/A"
-        nvme_str = "/".join(f"{c(str(t), temp_color(t, 'nvme'))}" for t in nvme_t) + ("°C" if nvme_t else "") if nvme_t else "N/A"
+        # Clean dynamic dGPU short name (e.g. "RTX 5090", "RTX 4070", "RTX 4060")
+        raw_gpu_name = (gpu.get("name") or "dGPU").replace("NVIDIA ", "").replace("GeForce ", "").replace(" Laptop GPU", "").strip()
+        short_gpu_name = raw_gpu_name if len(raw_gpu_name) <= 12 else " ".join(raw_gpu_name.split()[:2])
 
-        temp_line = f"Temps CPU: {cpu_str} │ GPU: {gpu_str} │ RAM: {spd_str} │ NVMe: {nvme_str}"
-        lines.append(row(temp_line))
+        cpu_t = cpu.get("temperature_c")
+        cpu_t_col = temp_color(cpu_t, "cpu") if cpu_t is not None else None
+        cpu_t_str = f"{cpu_t:.1f}°C" if cpu_t is not None else "N/A"
+        cpu_t_bar = make_gauge_with_trend(
+            list(hist.get("cpu_temp", [cpu_t] if cpu_t else [])),
+            35.0, 95.0, spark_w, cpu_t_col or Ansi.DIM, watch_mode
+        )
+        cpu_fan_det = (
+            f"CPU Fan {cpu_f['rpm']:4d} rpm ({cpu_f['percent']:2.0f}%)"
+            if right_w >= 22 else (f"{cpu_f['rpm']:4d} rpm ({cpu_f['percent']:2.0f}%)" if right_w >= 14 else f"{cpu_f['rpm']:4d}rpm ({cpu_f['percent']:2.0f}%)")
+        )
 
-        # 3. Compute & Acceleration
-        lines.append(divider(" COMPUTE & ACCELERATION ", Ansi.BRIGHT_GREEN))
-        cpu = data["cpu"]
-        c_p_num = cpu.get("package_power_w")
+        gpu_t = gpu.get("temperature_c")
+        gpu_asleep = gpu.get("state") == "suspended"
+        if gpu_t is not None:
+            gpu_t_col = temp_color(gpu_t, "gpu")
+            gpu_t_str = f"{gpu_t:.1f}°C" if gpu_t < 100 else f"{gpu_t:.0f}°C"
+            gpu_t_bar = make_gauge_with_trend(
+                list(hist.get("gpu_temp", [gpu_t])),
+                32.0, 87.0, spark_w, gpu_t_col, watch_mode
+            )
+        else:
+            gpu_t_col = None
+            gpu_t_str = "Sleep" if gpu_asleep else "N/A"
+            gpu_t_bar = c("·" * spark_w, Ansi.DIM)
+        gpu_fan_det = (
+            f"GPU Fan {gpu_f['rpm']:4d} rpm ({gpu_f['percent']:2.0f}%)"
+            if right_w >= 22 else (f"{gpu_f['rpm']:4d} rpm ({gpu_f['percent']:2.0f}%)" if right_w >= 14 else f"{gpu_f['rpm']:4d}rpm ({gpu_f['percent']:2.0f}%)")
+        )
+
+        if spd_t:
+            dimm_max = max(spd_t)
+            dimm_col = temp_color(dimm_max, "ram")
+            dimm_str = "/".join(f"{t:.0f}" for t in spd_t[:2]) + "°C"
+            dimm_bar = make_gauge_with_trend(
+                list(hist.get("dimm_temp", [dimm_max])),
+                30.0, 75.0, spark_w, dimm_col, watch_mode
+            )
+        else:
+            dimm_col = None
+            dimm_str = "N/A"
+            dimm_bar = c("·" * spark_w, Ansi.DIM)
+
+        # Show real memory bus speed & topology (e.g. "DDR5-6400 (2x32GB Micron)") instead of generic slot text
+        full_mem_sum = mem_hw.get("summary", "DDR5 SODIMM")
+        short_mem_sum = mem_hw.get("short_summary", "DDR5")
+        type_spd = mem_hw.get("type_speed", "DDR5")
+        if len(full_mem_sum) <= right_w:
+            dimm_det = full_mem_sum
+        elif len(short_mem_sum) <= right_w:
+            dimm_det = short_mem_sum
+        else:
+            dimm_det = type_spd
+
+        def _build_ssd_row(slot_idx: int, hist_key: str) -> str:
+            lbl = f"SSD{slot_idx + 1}"
+            if slot_idx < len(nvme_drives):
+                drv = nvme_drives[slot_idx]
+                t_comp = drv.get("composite_c")
+                s_mod = drv.get("short_model", f"NVMe {slot_idx + 1}")
+                pcie_tag = drv.get("pcie_tag", "")
+                if t_comp is not None:
+                    s_col = temp_color(t_comp, "nvme")
+                    s_str = f"{t_comp:.1f}°C"
+                    s_bar = make_gauge_with_trend(
+                        list(hist.get(hist_key, [t_comp])),
+                        28.0, 70.0, spark_w, s_col, watch_mode
+                    )
+                else:
+                    s_col = None
+                    s_str = "N/A"
+                    s_bar = c("·" * spark_w, Ansi.DIM)
+                full_ssd = f"{s_mod} ({pcie_tag})" if pcie_tag else s_mod
+                s_det = full_ssd if len(full_ssd) <= right_w else s_mod
+                return metric_row(lbl, s_str, s_col, s_bar, s_det)
+            elif slot_idx < len(nvme_t):
+                t_val = nvme_t[slot_idx]
+                s_col = temp_color(t_val, "nvme")
+                s_bar = make_gauge_with_trend(
+                    list(hist.get(hist_key, [t_val])),
+                    28.0, 70.0, spark_w, s_col, watch_mode
+                )
+                return metric_row(lbl, f"{t_val:.1f}°C", s_col, s_bar, f"NVMe Drive {slot_idx + 1}")
+            else:
+                return metric_row(lbl, "Empty", None, c("·" * spark_w, Ansi.DIM), "M.2 Slot Empty")
+
+        aux_hdr = ""
+        if aux_f.get("present", True) and aux_f.get("max_rpm", 0) > 0:
+            aux_rpm = aux_f["rpm"]
+            aux_pct = aux_f["percent"]
+            aux_hdr = (
+                f"{c('Aux Fan', Ansi.DIM)} {c(f'{aux_rpm} rpm ({aux_pct:.0f}%)', Ansi.BRIGHT_CYAN)}"
+                if inner_w >= 42 else f"{c(f'Aux {aux_rpm}rpm', Ansi.BRIGHT_CYAN)}"
+            )
+        thermal_title = "THERMAL & COOLING" if inner_w >= 44 else "THERMAL"
+        thermal_rows = [
+            metric_row("CPU", cpu_t_str, cpu_t_col, cpu_t_bar, cpu_fan_det),
+            metric_row("dGPU", gpu_t_str, gpu_t_col, gpu_t_bar, gpu_fan_det),
+            metric_row("DIMM", dimm_str, dimm_col, dimm_bar, dimm_det),
+        ]
+        # Dynamically render detected NVMe drives (supports 1, 2, or more SSDs; pads to 5 rows for 2x2 grid symmetry)
+        num_ssd_rows = max(2, min(3, len(nvme_drives))) if not two_col else 2
+        for s_idx in range(num_ssd_rows):
+            thermal_rows.append(_build_ssd_row(s_idx, f"ssd{s_idx + 1}_temp"))
+        card_thermal = DashboardRenderer._build_card(thermal_title, thermal_rows, card_w, right_title=aux_hdr)
+
+        # ── Card 2: POWER & BATTERY (5 rows) ──────────────────────────────────
+        c_p = cpu.get("package_power_w")
         pl1_w = cpu.get("power_limit_pl1_w")
         pl2_w = cpu.get("power_limit_pl2_w")
         if pl1_w is not None and pl2_w is not None:
             if pl2_w < pl1_w:
-                # Abnormal clamp where short-term PL2 is lower than long-term PL1
-                eff_limit_w = pl2_w
-            elif c_p_num is not None and c_p_num > pl1_w:
-                # Active short-term turbo burst between PL1 and PL2: show PL2 burst ceiling
-                eff_limit_w = pl2_w
+                eff_pl = pl2_w
+                pl_tag = "Clamp"
+            elif c_p is not None and c_p > pl1_w:
+                eff_pl = pl2_w
+                pl_tag = "PL2"
             else:
-                eff_limit_w = pl1_w
+                eff_pl = pl1_w
+                pl_tag = "PL1"
         else:
-            eff_limit_w = pl1_w if pl1_w is not None else pl2_w
-        if c_p_num is not None:
-            c_draw_val = f"{c_p_num:.0f}" if c_p_num >= 100 else f"{c_p_num:.1f}"
+            eff_pl = pl1_w or pl2_w or 55.0
+            pl_tag = "PL1"
+
+        if c_p is not None:
+            c_p_pct = (c_p / eff_pl * 100.0) if eff_pl > 0 else 0.0
+            c_p_col = pct_color(c_p_pct)
+            c_p_str = f"{c_p:.1f} W" if c_p < 100 else f"{c_p:.0f} W"
+            c_p_bar = make_gauge_with_trend(
+                list(hist.get("cpu_power", [c_p])),
+                0.0, max(eff_pl, pl2_w or 65.0), spark_w, c_p_col, watch_mode
+            )
+            c_p_det = f"of {eff_pl:.0f}W {pl_tag} ({c_p_pct:.0f}%)" if right_w >= 17 else f"{eff_pl:.0f}W {pl_tag} ({c_p_pct:.0f}%)"
         else:
-            c_draw_val = "N/A"
-        c_limit_val = f"/{eff_limit_w:.0f}W" if eff_limit_w is not None else (" W" if c_p_num is not None else "")
-        c_freq = f"{cpu['avg_frequency_mhz']} MHz" if cpu["avg_frequency_mhz"] else "N/A"
-        cpu_pct = max(0.0, min(100.0, cpu.get("usage_percent", 0.0)))
-        c_bar = make_bar(cpu_pct, 6)
+            c_p_col = None
+            c_p_str = "N/A"
+            c_p_bar = c("·" * spark_w, Ansi.DIM)
+            c_p_det = f"Limit {eff_pl:.0f}W"
 
-        cpu_col1 = fit_cell(f"CPU  {c(cpu['model'], Ansi.BOLD)}", 20)
-        cpu_col2 = fit_cell(f"Power: {c(c_draw_val, Ansi.BOLD, Ansi.BRIGHT_YELLOW)}{c_limit_val}", 16)
-        cpu_col3 = fit_cell(f"Clk: {c_freq}", 13)
-        cpu_col4 = fit_cell(f"Load {c_bar} {c(f'{cpu_pct:5.1f}%', Ansi.BOLD, pct_color(cpu_pct))}", 18)
-        lines.append(row(f"{cpu_col1} │ {cpu_col2} │ {cpu_col3} │ {cpu_col4}"))
-
-        gpu = data["gpu"]
-        gpu_short = gpu['name'].replace("NVIDIA ", "").replace("GeForce ", "").replace("Laptop GPU", "Laptop")
-        gpu_col1 = fit_cell(f"GPU  {c(gpu_short, Ansi.BOLD)}", 20)
-
-        if gpu.get("state") == "suspended":
-            gpu_col2 = fit_cell(f"Power: {c('Sleep 0W', Ansi.DIM)}", 16)
-            gpu_col3 = fit_cell(f"Clk: {c('Sleep', Ansi.DIM)}", 13)
-            gpu_col4 = fit_cell(f"Util {make_bar(0.0, 6)} {c('  0.0%', Ansi.DIM)}", 18)
-        else:
-            g_power_num = gpu.get('power_draw_w')
-            if g_power_num is not None:
-                g_draw_val = f"{g_power_num:.0f}" if g_power_num >= 100 else f"{g_power_num:.1f}"
+        g_p = gpu.get("power_draw_w")
+        g_lim = gpu.get("power_limit_w") or 150.0
+        if not gpu_asleep and g_p is not None:
+            g_p_pct = (g_p / g_lim * 100.0) if g_lim > 0 else 0.0
+            g_p_col = pct_color(g_p_pct)
+            g_p_str = f"{g_p:.1f} W" if g_p < 100 else f"{g_p:.0f} W"
+            g_p_bar = make_gauge_with_trend(
+                list(hist.get("gpu_power", [g_p])),
+                0.0, g_lim, spark_w, g_p_col, watch_mode
+            )
+            if right_w >= 18:
+                g_p_det = f"of {g_lim:.0f}W TGP ({g_p_pct:.0f}%)"
+            elif right_w >= 15:
+                g_p_det = f"{g_lim:.0f}W TGP ({g_p_pct:.0f}%)"
             else:
-                g_draw_val = "N/A"
-            g_limit_num = gpu.get('power_limit_w')
-            g_limit_val = f"/{g_limit_num:.0f}W" if g_limit_num is not None else ""
-            g_util = max(0.0, min(100.0, float(gpu.get('utilization_gpu') or 0.0)))
-            g_clk = f"{gpu['clock_graphics_mhz']} MHz" if gpu.get('clock_graphics_mhz') is not None else "N/A"
-            g_bar = make_bar(g_util, 6)
+                g_p_det = f"{g_lim:.0f}W ({g_p_pct:.0f}%)"
+        else:
+            g_p_col = None
+            g_p_str = "0.0 W" if gpu_asleep else "N/A"
+            g_p_bar = c("·" * spark_w, Ansi.DIM)
+            g_p_det = ("PCIe D3cold Sleep" if right_w >= 17 else "D3cold Sleep") if gpu_asleep else "N/A"
 
-            gpu_col2 = fit_cell(f"Power: {c(g_draw_val, Ansi.BOLD, Ansi.BRIGHT_YELLOW)}{g_limit_val}", 16)
-            gpu_col3 = fit_cell(f"Clk: {g_clk}", 13)
-            gpu_col4 = fit_cell(f"Util {g_bar} {c(f'{g_util:5.1f}%', Ansi.BOLD, pct_color(g_util))}", 18)
+        ig_p = igpu.get("power_draw_w")
+        ig_name = igpu.get("name", "Intel Graphics")
+        if ig_p is not None:
+            ig_p_col = pct_color((ig_p / 25.0) * 100.0)
+            ig_p_str = f"{ig_p:.1f} W"
+            ig_p_bar = make_gauge_with_trend(
+                list(hist.get("igpu_power", [ig_p])),
+                0.0, 20.0, spark_w, ig_p_col, watch_mode
+            )
+        else:
+            ig_p_col = Ansi.BRIGHT_GREEN
+            ig_p_str = "0.0 W"
+            ig_p_bar = make_bar(0.0, width=spark_w, color_override=Ansi.BRIGHT_GREEN)
+        ig_p_det = f"{ig_name} (RAPL)" if right_w >= len(ig_name) + 7 else (ig_name if right_w >= len(ig_name) else f"{igpu.get('vendor', 'Intel')} iGPU")
 
-        lines.append(row(f"{gpu_col1} │ {gpu_col2} │ {gpu_col3} │ {gpu_col4}"))
+        bat = data["power_battery"]
+        ac_on = bat.get("ac_online", True)
+        pwr_src = "AC" if ac_on else "Bat"
+        pl_pair = f"{pl1_w:.0f}/{pl2_w:.0f}W" if (pl1_w and pl2_w) else "N/A"
+        pl_bar = make_bar((pl1_w / 90.0 * 100.0) if pl1_w else 50.0, width=spark_w, color_override=Ansi.BRIGHT_CYAN)
+        lim_det = f"MMIO PL1/PL2 ({pwr_src} Mode)" if right_w >= 22 else f"PL1/PL2 ({pwr_src})"
+
+        b_cap_num = float(bat.get("capacity_percent") or 0.0)
+        b_cap_str = f"{int(b_cap_num)}%" if bat.get("capacity_percent") is not None else "N/A"
+        b_col = Ansi.BRIGHT_GREEN if b_cap_num >= 40 else (Ansi.BRIGHT_YELLOW if b_cap_num >= 20 else Ansi.BRIGHT_RED)
+        b_bar = make_bar(b_cap_num, width=spark_w, color_override=b_col)
+        cap_tag = c("80% Cap", Ansi.BRIGHT_GREEN) if bat.get("conservation_mode") else c("100% Max", Ansi.BRIGHT_YELLOW)
+        b_hlth = f"{bat['health_percent']}%" if bat.get("health_percent") else "N/A"
+        b_cyc = f"{bat['cycle_count']}c" if bat.get("cycle_count") is not None else ""
+        b_volt = f"{bat['voltage_v']:.1f}V" if bat.get("voltage_v") else ""
+        if right_w >= 28:
+            b_det = f"{cap_tag} · H:{b_hlth} {b_cyc} {b_volt}".strip()
+        elif right_w >= 19:
+            b_det = f"{cap_tag} · H:{b_hlth} {b_cyc}".strip()
+        elif right_w >= 16:
+            b_det = f"{cap_tag} · {b_hlth}"
+        else:
+            b_det = f"{cap_tag} {b_hlth}"
+
+        power_rows = [
+            metric_row("CPU", c_p_str, c_p_col, c_p_bar, c_p_det),
+            metric_row("dGPU", g_p_str, g_p_col, g_p_bar, g_p_det),
+            metric_row("iGPU", ig_p_str, ig_p_col, ig_p_bar, ig_p_det),
+            metric_row("LIM", pl_pair, Ansi.BRIGHT_CYAN, pl_bar, lim_det),
+            metric_row("BAT", b_cap_str, b_col, b_bar, b_det),
+        ]
+        card_power = DashboardRenderer._build_card("POWER & BATTERY", power_rows, card_w)
+
+        # ── Card 3: COMPUTE & MEMORY (5 rows) ─────────────────────────────────
+        cpu_pct = max(0.0, min(100.0, float(cpu.get("usage_percent") or 0.0)))
+        cpu_l_col = pct_color(cpu_pct)
+        cpu_l_bar = make_gauge_with_trend(
+            list(hist.get("cpu_load", [cpu_pct])),
+            0.0, 100.0, spark_w, cpu_l_col, watch_mode
+        )
+        avg_f = cpu.get("avg_frequency_mhz")
+        max_f = cpu.get("max_frequency_mhz")
+        if avg_f and max_f:
+            cpu_clk_det = f"{avg_f:4d} MHz (Peak {max_f/1000:.1f} GHz)"
+            if len(cpu_clk_det) > right_w:
+                cpu_clk_det = f"{avg_f:4d} MHz ({max_f/1000:.1f}G)" if right_w >= 15 else f"{avg_f}M ({max_f/1000:.1f}G)"
+        elif avg_f:
+            cpu_clk_det = f"{avg_f:4d} MHz"
+        else:
+            cpu_clk_det = cpu.get("model", "Processor")
+
+        if gpu_asleep:
+            gpu_u_col = None
+            gpu_u_str = "Sleep"
+            gpu_u_bar = c("·" * spark_w, Ansi.DIM)
+            full_sleep = f"{short_gpu_name} (Suspended)"
+            mid_sleep = f"{short_gpu_name} (Sleep)"
+            gpu_clk_det = full_sleep if len(full_sleep) <= right_w else (mid_sleep if len(mid_sleep) <= right_w else f"{short_gpu_name} (D3)")
+        else:
+            g_util = max(0.0, min(100.0, float(gpu.get("utilization_gpu") or 0.0)))
+            gpu_u_col = pct_color(g_util)
+            gpu_u_str = f"{g_util:.1f}%"
+            gpu_u_bar = make_gauge_with_trend(
+                list(hist.get("gpu_util", [g_util])),
+                0.0, 100.0, spark_w, gpu_u_col, watch_mode
+            )
+            g_clk = gpu.get("clock_graphics_mhz")
+            if g_clk is not None:
+                full_g_clk = f"{g_clk:4d} MHz ({short_gpu_name})"
+                gpu_nbr = short_gpu_name.split()[-1]
+                mid_g_clk = f"{g_clk:4d} MHz ({gpu_nbr})"
+                gpu_clk_det = full_g_clk if len(full_g_clk) <= right_w else (mid_g_clk if len(mid_g_clk) <= right_w else f"{g_clk}M ({gpu_nbr})")
+            else:
+                gpu_clk_det = short_gpu_name
+
+        ig_util = max(0.0, min(100.0, float(igpu.get("utilization_pct") or 0.0)))
+        ig_u_col = pct_color(ig_util)
+        ig_u_str = f"{ig_util:.1f}%"
+        ig_u_bar = make_gauge_with_trend(
+            list(hist.get("igpu_util", [ig_util])),
+            0.0, 100.0, spark_w, ig_u_col, watch_mode
+        )
+        ig_clk = igpu.get("clock_mhz")
+        ig_max = igpu.get("max_clock_mhz") or 1900
+        ig_vend = igpu.get("vendor", "Intel")
+        if ig_clk is not None:
+            if right_w >= 23:
+                ig_clk_det = f"{ig_clk:4d} / {ig_max} MHz ({ig_vend})"
+            elif right_w >= 16:
+                ig_clk_det = f"{ig_clk:4d} MHz ({ig_vend})"
+            else:
+                ig_clk_det = f"{ig_clk}/{ig_max} MHz"
+        else:
+            ig_clk_det = ig_name
 
         mem = data["memory"]
+        ram_pct = max(0.0, min(100.0, float(mem.get("percent") or 0.0)))
+        ram_col = pct_color(ram_pct)
+        ram_bar = make_bar(ram_pct, width=spark_w, color_override=ram_col)
+        # Show useful free RAM headroom instead of repeating (DDR5)
+        full_ram_det = f"{mem['used_gib']:.1f} / {mem['total_gib']:.1f} GiB ({mem['available_gib']:.1f}G Free)"
+        mid_ram_det = f"{mem['used_gib']:.1f} / {mem['total_gib']:.1f} GiB"
+        ram_det = full_ram_det if len(full_ram_det) <= right_w else (mid_ram_det if len(mid_ram_det) <= right_w else f"{mem['used_gib']:.1f}/{mem['total_gib']:.1f} GiB")
+
         v_used_mib = gpu.get("memory_used_mib")
         v_tot_mib = gpu.get("memory_total_mib")
         vram_pct = max(0.0, min(100.0, float(gpu.get("memory_percent") or 0.0)))
-        vram_bar = make_bar(vram_pct, 6)
-
-        if gpu.get("state") == "suspended":
+        if gpu_asleep:
+            vram_col = None
+            vram_str = "0.0%"
+            vram_bar = make_bar(0.0, width=spark_w)
             if v_tot_mib:
-                vram_str = f"VRAM 0.0/{v_tot_mib / 1024:.1f} GB   {vram_bar} {c('  0.0%', Ansi.DIM)}"
+                v_tot_g = v_tot_mib / 1024.0
+                full_v_sleep = f"0.0 / {v_tot_g:.1f} GiB ({v_tot_g:.1f}G Free)"
+                mid_v_sleep = f"0.0 / {v_tot_g:.1f} GiB"
+                vram_det = full_v_sleep if len(full_v_sleep) <= right_w else (mid_v_sleep if len(mid_v_sleep) <= right_w else f"0.0/{v_tot_g:.1f} GiB")
             else:
-                vram_str = f"VRAM {c('Sleep / Standby', Ansi.DIM)}"
+                vram_det = "0.0 GiB (Sleep)"
         else:
-            v_used_gb = f"{v_used_mib / 1024:.1f}" if v_used_mib is not None else "0.0"
-            v_tot_gb = f"{v_tot_mib / 1024:.1f}" if v_tot_mib is not None else "N/A"
-            vram_str = f"VRAM {v_used_gb}/{v_tot_gb} GB   {vram_bar} {c(f'{vram_pct:5.1f}%', Ansi.BOLD, pct_color(vram_pct))}"
+            vram_col = pct_color(vram_pct)
+            vram_str = f"{vram_pct:.1f}%"
+            vram_bar = make_bar(vram_pct, width=spark_w, color_override=vram_col)
+            v_used_gib = (v_used_mib / 1024.0) if v_used_mib is not None else 0.0
+            v_tot_gib = (v_tot_mib / 1024.0) if v_tot_mib is not None else 23.9
+            v_free_gib = max(0.0, v_tot_gib - v_used_gib)
+            full_v_det = f"{v_used_gib:.1f} / {v_tot_gib:.1f} GiB ({v_free_gib:.1f}G Free)"
+            mid_v_det = f"{v_used_gib:.1f} / {v_tot_gib:.1f} GiB"
+            vram_det = full_v_det if len(full_v_det) <= right_w else (mid_v_det if len(mid_v_det) <= right_w else f"{v_used_gib:.1f}/{v_tot_gib:.1f} GiB")
 
-        ram_used = f"{mem['used_gib']:.1f}"
-        ram_tot = f"{mem['total_gib']:.1f}"
-        ram_pct = max(0.0, min(100.0, float(mem['percent'])))
-        ram_bar = make_bar(ram_pct, 6)
+        compute_rows = [
+            metric_row("CPU", f"{cpu_pct:.1f}%", cpu_l_col, cpu_l_bar, cpu_clk_det),
+            metric_row("dGPU", gpu_u_str, gpu_u_col, gpu_u_bar, gpu_clk_det),
+            metric_row("iGPU", ig_u_str, ig_u_col, ig_u_bar, ig_clk_det),
+            metric_row("RAM", f"{ram_pct:.1f}%", ram_col, ram_bar, ram_det),
+            metric_row("VRAM", vram_str, vram_col, vram_bar, vram_det),
+        ]
+        card_compute = DashboardRenderer._build_card("COMPUTE & MEMORY", compute_rows, card_w)
 
-        ram_col = fit_cell(f"RAM  {ram_used}/{ram_tot} GiB   {ram_bar} {c(f'{ram_pct:5.1f}%', Ansi.BOLD, pct_color(ram_pct))}", 39)
-        vram_col = fit_cell(vram_str, 34)
-        lines.append(row(f"{ram_col} │ {vram_col}"))
-
-        # 4. Power & Battery
-        lines.append(divider(" POWER & BATTERY SUBSYSTEM ", Ansi.BRIGHT_BLUE))
-        bat = data["power_battery"]
-        if bat["present"]:
-            b_cap = f"{bat['capacity_percent']}%" if bat["capacity_percent"] is not None else "N/A"
-            b_bar = make_bar(float(bat["capacity_percent"] or 0), 8)
-            b_hlth = f"{bat['health_percent']}%" if bat["health_percent"] is not None else "N/A"
-            b_cyc = f"{bat['cycle_count']}" if bat["cycle_count"] is not None else "N/A"
-            b_volt = f"{bat['voltage_v']} V" if bat["voltage_v"] is not None else "N/A"
-
-            bat_line1 = f"Battery {b_cap} {b_bar} ({bat['status']})  │  Health: {b_hlth} ({b_cyc} Cyc)  │  {b_volt}"
-            lines.append(row(bat_line1))
-
-            if bat["conservation_mode"]:
-                cons_badge = c("[●] Conservation ON (~80% Cap)", Ansi.BOLD, Ansi.BRIGHT_GREEN)
-                cons_desc = "Extends Li-poly battery lifespan"
-            else:
-                cons_badge = c("[○] Full Charge Mode (100%)", Ansi.BOLD, Ansi.BRIGHT_YELLOW)
-                cons_desc = "Maximum travel run-time"
-            bat_line2 = f"Mode:   {cons_badge} • {c(cons_desc, Ansi.DIM)}"
-            lines.append(row(bat_line2))
-        else:
-            lines.append(row("Battery: No battery detected (Desktop / AC Only)"))
-
-        # 5. Display & Calibration (Supports Single, Extended, and Mirrored)
+        # ── Card 4: DISPLAYS & CALIBRATION (5 rows) ───────────────────────────
         disp = data["display"]
         d_count = disp.get("count", 1)
         d_mode = disp.get("display_mode", "single")
+        displays = disp.get("displays", [disp])
 
-        if d_count > 1 and d_mode == "extended":
-            lines.append(divider(f" DISPLAYS & CALIBRATION (EXTENDED {d_count}X) ", Ansi.BRIGHT_MAGENTA))
-        elif d_count > 1 and d_mode == "mirrored":
-            lines.append(divider(" DISPLAYS & CALIBRATION (MIRRORED / CLONE) ", Ansi.BRIGHT_MAGENTA))
-        else:
-            lines.append(divider(" DISPLAY & FACTORY CALIBRATION ", Ansi.BRIGHT_MAGENTA))
+        disp_rows: List[str] = []
+        if d_count > 1 and len(displays) > 1:
+            # Compute fixed column widths across all connected displays so resolution, scale, and Hz align vertically
+            shown_disps = displays[:2]
+            res_col_w = max(len(d.get("resolution", "")) for d in shown_disps)
+            scale_strs = [f"@{d.get('scale', 1.0):g}x" for d in shown_disps]
+            scale_col_w = max(len(s) for s in scale_strs)
+            max_natural_name = max(len(d.get("display_title", "")) for d in shown_disps)
 
-        if d_count > 1 and "displays" in disp and len(disp["displays"]) > 1:
-            for idx, d in enumerate(disp["displays"], start=1):
-                d_rate = d["refresh_rate_hz"]
-                r_color = Ansi.BRIGHT_GREEN if d_rate >= 120 else Ansi.BRIGHT_YELLOW
-                r_str = c(f"{d_rate:.2f} Hz", Ansi.BOLD, r_color)
-
-                out_tag = f"[{idx}] {d['output_name']}:"
-                title_str = fit_cell(f"{out_tag} {d['display_title']} ({d['resolution']} @ {d['scale']}x)", 38)
-
-                if d_mode == "mirrored":
-                    role = "Primary Source" if d.get("is_primary") else "Mirror Clone"
-                    r_badge = c(role, Ansi.BOLD, Ansi.BRIGHT_CYAN if d.get("is_primary") else Ansi.BRIGHT_YELLOW)
-                    d_row = f"{title_str}  │  {r_str} • {r_badge}"
+            for idx, d in enumerate(shown_disps, start=1):
+                hz = d["refresh_rate_hz"]
+                hz_col = Ansi.BRIGHT_GREEN if hz >= 120 else Ansi.BRIGHT_YELLOW
+                res_pad = f"{d['resolution']:<{res_col_w}}"
+                sc_pad = f"{scale_strs[idx - 1]:<{scale_col_w}}"
+                if inner_w >= 48:
+                    hz_str = c(f"{hz:6.2f} Hz", Ansi.BOLD, hz_col)
+                    out_pad = f"{d['output_name']:<5}"
+                    tag = c(f"[{idx}] {out_pad}", Ansi.BOLD, Ansi.WHITE)
+                    spec = f"{res_pad} {sc_pad}"
+                    sep_gap = "  "
+                    avail_name_w = max(8, inner_w - visible_width(tag) - len(spec) - visible_width(hz_str) - len(sep_gap) - 2)
+                    name_w = min(avail_name_w, max(15, max_natural_name + 1))
+                elif inner_w >= 40:
+                    hz_str = c(f"{hz:3.0f}Hz", Ansi.BOLD, hz_col)
+                    out_pad = f"{d['output_name']:<5}"
+                    tag = c(f"[{idx}]{out_pad}", Ansi.BOLD, Ansi.WHITE)
+                    spec = f"{res_pad}{sc_pad}"
+                    sep_gap = " "
+                    avail_name_w = max(7, inner_w - visible_width(tag) - len(spec) - visible_width(hz_str) - len(sep_gap) - 2)
+                    name_w = min(avail_name_w, max(12, max_natural_name))
                 else:
-                    if d.get("is_internal"):
-                        prof_color = Ansi.BRIGHT_CYAN if d.get("color_profile_id") != "unknown" else Ansi.WHITE
-                        prof_text = c(d.get("color_profile_title", "Native"), Ansi.BOLD, prof_color)
-                        d_row = f"{title_str}  │  {r_str} • {prof_text}"
-                    else:
-                        ext_p = d.get("color_profile_title", "External")
-                        if ext_p in ("Default / Native", "unknown"):
-                            ext_p = "Standard"
-                        d_row = f"{title_str}  │  {r_str} • {c(ext_p, Ansi.DIM)}"
+                    hz_str = c(f"{hz:3.0f}Hz", Ansi.BOLD, hz_col)
+                    tag = c(f"[{idx}]{d['output_name']}", Ansi.BOLD, Ansi.WHITE)
+                    spec = res_pad
+                    sep_gap = " "
+                    name_w = max(7, inner_w - visible_width(tag) - len(spec) - visible_width(hz_str) - len(sep_gap) - 2)
+                raw_name = d["display_title"]
+                if len(raw_name) > name_w:
+                    raw_name = raw_name.replace("Samsung ", "").replace("LG ", "")
+                d_title = fit_cell(raw_name, name_w)
+                disp_rows.append(f"{tag} {d_title} {c(spec, Ansi.DIM)}{sep_gap}{hz_str}")
 
-                lines.append(row(d_row))
-        else:
-            rate_color = Ansi.BRIGHT_GREEN if disp["refresh_rate_hz"] >= 120 else Ansi.BRIGHT_YELLOW
-            rate_str = c(f"{disp['refresh_rate_hz']:.2f} Hz", Ansi.BOLD, rate_color)
+            # Row 3: ICC calibration profile per display
+            icc_parts: List[str] = []
+            for idx, d in enumerate(shown_disps, start=1):
+                p_title = d.get("color_profile_title", "Standard")
+                if d.get("is_internal"):
+                    p_col = Ansi.BRIGHT_CYAN if d.get("color_profile_id") != "unknown" else Ansi.WHITE
+                    short_int = p_title if inner_w >= 50 else p_title.split(" (")[0]
+                    icc_parts.append(f"[{idx}] {c(short_int, Ansi.BOLD, p_col)}")
+                else:
+                    short_ext = "Standard" if "Uncalibrated" in p_title or p_title in ("Default / Native", "unknown") else p_title
+                    if inner_w < 36 and short_ext == "Standard":
+                        short_ext = "Std"
+                    icc_parts.append(f"[{idx}] {c(short_ext, Ansi.DIM)}")
+            disp_rows.append(f"{c('ICC ', Ansi.BOLD, Ansi.WHITE)}  " + " · ".join(icc_parts))
 
-            label = "Panel:  " if disp.get("is_internal", True) else "Display:"
-            d_panel = fit_cell(f"{label} {disp['display_title']} ({disp['resolution']} @ {disp['scale']}x)", 44)
-            d_line1 = f"{d_panel}  │  Refresh Rate: {rate_str}"
-            lines.append(row(d_line1))
-
-            if disp.get("is_internal", True):
-                prof_color = Ansi.BRIGHT_CYAN if disp["color_profile_id"] != "unknown" else Ansi.WHITE
-                d_prof = fit_cell(f"Profile: {c(disp['color_profile_title'], Ansi.BOLD, prof_color)}", 44)
-                d_line2 = f"{d_prof}  │  KWin Wayland Color Pipeline"
+            # Row 4: Multi-monitor topology summary
+            mode_str = "Mirrored" if d_mode == "mirrored" else f"Extended {d_count}x"
+            pri_out = next((d["output_name"] for d in displays if d.get("is_primary")), displays[0]["output_name"])
+            if inner_w >= 44:
+                mode_det = f"· Primary: {pri_out} (Wayland)"
+            elif inner_w >= 36:
+                mode_det = f"· Primary: {pri_out}"
             else:
-                ext_prof = disp.get("color_profile_title")
-                if ext_prof in ("Default / Native", "unknown"):
-                    ext_prof = "Standard / Uncalibrated"
-                d_prof = fit_cell(f"Profile: {c(ext_prof, Ansi.BOLD, Ansi.WHITE)}", 44)
-                d_line2 = f"{d_prof}  │  External Output ({disp['output_name']})"
-            lines.append(row(d_line2))
+                mode_det = f"· Pri: {pri_out}"
+            disp_rows.append(
+                f"{c('MODE', Ansi.BOLD, Ansi.WHITE)}  {c(mode_str, Ansi.BRIGHT_MAGENTA)} {c(mode_det, Ansi.DIM)}"
+            )
 
-        # Footer
-        footer_cmd = " lstats -w (Watch) │ lstats -j (JSON) │ lstats -s (Short) "
-        pad_bot = inner_w - len(footer_cmd)
-        lines.append(f"╰─{'─' * max(0, pad_bot)}{c(footer_cmd, Ansi.DIM)}─╯")
+            # Row 5: Per-connector GPU MUX source routing (dGPU vs iGPU)
+            mux_parts: List[str] = []
+            for idx, d in enumerate(shown_disps, start=1):
+                g_src = d.get("gpu_source", "iGPU" if d.get("is_internal") else "dGPU")
+                g_col = Ansi.BRIGHT_GREEN if g_src == "dGPU" else Ansi.BRIGHT_CYAN
+                if inner_w >= 42:
+                    mux_parts.append(f"[{idx}] {d['output_name']} ➔ {c(g_src, Ansi.BOLD, g_col)}")
+                else:
+                    mux_parts.append(f"{d['output_name']}➔{c(g_src, Ansi.BOLD, g_col)}")
+            mux_sep = "  ·  " if inner_w >= 44 else " · "
+            disp_rows.append(f"{c('MUX ', Ansi.BOLD, Ansi.WHITE)}  " + mux_sep.join(mux_parts))
+        else:
+            d0 = displays[0] if displays else disp
+            hz = d0.get("refresh_rate_hz", 240.0)
+            hz_col = Ansi.BRIGHT_GREEN if hz >= 120 else Ansi.BRIGHT_YELLOW
+            is_int = d0.get("is_internal", True)
+            p_col = Ansi.BRIGHT_CYAN if d0.get("color_profile_id") != "unknown" else Ansi.WHITE
+            p_title = d0.get("color_profile_title", "Default / Native")
+            panel_tag = "Internal OLED" if is_int else "External Monitor"
+            g_src = d0.get("gpu_source", "iGPU" if is_int else "dGPU")
+            g_col = Ansi.BRIGHT_GREEN if g_src == "dGPU" else Ansi.BRIGHT_CYAN
+            hw_id = d0.get("hw_id", EXPECTED_PANEL_ID)
+
+            # Adaptive non-truncating single-display lines based on exact inner_w
+            out_full = f"{c('OUT ', Ansi.BOLD, Ansi.WHITE)}  {c(d0['output_name'], Ansi.BOLD, Ansi.BRIGHT_CYAN)}  ·  {d0['display_title']} ({panel_tag})  ·  EDID: {hw_id}"
+            out_mid = f"{c('OUT ', Ansi.BOLD, Ansi.WHITE)}  {c(d0['output_name'], Ansi.BOLD, Ansi.BRIGHT_CYAN)}  ·  {d0['display_title']} ({panel_tag})"
+            out_short = f"{c('OUT ', Ansi.BOLD, Ansi.WHITE)}  {c(d0['output_name'], Ansi.BOLD, Ansi.BRIGHT_CYAN)} · {d0['display_title']}"
+            out_row = out_full if visible_width(out_full) <= inner_w else (out_mid if visible_width(out_mid) <= inner_w else out_short)
+
+            mode_full = f"{c('MODE', Ansi.BOLD, Ansi.WHITE)}  {d0['resolution']} @ {c(f'{hz:.2f} Hz', Ansi.BOLD, hz_col)}  ·  Scale {d0['scale']:g}x  ·  Wayland Active"
+            mode_mid = f"{c('MODE', Ansi.BOLD, Ansi.WHITE)}  {d0['resolution']} @ {c(f'{hz:.2f} Hz', Ansi.BOLD, hz_col)}  ·  Scale {d0['scale']:g}x"
+            mode_short = f"{c('MODE', Ansi.BOLD, Ansi.WHITE)}  {d0['resolution']} @ {c(f'{hz:.0f} Hz', Ansi.BOLD, hz_col)} · {d0['scale']:g}x"
+            mode_row = mode_full if visible_width(mode_full) <= inner_w else (mode_mid if visible_width(mode_mid) <= inner_w else mode_short)
+
+            icc_full = f"{c('ICC ', Ansi.BOLD, Ansi.WHITE)}  {c(p_title, Ansi.BOLD, p_col)}  ·  {c('Factory Calibrated' if is_int else 'Standard Color', Ansi.DIM)}"
+            icc_mid = f"{c('ICC ', Ansi.BOLD, Ansi.WHITE)}  {c(p_title, Ansi.BOLD, p_col)}"
+            icc_short = f"{c('ICC ', Ansi.BOLD, Ansi.WHITE)}  {c(p_title.split(' (')[0], Ansi.BOLD, p_col)}"
+            icc_row = icc_full if visible_width(icc_full) <= inner_w else (icc_mid if visible_width(icc_mid) <= inner_w else icc_short)
+
+            mux_desc = f"Hybrid Optimus (eDP ➔ {igpu.get('vendor', 'Intel')} iGPU)" if g_src == "iGPU" else f"Direct Scanout ({short_gpu_name})"
+            mux_full = f"{c('MUX ', Ansi.BOLD, Ansi.WHITE)}  Driven by {c(g_src, Ansi.BOLD, g_col)}  ·  {c(mux_desc, Ansi.DIM)}"
+            mux_mid = f"{c('MUX ', Ansi.BOLD, Ansi.WHITE)}  Driven by {c(g_src, Ansi.BOLD, g_col)} ({panel_tag})"
+            mux_short = f"{c('MUX ', Ansi.BOLD, Ansi.WHITE)}  Driven by {c(g_src, Ansi.BOLD, g_col)} ({'OLED' if is_int else 'Ext'})"
+            mux_row = mux_full if visible_width(mux_full) <= inner_w else (mux_mid if visible_width(mux_mid) <= inner_w else mux_short)
+
+            pipe_full = f"{c('PIPE', Ansi.BOLD, Ansi.WHITE)}  {c('KWin Wayland Color Management · EDID Verified', Ansi.DIM)}"
+            pipe_mid = f"{c('PIPE', Ansi.BOLD, Ansi.WHITE)}  {c('KWin Wayland · EDID Verified', Ansi.DIM)}"
+            pipe_short = f"{c('PIPE', Ansi.BOLD, Ansi.WHITE)}  {c('KWin Wayland · EDID OK', Ansi.DIM)}"
+            pipe_row = pipe_full if visible_width(pipe_full) <= inner_w else (pipe_mid if visible_width(pipe_mid) <= inner_w else pipe_short)
+
+            disp_rows = [out_row, mode_row, icc_row, mux_row, pipe_row]
+
+        card_title_disp = f"DISPLAYS ({d_mode.upper()} {d_count}X)" if d_count > 1 else "DISPLAY & CALIBRATION"
+        card_display = DashboardRenderer._build_card(card_title_disp, disp_rows, card_w)
+
+        # ── Assemble Grid ─────────────────────────────────────────────────────
+        lines: List[str] = [header_line]
+        if two_col:
+            for l_line, r_line in zip(card_thermal, card_power):
+                lines.append(f"{l_line}  {r_line}")
+            for l_line, r_line in zip(card_compute, card_display):
+                lines.append(f"{l_line}  {r_line}")
+        else:
+            lines.extend(card_thermal)
+            lines.extend(card_power)
+            lines.extend(card_compute)
+            lines.extend(card_display)
+
+        # ── Footer / Interactive Controls Bar ─────────────────────────────────
+        if watch_mode:
+            if total_w >= 82:
+                keys = [
+                    ("[p]", "Profile"),
+                    ("[1-4]", "Mode"),
+                    ("[c]", "80% Cap"),
+                    ("[r]", "240/60Hz"),
+                    ("[l]", "Color"),
+                    ("[s]", "Shell"),
+                    ("[q]", "Quit"),
+                ]
+                sep_k = "  "
+            else:
+                keys = [
+                    ("[p]", "Prof"),
+                    ("[1-4]", "Mode"),
+                    ("[c]", "80%"),
+                    ("[r]", "Hz"),
+                    ("[l]", "ICC"),
+                    ("[s]", "Sh"),
+                    ("[q]", "Quit"),
+                ]
+                sep_k = " "
+            ctrl_left = " " + sep_k.join(f"{c(k, Ansi.BOLD, Ansi.BRIGHT_CYAN)} {c(v, Ansi.DIM)}" for k, v in keys)
+            if status_msg:
+                toast = f"{c('▸ ' + status_msg, Ansi.BOLD, Ansi.BRIGHT_GREEN)} "
+                if visible_width(ctrl_left) + visible_width(toast) + 1 <= total_w:
+                    pad_f = max(1, total_w - visible_width(ctrl_left) - visible_width(toast))
+                    lines.append(f"{ctrl_left}{' ' * pad_f}{toast}")
+                else:
+                    lines.append(f" {toast}")
+            else:
+                lines.append(fit_cell(ctrl_left, total_w))
+        else:
+            footer_hint = (
+                f" {c('Live TUI & Controls:', Ansi.DIM)} {c('lstats -w', Ansi.BOLD, Ansi.BRIGHT_CYAN)}   "
+                f"{c('│', Ansi.DIM)}   {c('JSON:', Ansi.DIM)} {c('lstats -j', Ansi.WHITE)}   "
+                f"{c('│', Ansi.DIM)}   {c('Compact:', Ansi.DIM)} {c('lstats -s', Ansi.WHITE)}"
+            )
+            lines.append(fit_cell(footer_hint, total_w))
 
         return "\n".join(lines)
 
@@ -774,6 +1255,70 @@ def get_user_shell() -> str:
     return "/bin/sh"
 
 
+def _dispatch_tui_action(key: bytes) -> Tuple[str, bool]:
+    """
+    Executes an interactive TUI hotkey action without leaving watch mode.
+    Returns (status_toast_message, force_display_refresh).
+    """
+    try:
+        if key in (b"p", b"P", b"1", b"2", b"3", b"4"):
+            direct_map = {
+                b"1": "low-power",
+                b"2": "balanced",
+                b"3": "performance",
+                b"4": "max-power",
+            }
+            if key in direct_map:
+                target = direct_map[key]
+            else:
+                cur = get_platform_profile().get("id", "balanced")
+                cycle = ["low-power", "balanced", "performance"]
+                target = cycle[(cycle.index(cur) + 1) % len(cycle)] if cur in cycle else "balanced"
+
+            if os.path.isfile(PLATFORM_PROFILE_NODE) and os.access(PLATFORM_PROFILE_NODE, os.W_OK):
+                with open(PLATFORM_PROFILE_NODE, "w") as f:
+                    f.write(target)
+                rapl_res = sync_rapl_mmio(profile_id=target)
+                p_title = PLATFORM_PROFILES.get(target, {}).get("title", target)
+                if rapl_res.get("applied"):
+                    return f"{p_title} ({rapl_res['pl1_w']}/{rapl_res['pl2_w']}W)", False
+                return f"Switched to {p_title}", False
+            return "Profile node not writable", False
+
+        if key in (b"c", b"C"):
+            active, node = get_conservation_mode()
+            new_val = "0" if active else "1"
+            if os.path.isfile(node) and os.access(node, os.W_OK):
+                with open(node, "w") as f:
+                    f.write(new_val)
+                label = "Conservation 80% ON" if new_val == "1" else "Full Charge 100% ON"
+                return label, False
+            return "Conservation node not writable", False
+
+        if key in (b"r", b"R"):
+            lhz_bin = os.path.join(SCRIPT_DIR, "lhz")
+            if not os.path.isfile(lhz_bin):
+                lhz_bin = shutil.which("lhz") or ""
+            if lhz_bin:
+                proc = subprocess.run([lhz_bin, "toggle"], capture_output=True, text=True, timeout=2)
+                msg = strip_ansi(proc.stdout.strip()).splitlines()[-1] if proc.stdout.strip() else "Refresh rate toggled"
+                return msg, True
+            return "lhz not found", False
+
+        if key in (b"l", b"L"):
+            lcolor_bin = os.path.join(SCRIPT_DIR, "lcolor")
+            if not os.path.isfile(lcolor_bin):
+                lcolor_bin = shutil.which("lcolor") or ""
+            if lcolor_bin:
+                proc = subprocess.run([lcolor_bin, "cycle"], capture_output=True, text=True, timeout=2)
+                first = strip_ansi(proc.stdout.strip()).splitlines()[0] if proc.stdout.strip() else "Color profile cycled"
+                return first.replace("Applied Color Profile: ", ""), True
+            return "lcolor not found", False
+    except Exception as e:
+        return f"Action error: {e}", False
+    return "", False
+
+
 # --- Interactive Live Watch Loop ---
 
 def run_watch_mode(telemetry: TelemetryCollector, interval: float = 1.0):
@@ -784,6 +1329,9 @@ def run_watch_mode(telemetry: TelemetryCollector, interval: float = 1.0):
     old_sigwinch = None
     drop_shell = False
     resized = False
+    force_display = False
+    status_msg = ""
+    status_until = 0.0
 
     pipe_r = None
     pipe_w = None
@@ -836,13 +1384,13 @@ def run_watch_mode(telemetry: TelemetryCollector, interval: float = 1.0):
                 sys.stdout.write(Ansi.CLEAR_SCREEN + Ansi.HOME)
                 sys.stdout.flush()
 
-            # Guard against terminals smaller than base minimum dimensions (80x18)
+            # Guard against terminals smaller than base minimum dimensions (58x14)
             # Skips expensive sysfs/NVML telemetry polling completely when the window is too small
-            if is_tty and (term_cols < 80 or term_rows < 18):
+            if is_tty and (term_cols < 58 or term_rows < 14):
                 warn_lines = [
                     "",
                     c(f"Terminal too small: {term_cols}x{term_rows}", Ansi.BOLD, Ansi.BRIGHT_YELLOW),
-                    "Minimum required: 80x18 to render telemetry dashboard.",
+                    "Minimum required: 76x16 (2x2 grid) or 58x30 (stacked).",
                     "",
                     c("Please resize / enlarge your terminal window.", Ansi.DIM),
                     c("Press 'q' to quit, 's' for shell (Ctrl+C to exit)", Ansi.DIM),
@@ -851,19 +1399,28 @@ def run_watch_mode(telemetry: TelemetryCollector, interval: float = 1.0):
                 sys.stdout.write(frame)
                 sys.stdout.flush()
             else:
-                data = telemetry.collect_all(sample_interval=0.0)
-                output = DashboardRenderer.render(data, width=term_cols)
+                active_toast = status_msg if time.monotonic() < status_until else ""
+                data = telemetry.collect_all(sample_interval=0.0, force_display=force_display)
+                force_display = False
+                output = DashboardRenderer.render(
+                    data,
+                    width=term_cols,
+                    height=term_rows,
+                    history=telemetry.history,
+                    watch_mode=True,
+                    status_msg=active_toast,
+                )
 
                 if is_tty:
                     raw_lines = output.split("\n")
-                    min_required_rows = len(raw_lines) + 2  # dynamic: rendered box + hint + safety line
+                    min_required_rows = len(raw_lines)
 
-                    # Secondary guard: dynamically checks if multi-monitor displays need more vertical rows
+                    # Secondary guard: dynamically checks if stacked narrow layout needs more vertical rows
                     if term_rows < min_required_rows:
                         warn_lines = [
                             "",
                             c(f"Terminal too small: {term_cols}x{term_rows}", Ansi.BOLD, Ansi.BRIGHT_YELLOW),
-                            f"Minimum required: 80x{min_required_rows} for extended display layout.",
+                            f"Minimum required: {term_cols}x{min_required_rows} for current layout.",
                             "",
                             c("Please resize / enlarge your terminal window.", Ansi.DIM),
                             c("Press 'q' to quit, 's' for shell (Ctrl+C to exit)", Ansi.DIM),
@@ -872,16 +1429,8 @@ def run_watch_mode(telemetry: TelemetryCollector, interval: float = 1.0):
                         sys.stdout.write(frame)
                         sys.stdout.flush()
                     else:
-                        # Clear each line to end-of-line (Ansi.CLEAR_LINE) so columns > 80
-                        # on wide screens are cleanly cleared without ghost characters
                         framed_lines = [line + Ansi.CLEAR_LINE for line in raw_lines]
                         frame_body = "\n".join(framed_lines)
-
-                        hint = "Press 'q' to quit, 's' for shell (Ctrl+C to exit)"
-                        frame_body += "\n" + c(hint, Ansi.DIM) + Ansi.CLEAR_LINE
-
-                        # Clear to end of screen (Ansi.CLEAR_TO_END) to wipe any lines below
-                        # Omit trailing newline to prevent scrolling the bottom terminal row
                         sys.stdout.write(Ansi.HOME + frame_body + Ansi.CLEAR_TO_END)
                         sys.stdout.flush()
                 else:
@@ -943,6 +1492,14 @@ def run_watch_mode(telemetry: TelemetryCollector, interval: float = 1.0):
                         elif data_bytes in (b"s", b"S"):
                             drop_shell = True
                             return
+                        elif data_bytes in (b"p", b"P", b"1", b"2", b"3", b"4", b"c", b"C", b"r", b"R", b"l", b"L"):
+                            msg, disp_dirty = _dispatch_tui_action(data_bytes)
+                            if msg:
+                                status_msg = msg
+                                status_until = time.monotonic() + 2.8
+                            if disp_dirty:
+                                force_display = True
+                            break
                 else:
                     time.sleep(remaining)
                     break
@@ -1046,8 +1603,8 @@ Examples:
             run_watch_mode(telemetry, interval=interval)
         else:
             data = telemetry.collect_all(sample_interval=0.05)
-            term_cols = shutil.get_terminal_size(fallback=(80, 24)).columns
-            print(DashboardRenderer.render(data, width=term_cols))
+            ts = shutil.get_terminal_size(fallback=(104, 28))
+            print(DashboardRenderer.render(data, width=ts.columns, height=ts.lines, history=telemetry.history, watch_mode=False))
     finally:
         telemetry.close()
 
