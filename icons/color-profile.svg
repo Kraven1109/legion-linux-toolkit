@@ -1,45 +1,59 @@
 <svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
   <defs>
-    <linearGradient id="bgDisc" x1="0%" y1="0%" x2="100%" y2="100%">
+    <linearGradient id="cpArmor" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#312e81"/>
+      <stop offset="50%" stop-color="#0f172a"/>
+      <stop offset="100%" stop-color="#040711"/>
+    </linearGradient>
+    <radialGradient id="cpCoreBg" cx="50%" cy="45%" r="62%">
       <stop offset="0%" stop-color="#1e1b4b"/>
-      <stop offset="100%" stop-color="#0f172a"/>
+      <stop offset="60%" stop-color="#090d1a"/>
+      <stop offset="100%" stop-color="#02040a"/>
+    </radialGradient>
+    <linearGradient id="cpRed" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ff6b8b"/>
+      <stop offset="50%" stop-color="#ff1f4b"/>
+      <stop offset="100%" stop-color="#be123c"/>
     </linearGradient>
-    <linearGradient id="redGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#ff4b4b"/>
-      <stop offset="100%" stop-color="#dc2626"/>
+    <linearGradient id="cpGreen" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#6ee7b7"/>
+      <stop offset="50%" stop-color="#10b981"/>
+      <stop offset="100%" stop-color="#047857"/>
     </linearGradient>
-    <linearGradient id="greenGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#22c55e"/>
-      <stop offset="100%" stop-color="#16a34a"/>
+    <linearGradient id="cpBlue" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#7dd3fc"/>
+      <stop offset="50%" stop-color="#0ea5e9"/>
+      <stop offset="100%" stop-color="#1d4ed8"/>
     </linearGradient>
-    <linearGradient id="blueGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#38bdf8"/>
-      <stop offset="100%" stop-color="#2563eb"/>
-    </linearGradient>
-    <linearGradient id="centerGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+    <linearGradient id="cpPrism" x1="0%" y1="0%" x2="100%" y2="100%">
       <stop offset="0%" stop-color="#ffffff"/>
-      <stop offset="100%" stop-color="#f1f5f9"/>
+      <stop offset="50%" stop-color="#f43f5e"/>
+      <stop offset="100%" stop-color="#38bdf8"/>
     </linearGradient>
   </defs>
 
-  <!-- Outer Disc -->
-  <rect x="6" y="6" width="52" height="52" rx="26" fill="url(#bgDisc)"/>
-  
-  <!-- Subtle 3D Rim -->
-  <path d="M 32 6 A 26 26 0 0 1 58 32 A 26 26 0 0 0 32 7 A 26 26 0 0 0 6 32 A 26 26 0 0 1 32 6 Z" fill="#ffffff" opacity="0.2"/>
-  <path d="M 6 32 A 26 26 0 0 0 32 58 A 26 26 0 0 0 58 32 A 26 26 0 0 1 32 57 A 26 26 0 0 1 6 32 Z" fill="#000000" opacity="0.4"/>
+  <!-- Outer Machined Optical Lens Bezel -->
+  <circle cx="32" cy="32" r="29" fill="url(#cpArmor)" stroke="url(#cpPrism)" stroke-width="1" stroke-opacity="0.8"/>
+  <circle cx="32" cy="32" r="26.5" fill="url(#cpCoreBg)" stroke="#64748b" stroke-width="0.7" stroke-opacity="0.4"/>
 
-  <!-- CIE Chromaticity Tri-Color Gamut Petals -->
-  <!-- Top: Red Gamut Vertex -->
-  <circle cx="32" cy="21" r="9" fill="url(#redGrad)" opacity="0.85"/>
-  
-  <!-- Bottom-Left: Blue Gamut Vertex -->
-  <circle cx="23" cy="37" r="9" fill="url(#blueGrad)" opacity="0.85"/>
-  
-  <!-- Bottom-Right: Green Gamut Vertex -->
-  <circle cx="41" cy="37" r="9" fill="url(#greenGrad)" opacity="0.85"/>
+  <!-- Precision Optical Aperture Ring -->
+  <circle cx="32" cy="32" r="23.5" fill="none" stroke="#94a3b8" stroke-width="0.9" stroke-dasharray="2 3.2" opacity="0.5"/>
 
-  <!-- Center Gamut Overlap / Whitepoint Core (D65 Calibration) -->
-  <circle cx="32" cy="32" r="4.5" fill="url(#centerGrad)" opacity="0.95"/>
-  <circle cx="32" cy="32" r="2" fill="#0f172a" opacity="0.4"/>
+  <!-- CIE Wide-Gamut Chromaticity Triangle Guide -->
+  <polygon points="32,12.5 49,42 15,42" fill="none" stroke="#e2e8f0" stroke-width="0.9" stroke-dasharray="2.5 2" opacity="0.45"/>
+
+  <!-- Tri-Primary OLED Gamut Lobes -->
+  <circle cx="32" cy="22.5" r="9.8" fill="url(#cpRed)" opacity="0.88" stroke="#fda4af" stroke-width="0.7"/>
+  <circle cx="23.2" cy="37.2" r="9.8" fill="url(#cpBlue)" opacity="0.88" stroke="#7dd3fc" stroke-width="0.7"/>
+  <circle cx="40.8" cy="37.2" r="9.8" fill="url(#cpGreen)" opacity="0.88" stroke="#6ee7b7" stroke-width="0.7"/>
+
+  <!-- Gamut Vertex Calibration Nodes -->
+  <circle cx="32" cy="12.5" r="1.7" fill="#ffffff"/>
+  <circle cx="15" cy="42" r="1.7" fill="#ffffff"/>
+  <circle cx="49" cy="42" r="1.7" fill="#ffffff"/>
+
+  <!-- Central D65 Whitepoint Diamond Prism -->
+  <polygon points="32,25.5 38.5,32 32,38.5 25.5,32" fill="#ffffff" stroke="#0f172a" stroke-width="1.1" stroke-linejoin="round"/>
+  <polygon points="32,28.5 35.5,32 32,35.5 28.5,32" fill="#0f172a"/>
+  <circle cx="32" cy="32" r="1.4" fill="#ffffff"/>
 </svg>

@@ -1,57 +1,65 @@
 <svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
   <defs>
-    <radialGradient id="qBg" cx="50%" cy="38%" r="65%">
-      <stop offset="0%" stop-color="#0f2544"/>
-      <stop offset="60%" stop-color="#081326"/>
+    <linearGradient id="qArmor" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1e3a5f"/>
+      <stop offset="50%" stop-color="#0b172a"/>
       <stop offset="100%" stop-color="#040812"/>
+    </linearGradient>
+    <radialGradient id="qCoreBg" cx="50%" cy="42%" r="60%">
+      <stop offset="0%" stop-color="#0c2d57"/>
+      <stop offset="58%" stop-color="#071428"/>
+      <stop offset="100%" stop-color="#030710"/>
     </radialGradient>
-    <radialGradient id="qGlow" cx="50%" cy="50%" r="50%">
-      <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.45"/>
-      <stop offset="55%" stop-color="#0284c7" stop-opacity="0.16"/>
+    <radialGradient id="qHalo" cx="50%" cy="50%" r="48%">
+      <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.55"/>
+      <stop offset="50%" stop-color="#0284c7" stop-opacity="0.22"/>
       <stop offset="100%" stop-color="#0284c7" stop-opacity="0"/>
     </radialGradient>
-    <linearGradient id="qRim" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#7dd3fc" stop-opacity="0.75"/>
-      <stop offset="50%" stop-color="#0284c7" stop-opacity="0.25"/>
-      <stop offset="100%" stop-color="#38bdf8" stop-opacity="0.65"/>
-    </linearGradient>
-    <linearGradient id="qArc" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#e0f2fe"/>
-      <stop offset="50%" stop-color="#38bdf8"/>
+    <linearGradient id="qCyan" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="45%" stop-color="#7dd3fc"/>
       <stop offset="100%" stop-color="#0284c7"/>
     </linearGradient>
-    <linearGradient id="qCore" x1="0%" y1="0%" x2="0%" y2="100%">
+    <linearGradient id="qIce" x1="0%" y1="0%" x2="0%" y2="100%">
       <stop offset="0%" stop-color="#ffffff"/>
-      <stop offset="100%" stop-color="#7dd3fc"/>
+      <stop offset="65%" stop-color="#bae6fd"/>
+      <stop offset="100%" stop-color="#38bdf8"/>
     </linearGradient>
   </defs>
 
-  <!-- Obsidian Titanium Disc -->
-  <circle cx="32" cy="32" r="28" fill="url(#qBg)"/>
-  <circle cx="32" cy="32" r="26" fill="url(#qGlow)"/>
+  <!-- Outer Machined Titanium Bezel -->
+  <circle cx="32" cy="32" r="29" fill="url(#qArmor)" stroke="#38bdf8" stroke-width="0.9" stroke-opacity="0.65"/>
+  <circle cx="32" cy="32" r="26.5" fill="url(#qCoreBg)" stroke="#0ea5e9" stroke-width="0.7" stroke-opacity="0.35"/>
+  <circle cx="32" cy="32" r="25" fill="url(#qHalo)"/>
 
-  <!-- Metallic Bevel Rim -->
-  <circle cx="32" cy="32" r="27.3" fill="none" stroke="url(#qRim)" stroke-width="1.2"/>
+  <!-- Recessed Armor Notches (Cardinal & Diagonal) -->
+  <path d="M 29 3.4 L 35 3.4 M 29 60.6 L 35 60.6 M 3.4 29 L 3.4 35 M 60.6 29 L 60.6 35" stroke="#7dd3fc" stroke-width="1.6" stroke-linecap="round" opacity="0.85"/>
+  <circle cx="13.2" cy="13.2" r="1.1" fill="#38bdf8" opacity="0.7"/>
+  <circle cx="50.8" cy="13.2" r="1.1" fill="#38bdf8" opacity="0.7"/>
+  <circle cx="13.2" cy="50.8" r="1.1" fill="#38bdf8" opacity="0.7"/>
+  <circle cx="50.8" cy="50.8" r="1.1" fill="#38bdf8" opacity="0.7"/>
 
-  <!-- Outer Precision HUD Ring & Cardinal Ticks -->
-  <circle cx="32" cy="32" r="23.5" fill="none" stroke="#38bdf8" stroke-width="0.8" stroke-dasharray="3 4" opacity="0.35"/>
-  <line x1="32" y1="5.5" x2="32" y2="8.5" stroke="#7dd3fc" stroke-width="1.3" stroke-linecap="round" opacity="0.8"/>
-  <line x1="32" y1="55.5" x2="32" y2="58.5" stroke="#7dd3fc" stroke-width="1.3" stroke-linecap="round" opacity="0.5"/>
-  <line x1="5.5" y1="32" x2="8.5" y2="32" stroke="#7dd3fc" stroke-width="1.3" stroke-linecap="round" opacity="0.5"/>
-  <line x1="55.5" y1="32" x2="58.5" y2="32" stroke="#7dd3fc" stroke-width="1.3" stroke-linecap="round" opacity="0.5"/>
+  <!-- Segmented Cryo Telemetry Ring -->
+  <circle cx="32" cy="32" r="23.2" fill="none" stroke="#38bdf8" stroke-width="1.1" stroke-dasharray="6 3 1.5 3" opacity="0.45"/>
+  <path d="M 14.5 41 A 19.8 19.8 0 1 1 49.5 41" fill="none" stroke="#0c4a6e" stroke-width="2.4" stroke-linecap="round"/>
+  <path d="M 14.5 41 A 19.8 19.8 0 0 1 38 13.1" fill="none" stroke="url(#qCyan)" stroke-width="2.6" stroke-linecap="round"/>
 
-  <!-- Cryo-Stealth Acoustic Shield Arc -->
-  <path d="M 16.5 41.5 A 18 18 0 1 1 47.5 41.5" fill="none" stroke="#0c4a6e" stroke-width="2.6" stroke-linecap="round" opacity="0.85"/>
-  <path d="M 16.5 41.5 A 18 18 0 0 1 32 14" fill="none" stroke="url(#qArc)" stroke-width="2.8" stroke-linecap="round"/>
+  <!-- Double Hexagonal Cryo-Chamber -->
+  <polygon points="32,16.5 45.4,24.2 45.4,39.8 32,47.5 18.6,39.8 18.6,24.2" fill="#061529" fill-opacity="0.9" stroke="url(#qCyan)" stroke-width="1.4" stroke-linejoin="round"/>
+  <polygon points="32,20 42.4,26 42.4,38 32,44 21.6,38 21.6,26" fill="none" stroke="#38bdf8" stroke-width="0.7" stroke-opacity="0.45"/>
 
-  <!-- Hexagonal Cryo-Core Frame -->
-  <polygon points="32,19 43,25.5 43,38.5 32,45 21,38.5 21,25.5" fill="#071a30" fill-opacity="0.85" stroke="#38bdf8" stroke-width="1.3" stroke-linejoin="round"/>
+  <!-- 6-Axis Cryo Lattice Struts -->
+  <line x1="32" y1="18" x2="32" y2="46" stroke="#38bdf8" stroke-width="1.1" opacity="0.5"/>
+  <line x1="19.9" y1="25" x2="44.1" y2="39" stroke="#38bdf8" stroke-width="1.1" opacity="0.5"/>
+  <line x1="44.1" y1="25" x2="19.9" y2="39" stroke="#38bdf8" stroke-width="1.1" opacity="0.5"/>
 
-  <!-- Cryo-Blade / Stealth Energy Core -->
-  <path d="M 32 21.5 L 35.2 28.8 L 41 32 L 35.2 35.2 L 32 42.5 L 28.8 35.2 L 23 32 L 28.8 28.8 Z" fill="url(#qCore)"/>
-  <circle cx="32" cy="32" r="2.6" fill="#0284c7"/>
-  <circle cx="32" cy="32" r="1.2" fill="#e0f2fe"/>
+  <!-- Faceted Crystalline Cryo-Star Core -->
+  <polygon points="32,19.5 35.4,28.6 44.5,32 35.4,35.4 32,44.5 28.6,35.4 19.5,32 28.6,28.6" fill="url(#qIce)"/>
+  <polygon points="32,24.5 37.5,26.5 39.5,32 37.5,37.5 32,39.5 26.5,37.5 24.5,32 26.5,26.5" fill="none" stroke="#ffffff" stroke-width="0.9" opacity="0.8"/>
+  <circle cx="32" cy="32" r="3.4" fill="#061529" stroke="#7dd3fc" stroke-width="1.2"/>
+  <circle cx="32" cy="32" r="1.5" fill="#ffffff"/>
 
-  <!-- Bottom Stealth Mode Indicators -->
-  <path d="M 25 48.5 L 32 51 L 39 48.5" fill="none" stroke="#7dd3fc" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" opacity="0.85"/>
+  <!-- Acoustic Dampening Sub-Zero Waves -->
+  <path d="M 23.5 50.2 Q 32 53.8 40.5 50.2" fill="none" stroke="#7dd3fc" stroke-width="1.6" stroke-linecap="round" opacity="0.9"/>
+  <path d="M 26.8 53.5 Q 32 55.8 37.2 53.5" fill="none" stroke="#38bdf8" stroke-width="1.3" stroke-linecap="round" opacity="0.65"/>
 </svg>
