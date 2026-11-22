@@ -650,9 +650,17 @@ class DashboardRenderer:
         nvme_drives = data["storage"].get("drives") or []
         nvme_t = data["storage"]["nvme_temps_c"]
 
-        # Clean dynamic dGPU short name (e.g. "RTX 5090", "RTX 4070", "RTX 4060")
+        # Clean dynamic dGPU short name (e.g. "RTX 5090", "RTX 4070", "RTX 4060") & firmware
         raw_gpu_name = (gpu.get("name") or "dGPU").replace("NVIDIA ", "").replace("GeForce ", "").replace(" Laptop GPU", "").strip()
         short_gpu_name = raw_gpu_name if len(raw_gpu_name) <= 12 else " ".join(raw_gpu_name.split()[:2])
+        gpu_nbr = short_gpu_name.split()[-1] if short_gpu_name else "dGPU"
+        gpu_fw = gpu.get("firmware") or (gpu.get("driver") if gpu.get("driver") not in (None, "", "N/A") else "")
+
+        def _pick_fit(candidates: List[str]) -> str:
+            for cand in candidates:
+                if len(cand) <= right_w:
+                    return cand
+            return candidates[-1]
 
         cpu_t = cpu.get("temperature_c")
         cpu_t_col = temp_color(cpu_t, "cpu") if cpu_t is not None else None
@@ -667,7 +675,9 @@ class DashboardRenderer:
         )
 
         gpu_t = gpu.get("temperature_c")
-        gpu_asleep = gpu.get("state") == "suspended"
+        gpu_state = gpu.get("state")
+        gpu_asleep = gpu_state == "suspended"
+        gpu_idling = gpu_state == "idling"
         if gpu_t is not None:
             gpu_t_col = temp_color(gpu_t, "gpu")
             gpu_t_str = f"{gpu_t:.1f}°C" if gpu_t < 100 else f"{gpu_t:.0f}°C"
@@ -677,7 +687,7 @@ class DashboardRenderer:
             )
         else:
             gpu_t_col = None
-            gpu_t_str = "Sleep" if gpu_asleep else "N/A"
+            gpu_t_str = "Sleep" if gpu_asleep else ("Idle" if gpu_idling else "N/A")
             gpu_t_bar = c("·" * spark_w, Ansi.DIM)
         gpu_fan_det = (
             f"GPU Fan {gpu_f['rpm']:4d} rpm ({gpu_f['percent']:2.0f}%)"
@@ -795,7 +805,7 @@ class DashboardRenderer:
 
         g_p = gpu.get("power_draw_w")
         g_lim = gpu.get("power_limit_w") or 150.0
-        if not gpu_asleep and g_p is not None:
+        if not gpu_asleep and not gpu_idling and g_p is not None:
             g_p_pct = (g_p / g_lim * 100.0) if g_lim > 0 else 0.0
             g_p_col = pct_color(g_p_pct)
             g_p_str = f"{g_p:.1f} W" if g_p < 100 else f"{g_p:.0f} W"
@@ -811,9 +821,16 @@ class DashboardRenderer:
                 g_p_det = f"{g_lim:.0f}W ({g_p_pct:.0f}%)"
         else:
             g_p_col = None
-            g_p_str = "0.0 W" if gpu_asleep else "N/A"
+            if gpu_asleep:
+                g_p_str = "0.0 W"
+                g_p_det = "PCIe D3cold Sleep" if right_w >= 17 else "D3cold Sleep"
+            elif gpu_idling:
+                g_p_str = "Idle"
+                g_p_det = "Waiting D3cold" if right_w >= 14 else "Idle (D3)"
+            else:
+                g_p_str = "N/A"
+                g_p_det = "N/A"
             g_p_bar = c("·" * spark_w, Ansi.DIM)
-            g_p_det = ("PCIe D3cold Sleep" if right_w >= 17 else "D3cold Sleep") if gpu_asleep else "N/A"
 
         ig_p = igpu.get("power_draw_w")
         ig_name = igpu.get("name", "Intel Graphics")
@@ -885,9 +902,20 @@ class DashboardRenderer:
             gpu_u_col = None
             gpu_u_str = "Sleep"
             gpu_u_bar = c("·" * spark_w, Ansi.DIM)
-            full_sleep = f"{short_gpu_name} (Suspended)"
-            mid_sleep = f"{short_gpu_name} (Sleep)"
-            gpu_clk_det = full_sleep if len(full_sleep) <= right_w else (mid_sleep if len(mid_sleep) <= right_w else f"{short_gpu_name} (D3)")
+            cands = []
+            if gpu_fw:
+                cands.append(f"{short_gpu_name} {gpu_fw} (Sleep)")
+            cands.extend([f"{short_gpu_name} (Suspended)", f"{short_gpu_name} (Sleep)", f"{short_gpu_name} (D3)"])
+            gpu_clk_det = _pick_fit(cands)
+        elif gpu_idling:
+            gpu_u_col = None
+            gpu_u_str = "Idle"
+            gpu_u_bar = c("·" * spark_w, Ansi.DIM)
+            cands = []
+            if gpu_fw:
+                cands.append(f"{short_gpu_name} {gpu_fw} (Idle)")
+            cands.extend([f"{short_gpu_name} (Standby)", f"{short_gpu_name} (Idle)", f"{short_gpu_name} Idle"])
+            gpu_clk_det = _pick_fit(cands)
         else:
             g_util = max(0.0, min(100.0, float(gpu.get("utilization_gpu") or 0.0)))
             gpu_u_col = pct_color(g_util)
@@ -898,12 +926,22 @@ class DashboardRenderer:
             )
             g_clk = gpu.get("clock_graphics_mhz")
             if g_clk is not None:
-                full_g_clk = f"{g_clk:4d} MHz ({short_gpu_name})"
-                gpu_nbr = short_gpu_name.split()[-1]
-                mid_g_clk = f"{g_clk:4d} MHz ({gpu_nbr})"
-                gpu_clk_det = full_g_clk if len(full_g_clk) <= right_w else (mid_g_clk if len(mid_g_clk) <= right_w else f"{g_clk}M ({gpu_nbr})")
+                cands = []
+                if gpu_fw:
+                    cands.extend([
+                        f"{g_clk:4d} MHz ({short_gpu_name} {gpu_fw})",
+                        f"{g_clk:4d} MHz ({gpu_nbr} {gpu_fw})",
+                    ])
+                cands.extend([
+                    f"{g_clk:4d} MHz ({short_gpu_name})",
+                    f"{g_clk:4d} MHz ({gpu_nbr})",
+                    f"{g_clk}M ({gpu_nbr})",
+                ])
+                gpu_clk_det = _pick_fit(cands)
             else:
-                gpu_clk_det = short_gpu_name
+                cands = [f"{short_gpu_name} ({gpu_fw})"] if gpu_fw else []
+                cands.append(short_gpu_name)
+                gpu_clk_det = _pick_fit(cands)
 
         ig_util = max(0.0, min(100.0, float(igpu.get("utilization_pct") or 0.0)))
         ig_u_col = pct_color(ig_util)
@@ -937,7 +975,7 @@ class DashboardRenderer:
         v_used_mib = gpu.get("memory_used_mib")
         v_tot_mib = gpu.get("memory_total_mib")
         vram_pct = max(0.0, min(100.0, float(gpu.get("memory_percent") or 0.0)))
-        if gpu_asleep:
+        if gpu_asleep or gpu_idling:
             vram_col = None
             vram_str = "0.0%"
             vram_bar = make_bar(0.0, width=spark_w)
@@ -947,7 +985,7 @@ class DashboardRenderer:
                 mid_v_sleep = f"0.0 / {v_tot_g:.1f} GiB"
                 vram_det = full_v_sleep if len(full_v_sleep) <= right_w else (mid_v_sleep if len(mid_v_sleep) <= right_w else f"0.0/{v_tot_g:.1f} GiB")
             else:
-                vram_det = "0.0 GiB (Sleep)"
+                vram_det = "0.0 GiB (Sleep)" if gpu_asleep else "0.0 GiB (Idle)"
         else:
             vram_col = pct_color(vram_pct)
             vram_str = f"{vram_pct:.1f}%"
@@ -1173,7 +1211,12 @@ class ShortRenderer:
         c_pow = f" {cpu['package_power_w']:.0f}W" if cpu.get("package_power_w") is not None else ""
 
         gpu = data["gpu"]
-        g_temp = f"{gpu['temperature_c']}°C" if gpu.get("temperature_c") else ("Sleep" if gpu.get("state") == "suspended" else "N/A")
+        g_state = gpu.get("state")
+        g_temp = (
+            f"{gpu['temperature_c']}°C"
+            if gpu.get("temperature_c") is not None
+            else ("Sleep" if g_state == "suspended" else ("Idle" if g_state == "idling" else "N/A"))
+        )
         g_pow = f" {gpu['power_draw_w']:.0f}W" if gpu.get("power_draw_w") is not None and gpu["power_draw_w"] > 0 else ""
 
         bat = data["power_battery"]
@@ -1537,6 +1580,7 @@ def run_watch_mode(telemetry: TelemetryCollector, interval: float = 1.0):
                 pass
 
         if drop_shell:
+            telemetry.close()
             user_sh = get_user_shell()
             sh_name = os.path.basename(user_sh)
             try:
