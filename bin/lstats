@@ -185,20 +185,28 @@ def make_bar(percent: float, width: int = 10, color_override: Optional[str] = No
 
 
 SPARK_CHARS = "▁▂▃▄▅▆▇█"
+_BRAILLE_LEFT = (0x00, 0x40, 0x44, 0x46, 0x47)
+_BRAILLE_RIGHT = (0x00, 0x80, 0xA0, 0xB0, 0xB8)
 
 
-def make_gauge_with_trend(
+def make_trend_visual(
     values: List[float],
     low: float,
     high: float,
     width: int = 10,
     color_style: str = Ansi.BRIGHT_GREEN,
     watch_mode: bool = False,
+    graph_mode: str = "spark",
+    adaptive_mode: str = "power",
+    min_span: float = 10.0,
+    color_fn=None,
 ) -> str:
     """
-    Renders a segmented progress gauge bar (`▰▰▰▱▱▱▱▱▱`) so steady values never
-    merge horizontally into a solid 100%-full block in terminal fonts, plus a
-    live trend arrow (`↑`, `↓`, or ` `) when history is available in watch mode.
+    Renders a real-time trend visual of exact visual cell width `width`:
+    - snapshot mode (`not watch_mode` and <=1 sample): segmented progress bar (`make_bar`)
+    - watch mode `spark` (default): adaptive-windowed block sparkline (`▁▂▃▄▅▆▇█`) + recency shading + trend arrow
+    - watch mode `braille`: high-density 2-point-per-cell Braille waveform + recency shading + trend arrow
+    - watch mode `gauge`: segmented capacity gauge bar + trend arrow
     """
     clean_vals = [float(v) for v in values if v is not None]
     if not clean_vals:
@@ -208,9 +216,14 @@ def make_gauge_with_trend(
     cur = clean_vals[-1]
     pct = max(0.0, min(100.0, ((cur - low) / span) * 100.0))
 
-    if watch_mode and len(clean_vals) >= 2 and width >= 5:
-        bar_w = width - 1
-        delta = cur - clean_vals[0]
+    if not watch_mode and len(clean_vals) <= 1:
+        return make_bar(pct, width=width, color_override=color_style)
+
+    show_trend = watch_mode and width >= 8
+    plot_w = width - 1 if show_trend else width
+    if show_trend:
+        ref_idx = max(0, len(clean_vals) - 9)
+        delta = cur - clean_vals[ref_idx]
         thresh = max(0.4, span * 0.015)
         if delta >= thresh:
             trend = c("↑", Ansi.BOLD, Ansi.BRIGHT_YELLOW)
@@ -218,9 +231,99 @@ def make_gauge_with_trend(
             trend = c("↓", Ansi.BOLD, Ansi.BRIGHT_CYAN)
         else:
             trend = " "
-        return f"{make_bar(pct, width=bar_w, color_override=color_style)}{trend}"
+    else:
+        trend = ""
 
-    return make_bar(pct, width=width, color_override=color_style)
+    if graph_mode == "gauge":
+        return f"{make_bar(pct, width=plot_w, color_override=color_style)}{trend}"
+
+    def _scale_window(tail_vals: List[float]) -> Tuple[Optional[float], Optional[float]]:
+        if adaptive_mode == "temp":
+            v_min = min(tail_vals)
+            v_max = max(tail_vals)
+            spread = v_max - v_min
+            if spread < 0.8:
+                return None, None
+            eff_span = max(min_span, spread + 2.0)
+            v_lo = v_min - (eff_span - spread) * 0.35
+            v_lo = max(low, min(v_lo, max(low, high - eff_span)))
+            v_hi = v_lo + eff_span
+            return v_lo, v_hi
+        else:
+            v_lo = low
+            v_hi = min(high, max(min_span, max(tail_vals) * 1.25))
+            if v_hi <= v_lo:
+                v_hi = v_lo + max(1.0, min_span)
+            return v_lo, v_hi
+
+    if graph_mode == "braille":
+        max_pts = plot_w * 2
+        tail = clean_vals[-max_pts:]
+        v_lo, v_hi = _scale_window(tail)
+        slots: List[Optional[float]] = [None] * (max_pts - len(tail)) + tail
+        raw_cells: List[Tuple[Optional[str], Optional[float]]] = []
+        filled_indices: List[int] = []
+        for ci in range(plot_w):
+            p_l = slots[ci * 2]
+            p_r = slots[ci * 2 + 1]
+            if p_l is None and p_r is None:
+                raw_cells.append((None, None))
+            else:
+                def _lvl(val: Optional[float]) -> int:
+                    if val is None:
+                        return 0
+                    if v_lo is None or v_hi is None:
+                        return 1
+                    norm = max(0.0, min(1.0, (val - v_lo) / max(1e-6, v_hi - v_lo)))
+                    return 1 + min(3, int(round(norm * 3.0)))
+
+                ch = chr(0x2800 | _BRAILLE_LEFT[_lvl(p_l)] | _BRAILLE_RIGHT[_lvl(p_r)])
+                rep_v = p_r if p_r is not None else p_l
+                filled_indices.append(ci)
+                raw_cells.append((ch, rep_v))
+
+        out_parts: List[str] = []
+        n_filled = len(filled_indices)
+        first_filled = filled_indices[0] if filled_indices else plot_w
+        dim_cutoff = first_filled + int(n_filled * 0.4) if n_filled >= 4 else -1
+        last_filled = filled_indices[-1] if filled_indices else -1
+        for ci, (ch, rep_v) in enumerate(raw_cells):
+            if ch is None or rep_v is None:
+                out_parts.append(c("·", Ansi.DIM))
+            else:
+                s_col = color_fn(rep_v) if color_fn else color_style
+                if ci < dim_cutoff:
+                    out_parts.append(c(ch, Ansi.DIM, s_col))
+                elif ci == last_filled:
+                    out_parts.append(c(ch, Ansi.BOLD, s_col))
+                else:
+                    out_parts.append(c(ch, s_col))
+        return "".join(out_parts) + trend
+
+    # Default: "spark" (adaptive block sparkline)
+    tail = clean_vals[-plot_w:]
+    pad_len = max(0, plot_w - len(tail))
+    v_lo, v_hi = _scale_window(tail)
+    styled_bars: List[str] = []
+    n_tail = len(tail)
+    for i, v in enumerate(tail):
+        if v_lo is None or v_hi is None:
+            norm_abs = max(0.0, min(1.0, (v - low) / span))
+            idx = min(2, int(round(norm_abs * 3.0)))
+        else:
+            norm = max(0.0, min(1.0, (v - v_lo) / max(1e-6, v_hi - v_lo)))
+            idx = min(len(SPARK_CHARS) - 1, int(round(norm * (len(SPARK_CHARS) - 1))))
+        ch = SPARK_CHARS[idx]
+        s_col = color_fn(v) if color_fn else color_style
+        if n_tail >= 4 and i < n_tail * 0.4:
+            styled_bars.append(c(ch, Ansi.DIM, s_col))
+        elif i == n_tail - 1:
+            styled_bars.append(c(ch, Ansi.BOLD, s_col))
+        else:
+            styled_bars.append(c(ch, s_col))
+
+    pad_str = c("·" * pad_len, Ansi.DIM) if pad_len > 0 else ""
+    return f"{pad_str}{''.join(styled_bars)}{trend}"
 
 def temp_color(t: float, comp: str = "cpu") -> str:
     """Returns an adaptive ANSI color string based on hardware thermal limits."""
@@ -268,17 +371,17 @@ class TelemetryCollector:
         self._logical_cores: int = 0
         self._freq_nodes: List[str] = sorted(glob.glob("/sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq"))
         self.history: Dict[str, Deque[float]] = {
-            "cpu_temp": deque(maxlen=12),
-            "gpu_temp": deque(maxlen=12),
-            "dimm_temp": deque(maxlen=12),
-            "ssd1_temp": deque(maxlen=12),
-            "ssd2_temp": deque(maxlen=12),
-            "cpu_power": deque(maxlen=12),
-            "gpu_power": deque(maxlen=12),
-            "igpu_power": deque(maxlen=12),
-            "cpu_load": deque(maxlen=12),
-            "gpu_util": deque(maxlen=12),
-            "igpu_util": deque(maxlen=12),
+            "cpu_temp": deque(maxlen=24),
+            "gpu_temp": deque(maxlen=24),
+            "dimm_temp": deque(maxlen=24),
+            "ssd1_temp": deque(maxlen=24),
+            "ssd2_temp": deque(maxlen=24),
+            "cpu_power": deque(maxlen=24),
+            "gpu_power": deque(maxlen=24),
+            "igpu_power": deque(maxlen=24),
+            "cpu_load": deque(maxlen=24),
+            "gpu_util": deque(maxlen=24),
+            "igpu_util": deque(maxlen=24),
         }
         try:
             with open("/proc/cpuinfo", "r") as f:
@@ -493,7 +596,9 @@ class TelemetryCollector:
 
         if cpu_info.get("temperature_c") is not None:
             self.history["cpu_temp"].append(float(cpu_info["temperature_c"]))
-        if gpu_info.get("temperature_c") is not None:
+        if gpu_info.get("state") == "suspended":
+            self.history["gpu_temp"].clear()
+        elif gpu_info.get("temperature_c") is not None:
             self.history["gpu_temp"].append(float(gpu_info["temperature_c"]))
         if mem_info.get("spd_temps_c"):
             self.history["dimm_temp"].append(float(max(mem_info["spd_temps_c"])))
@@ -580,6 +685,7 @@ class DashboardRenderer:
         history: Optional[Dict[str, Deque[float]]] = None,
         watch_mode: bool = False,
         status_msg: str = "",
+        graph_mode: str = "spark",
     ) -> str:
         hist = history or {}
         # Prefer 2x2 side-by-side grid at >= 86 cols (or >= 76 cols when terminal height < 28 rows)
@@ -665,9 +771,11 @@ class DashboardRenderer:
         cpu_t = cpu.get("temperature_c")
         cpu_t_col = temp_color(cpu_t, "cpu") if cpu_t is not None else None
         cpu_t_str = f"{cpu_t:.1f}°C" if cpu_t is not None else "N/A"
-        cpu_t_bar = make_gauge_with_trend(
+        cpu_t_bar = make_trend_visual(
             list(hist.get("cpu_temp", [cpu_t] if cpu_t else [])),
-            35.0, 95.0, spark_w, cpu_t_col or Ansi.DIM, watch_mode
+            35.0, 95.0, spark_w, cpu_t_col or Ansi.DIM, watch_mode,
+            graph_mode=graph_mode, adaptive_mode="temp", min_span=8.0,
+            color_fn=lambda v: temp_color(v, "cpu"),
         )
         cpu_fan_det = (
             f"CPU Fan {cpu_f['rpm']:4d} rpm ({cpu_f['percent']:2.0f}%)"
@@ -681,9 +789,11 @@ class DashboardRenderer:
         if gpu_t is not None:
             gpu_t_col = temp_color(gpu_t, "gpu")
             gpu_t_str = f"{gpu_t:.1f}°C" if gpu_t < 100 else f"{gpu_t:.0f}°C"
-            gpu_t_bar = make_gauge_with_trend(
+            gpu_t_bar = make_trend_visual(
                 list(hist.get("gpu_temp", [gpu_t])),
-                32.0, 87.0, spark_w, gpu_t_col, watch_mode
+                32.0, 87.0, spark_w, gpu_t_col, watch_mode,
+                graph_mode=graph_mode, adaptive_mode="temp", min_span=8.0,
+                color_fn=lambda v: temp_color(v, "gpu"),
             )
         else:
             gpu_t_col = None
@@ -698,9 +808,11 @@ class DashboardRenderer:
             dimm_max = max(spd_t)
             dimm_col = temp_color(dimm_max, "ram")
             dimm_str = "/".join(f"{t:.0f}" for t in spd_t[:2]) + "°C"
-            dimm_bar = make_gauge_with_trend(
+            dimm_bar = make_trend_visual(
                 list(hist.get("dimm_temp", [dimm_max])),
-                30.0, 75.0, spark_w, dimm_col, watch_mode
+                30.0, 75.0, spark_w, dimm_col, watch_mode,
+                graph_mode=graph_mode, adaptive_mode="temp", min_span=4.0,
+                color_fn=lambda v: temp_color(v, "ram"),
             )
         else:
             dimm_col = None
@@ -728,9 +840,11 @@ class DashboardRenderer:
                 if t_comp is not None:
                     s_col = temp_color(t_comp, "nvme")
                     s_str = f"{t_comp:.1f}°C"
-                    s_bar = make_gauge_with_trend(
+                    s_bar = make_trend_visual(
                         list(hist.get(hist_key, [t_comp])),
-                        28.0, 70.0, spark_w, s_col, watch_mode
+                        28.0, 70.0, spark_w, s_col, watch_mode,
+                        graph_mode=graph_mode, adaptive_mode="temp", min_span=4.0,
+                        color_fn=lambda v: temp_color(v, "nvme"),
                     )
                 else:
                     s_col = None
@@ -742,9 +856,11 @@ class DashboardRenderer:
             elif slot_idx < len(nvme_t):
                 t_val = nvme_t[slot_idx]
                 s_col = temp_color(t_val, "nvme")
-                s_bar = make_gauge_with_trend(
+                s_bar = make_trend_visual(
                     list(hist.get(hist_key, [t_val])),
-                    28.0, 70.0, spark_w, s_col, watch_mode
+                    28.0, 70.0, spark_w, s_col, watch_mode,
+                    graph_mode=graph_mode, adaptive_mode="temp", min_span=4.0,
+                    color_fn=lambda v: temp_color(v, "nvme"),
                 )
                 return metric_row(lbl, f"{t_val:.1f}°C", s_col, s_bar, f"NVMe Drive {slot_idx + 1}")
             else:
@@ -792,9 +908,11 @@ class DashboardRenderer:
             c_p_pct = (c_p / eff_pl * 100.0) if eff_pl > 0 else 0.0
             c_p_col = pct_color(c_p_pct)
             c_p_str = f"{c_p:.1f} W" if c_p < 100 else f"{c_p:.0f} W"
-            c_p_bar = make_gauge_with_trend(
+            c_p_bar = make_trend_visual(
                 list(hist.get("cpu_power", [c_p])),
-                0.0, max(eff_pl, pl2_w or 65.0), spark_w, c_p_col, watch_mode
+                0.0, max(eff_pl, pl2_w or 65.0), spark_w, c_p_col, watch_mode,
+                graph_mode=graph_mode, adaptive_mode="power", min_span=max(25.0, eff_pl * 0.55),
+                color_fn=lambda v: pct_color((v / eff_pl * 100.0) if eff_pl > 0 else 0.0),
             )
             c_p_det = f"of {eff_pl:.0f}W {pl_tag} ({c_p_pct:.0f}%)" if right_w >= 17 else f"{eff_pl:.0f}W {pl_tag} ({c_p_pct:.0f}%)"
         else:
@@ -809,9 +927,11 @@ class DashboardRenderer:
             g_p_pct = (g_p / g_lim * 100.0) if g_lim > 0 else 0.0
             g_p_col = pct_color(g_p_pct)
             g_p_str = f"{g_p:.1f} W" if g_p < 100 else f"{g_p:.0f} W"
-            g_p_bar = make_gauge_with_trend(
+            g_p_bar = make_trend_visual(
                 list(hist.get("gpu_power", [g_p])),
-                0.0, g_lim, spark_w, g_p_col, watch_mode
+                0.0, g_lim, spark_w, g_p_col, watch_mode,
+                graph_mode=graph_mode, adaptive_mode="power", min_span=max(30.0, g_lim * 0.25),
+                color_fn=lambda v: pct_color((v / g_lim * 100.0) if g_lim > 0 else 0.0),
             )
             if right_w >= 18:
                 g_p_det = f"of {g_lim:.0f}W TGP ({g_p_pct:.0f}%)"
@@ -837,9 +957,11 @@ class DashboardRenderer:
         if ig_p is not None:
             ig_p_col = pct_color((ig_p / 25.0) * 100.0)
             ig_p_str = f"{ig_p:.1f} W"
-            ig_p_bar = make_gauge_with_trend(
+            ig_p_bar = make_trend_visual(
                 list(hist.get("igpu_power", [ig_p])),
-                0.0, 20.0, spark_w, ig_p_col, watch_mode
+                0.0, 20.0, spark_w, ig_p_col, watch_mode,
+                graph_mode=graph_mode, adaptive_mode="power", min_span=5.0,
+                color_fn=lambda v: pct_color((v / 25.0) * 100.0),
             )
         else:
             ig_p_col = Ansi.BRIGHT_GREEN
@@ -883,9 +1005,11 @@ class DashboardRenderer:
         # ── Card 3: COMPUTE & MEMORY (5 rows) ─────────────────────────────────
         cpu_pct = max(0.0, min(100.0, float(cpu.get("usage_percent") or 0.0)))
         cpu_l_col = pct_color(cpu_pct)
-        cpu_l_bar = make_gauge_with_trend(
+        cpu_l_bar = make_trend_visual(
             list(hist.get("cpu_load", [cpu_pct])),
-            0.0, 100.0, spark_w, cpu_l_col, watch_mode
+            0.0, 100.0, spark_w, cpu_l_col, watch_mode,
+            graph_mode=graph_mode, adaptive_mode="power", min_span=25.0,
+            color_fn=pct_color,
         )
         avg_f = cpu.get("avg_frequency_mhz")
         max_f = cpu.get("max_frequency_mhz")
@@ -920,9 +1044,11 @@ class DashboardRenderer:
             g_util = max(0.0, min(100.0, float(gpu.get("utilization_gpu") or 0.0)))
             gpu_u_col = pct_color(g_util)
             gpu_u_str = f"{g_util:.1f}%"
-            gpu_u_bar = make_gauge_with_trend(
+            gpu_u_bar = make_trend_visual(
                 list(hist.get("gpu_util", [g_util])),
-                0.0, 100.0, spark_w, gpu_u_col, watch_mode
+                0.0, 100.0, spark_w, gpu_u_col, watch_mode,
+                graph_mode=graph_mode, adaptive_mode="power", min_span=25.0,
+                color_fn=pct_color,
             )
             g_clk = gpu.get("clock_graphics_mhz")
             if g_clk is not None:
@@ -946,9 +1072,11 @@ class DashboardRenderer:
         ig_util = max(0.0, min(100.0, float(igpu.get("utilization_pct") or 0.0)))
         ig_u_col = pct_color(ig_util)
         ig_u_str = f"{ig_util:.1f}%"
-        ig_u_bar = make_gauge_with_trend(
+        ig_u_bar = make_trend_visual(
             list(hist.get("igpu_util", [ig_util])),
-            0.0, 100.0, spark_w, ig_u_col, watch_mode
+            0.0, 100.0, spark_w, ig_u_col, watch_mode,
+            graph_mode=graph_mode, adaptive_mode="power", min_span=25.0,
+            color_fn=pct_color,
         )
         ig_clk = igpu.get("clock_mhz")
         ig_max = igpu.get("max_clock_mhz") or 1900
@@ -1152,13 +1280,14 @@ class DashboardRenderer:
 
         # ── Footer / Interactive Controls Bar ─────────────────────────────────
         if watch_mode:
-            if total_w >= 82:
+            if total_w >= 96:
                 keys = [
                     ("[p]", "Profile"),
                     ("[1-4]", "Mode"),
                     ("[c]", "80% Cap"),
                     ("[r]", "240/60Hz"),
                     ("[l]", "Color"),
+                    ("[g]", "Graph"),
                     ("[s]", "Shell"),
                     ("[q]", "Quit"),
                 ]
@@ -1170,6 +1299,7 @@ class DashboardRenderer:
                     ("[c]", "80%"),
                     ("[r]", "Hz"),
                     ("[l]", "ICC"),
+                    ("[g]", "Grp"),
                     ("[s]", "Sh"),
                     ("[q]", "Quit"),
                 ]
@@ -1364,7 +1494,7 @@ def _dispatch_tui_action(key: bytes) -> Tuple[str, bool]:
 
 # --- Interactive Live Watch Loop ---
 
-def run_watch_mode(telemetry: TelemetryCollector, interval: float = 1.0):
+def run_watch_mode(telemetry: TelemetryCollector, interval: float = 1.0, graph_mode: str = "spark"):
     """Runs a real-time terminal dashboard with flicker-free updates and clean screen isolation."""
     is_tty = sys.stdin.isatty() and sys.stdout.isatty()
     stdin_fd = sys.stdin.fileno() if is_tty else None
@@ -1375,6 +1505,10 @@ def run_watch_mode(telemetry: TelemetryCollector, interval: float = 1.0):
     force_display = False
     status_msg = ""
     status_until = 0.0
+    graph_modes = ("spark", "braille", "gauge")
+    graph_labels = {"spark": "Sparkline", "braille": "Braille", "gauge": "Gauge"}
+    if graph_mode not in graph_modes:
+        graph_mode = "spark"
 
     pipe_r = None
     pipe_w = None
@@ -1452,6 +1586,7 @@ def run_watch_mode(telemetry: TelemetryCollector, interval: float = 1.0):
                     history=telemetry.history,
                     watch_mode=True,
                     status_msg=active_toast,
+                    graph_mode=graph_mode,
                 )
 
                 if is_tty:
@@ -1535,6 +1670,12 @@ def run_watch_mode(telemetry: TelemetryCollector, interval: float = 1.0):
                         elif data_bytes in (b"s", b"S"):
                             drop_shell = True
                             return
+                        elif data_bytes in (b"g", b"G"):
+                            cur_idx = graph_modes.index(graph_mode)
+                            graph_mode = graph_modes[(cur_idx + 1) % len(graph_modes)]
+                            status_msg = f"Graph: {graph_labels[graph_mode]}"
+                            status_until = time.monotonic() + 2.2
+                            break
                         elif data_bytes in (b"p", b"P", b"1", b"2", b"3", b"4", b"c", b"C", b"r", b"R", b"l", b"L"):
                             msg, disp_dirty = _dispatch_tui_action(data_bytes)
                             if msg:
@@ -1623,6 +1764,12 @@ Examples:
         help="Output single-line compact telemetry summary",
     )
     parser.add_argument(
+        "-g", "--graph",
+        choices=("spark", "braille", "gauge"),
+        default="spark",
+        help="Watch-mode graph style: spark (block sparkline), braille (high-density wave), or gauge (bar)",
+    )
+    parser.add_argument(
         "--no-color",
         action="store_true",
         help="Disable ANSI color output",
@@ -1644,7 +1791,7 @@ Examples:
             print(ShortRenderer.render(data))
         elif args.watch is not None:
             interval = max(0.2, float(args.watch))
-            run_watch_mode(telemetry, interval=interval)
+            run_watch_mode(telemetry, interval=interval, graph_mode=args.graph)
         else:
             data = telemetry.collect_all(sample_interval=0.05)
             ts = shutil.get_terminal_size(fallback=(104, 28))
