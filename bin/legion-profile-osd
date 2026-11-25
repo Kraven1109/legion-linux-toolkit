@@ -1091,6 +1091,152 @@ def trigger_copilot_tap(source="COPILOT"):
     dispatch_hotkey("Copilot Tap", cfg.get("tap"), DEFAULT_COPILOT_CMD)
 
 
+EVIOCGKEY_96 = 0x80604518
+MODIFIER_KEYCODES = {29, 42, 54, 56, 97, 100, 125, 126}  # Ctrl, Shift, Alt, Meta (L/R)
+_copilot_auto_lock = threading.Lock()
+_last_auto_trigger_ts = 0.0
+
+
+def _detect_pressed_keyboard_keys():
+    """
+    Scans readable /dev/input/event* nodes via EVIOCGKEY ioctl (96-byte key bitmap).
+    Returns a list of (fd, path, non_modifier_keys, all_keys) for devices with active keys.
+    Caller owns the returned file descriptors and must close them.
+    """
+    active = []
+    for p in sorted(glob.glob("/dev/input/event*")):
+        fd = None
+        try:
+            fd = os.open(p, os.O_RDONLY | os.O_NONBLOCK)
+            buf = bytearray(96)
+            fcntl.ioctl(fd, EVIOCGKEY_96, buf)
+            pressed = [i for i in range(96 * 8) if buf[i // 8] & (1 << (i % 8))]
+            if pressed:
+                non_mod = [k for k in pressed if k not in MODIFIER_KEYCODES]
+                active.append((fd, p, non_mod, pressed))
+                fd = None
+        except Exception:
+            pass
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except Exception:
+                    pass
+    return active
+
+
+def trigger_copilot_auto(source="IPC/COPILOT"):
+    """
+    Emulates full physical Copilot key behavior (Short Tap < 0.28s vs Long Hold >= 0.28s)
+    for external keyboard shortcuts (e.g. Meta+M -> `lcopilot`).
+    - If Quick Launch menu is already open: immediately dismisses it.
+    - Queries EVIOCGKEY on readable keyboard nodes at t=0 when the shortcut fires:
+      blocks inside kernel wait queue via select.poll() for up to 280ms waiting for EV_KEY release.
+      * Released before 280ms -> Short Tap (Smart Terminal).
+      * Still held at 280ms -> Long Hold (Quick Launch Menu).
+    - Fallback when no key is physically held (e.g. CLI or synthetic trigger):
+      single invocation triggers Tap; double invocation within 320ms triggers Menu.
+    """
+    global _last_auto_trigger_ts
+    if _menu_open.is_set():
+        dismiss_copilot_menu()
+        return
+
+    now = time.monotonic()
+    active_devs = _detect_pressed_keyboard_keys()
+
+    # Prefer devices that currently have a non-modifier trigger key held (e.g. KEY_M = 50)
+    target_fd = None
+    target_keys = set()
+    for fd, _path, non_mod, all_keys in active_devs:
+        if target_fd is None and non_mod:
+            target_fd = fd
+            target_keys = set(non_mod)
+        elif target_fd is None and all_keys:
+            target_fd = fd
+            target_keys = set(all_keys)
+        else:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+
+    if target_fd is None:
+        # KDE kglobalaccel invokes the command after key release (<200ms tap).
+        # Single tap triggers Tap immediately; double-press within 380ms triggers Menu.
+        if now - _last_auto_trigger_ts <= 0.38:
+            _last_auto_trigger_ts = 0.0
+            print(f"[{source}] Double-press / repeat detected ➔ Opening Candidates Menu", flush=True)
+            launch_copilot_menu()
+        else:
+            _last_auto_trigger_ts = now
+            trigger_copilot_tap(source)
+        return
+
+    if not _copilot_auto_lock.acquire(blocking=False):
+        try:
+            os.close(target_fd)
+        except Exception:
+            pass
+        return
+
+    def _hold_waiter(fd, watch_keys):
+        try:
+            p = select.poll()
+            p.register(fd, select.POLLIN | select.POLLERR | select.POLLHUP)
+            deadline = time.monotonic() + 0.28
+            released = False
+
+            while not released:
+                rem_ms = int((deadline - time.monotonic()) * 1000)
+                if rem_ms <= 0:
+                    break
+                evts = p.poll(rem_ms)
+                if not evts:
+                    break
+                while True:
+                    try:
+                        data = os.read(fd, 24)
+                        if len(data) < 24:
+                            break
+                        _sec, _usec, etype, code, value = struct.unpack("qqHHI", data)
+                        if etype == 1 and code in watch_keys and value == 0:
+                            released = True
+                            break
+                    except BlockingIOError:
+                        break
+                    except Exception:
+                        released = True
+                        break
+
+            # Verify via EVIOCGKEY bitmap whether any watched key is still physically depressed
+            if not released:
+                try:
+                    buf = bytearray(96)
+                    fcntl.ioctl(fd, EVIOCGKEY_96, buf)
+                    still_down = any(buf[k // 8] & (1 << (k % 8)) for k in watch_keys)
+                    if not still_down:
+                        released = True
+                except Exception:
+                    pass
+
+            if released:
+                trigger_copilot_tap(source)
+            else:
+                print(f"[{source}] Long hold (>=280ms) detected ➔ Opening Candidates Menu", flush=True)
+                launch_copilot_menu()
+        finally:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+            _copilot_auto_lock.release()
+
+    threading.Thread(target=_hold_waiter, args=(target_fd, target_keys), daemon=True).start()
+
+
+
 def trigger_fn_n(source="Fn+N"):
     """Dispatches configurable Fn+N smart toggle / launcher action."""
     cfg, _ = load_config()
@@ -1331,7 +1477,9 @@ def main():
                             if not cmd_bytes:
                                 break
                             ipc_cmd = cmd_bytes.decode("utf-8", errors="ignore").strip().lower()
-                            if ipc_cmd == "copilot_tap":
+                            if ipc_cmd == "copilot_auto":
+                                trigger_copilot_auto("IPC/COPILOT")
+                            elif ipc_cmd == "copilot_tap":
                                 trigger_copilot_tap("IPC/COPILOT")
                             elif ipc_cmd == "copilot_menu":
                                 print("[IPC/COPILOT] Quick Launch menu requested", flush=True)

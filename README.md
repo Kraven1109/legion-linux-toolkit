@@ -24,9 +24,9 @@ Native, zero-overhead hardware control suite and event-driven OSD daemon for the
 | **`lstats`** | Hardware & Platform Telemetry CLI | `lstats` (2×2 TUI dashboard), `-w` (Interactive live TUI), `-j` (JSON), `-s` (Short) |
 | **`lbat`** | Battery Conservation Mode | `status`, `on` (~80% cap), `off` (100% full), `toggle` |
 | **`lmode`** | Power & Thermal Manager | `status`, `next` (Fn+Q loop), `quiet`, `balanced`, `perf`, `extreme` |
-| **`lhz`** | Display Refresh Rate | `status`, `toggle` (240Hz $\leftrightarrow$ 60Hz), `240`, `60`, `fix` |
+| **`lhz`** | Display Refresh Rate & Recovery | `status`, `toggle` (eDP 240/60Hz or external Hz cycle), `240`, `60`, `fix` |
 | **`lcolor`** | Display Color Profile Manager | `status`, `cycle` (Fn+L), `set <name>`, `list` |
-| **`lcopilot`** | External Keyboard & CLI Copilot Trigger | `tap` (Smart Terminal), `hold` / `menu` (Quick Launch), `fn-n` |
+| **`lcopilot`** | External Keyboard & CLI Copilot Trigger | `auto` (Tap <0.3s / Hold >=0.3s mimic), `tap`, `hold`, `fn-n` |
 | **`test-hotkey`** | Hardware Event Sniffer | Real-time evdev scancode & keycode diagnostic tool |
 
 ---

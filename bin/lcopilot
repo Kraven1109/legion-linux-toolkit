@@ -86,11 +86,12 @@ def show_status() -> int:
     for item in candidates:
         print(f"    • {item.get('name', 'Application')} -> {item.get('exec', '')}")
     print("────────────────────────────────────────────────────────────────────")
-    print("  Commands: lcopilot tap  |  lcopilot menu  |  lcopilot fn-n")
+    print("  Commands: lcopilot (auto) | lcopilot tap | lcopilot menu | lcopilot fn-n")
     print("  External Keyboard Tip (KDE Plasma 6):")
     print("    System Settings -> Keyboard -> Shortcuts -> Add New -> Command:")
-    print("      • Quick Launch Menu : lcopilot menu   (e.g. Meta+Space / Alt+Space)")
-    print("      • Copilot Tap       : lcopilot tap    (e.g. F13 / Pause)")
+    print("      • Full Copilot Mimic (Tap <0.3s / Hold >=0.3s) : lcopilot")
+    print("      • Quick Launch Menu Only                       : lcopilot menu")
+    print("      • Copilot Tap Only                             : lcopilot tap")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     return 0
 
@@ -99,8 +100,9 @@ def show_help() -> int:
     print(
         "Usage: lcopilot [command]\n\n"
         "Commands:\n"
-        "  tap, (none)     Trigger Copilot short-tap action (or dismiss open menu)\n"
-        "  menu, quick     Toggle Copilot hold Quick Launch menu (Rofi / Kdialog)\n"
+        "  auto, (none)    Mimic physical Copilot key: Short Tap (<0.3s) vs Long Hold (>=0.3s)\n"
+        "  tap             Trigger Copilot short-tap action directly (or dismiss open menu)\n"
+        "  menu, quick     Toggle Copilot hold Quick Launch menu directly (Rofi / Kdialog)\n"
         "  fn-n, n         Trigger Fn+N smart window toggle / launcher\n"
         "  status          Show IPC socket state and configured actions\n"
         "  help, -h        Show this help message"
@@ -109,10 +111,12 @@ def show_help() -> int:
 
 
 def main() -> int:
-    cmd = sys.argv[1].strip().lower() if len(sys.argv) > 1 else "tap"
+    cmd = sys.argv[1].strip().lower() if len(sys.argv) > 1 else "auto"
+    if cmd in ("auto", "copilot", "mimic", "menu", "quick"):
+        return ensure_daemon_and_send("copilot_auto")
     if cmd in ("tap", "run"):
         return ensure_daemon_and_send("copilot_tap")
-    if cmd in ("menu", "quick", "hold", "launcher"):
+    if cmd in ("hold", "launcher", "menu-only"):
         return ensure_daemon_and_send("copilot_menu")
     if cmd in ("fn-n", "fn_n", "n"):
         return ensure_daemon_and_send("fn_n")

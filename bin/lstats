@@ -1280,12 +1280,14 @@ class DashboardRenderer:
 
         # ── Footer / Interactive Controls Bar ─────────────────────────────────
         if watch_mode:
+            has_internal_active = any(d.get("is_internal") for d in displays)
+            r_label_wide = "240/60Hz" if has_internal_active else "Hz Cycle"
             if total_w >= 96:
                 keys = [
                     ("[p]", "Profile"),
                     ("[1-4]", "Mode"),
                     ("[c]", "80% Cap"),
-                    ("[r]", "240/60Hz"),
+                    ("[r]", r_label_wide),
                     ("[l]", "Color"),
                     ("[g]", "Graph"),
                     ("[s]", "Shell"),

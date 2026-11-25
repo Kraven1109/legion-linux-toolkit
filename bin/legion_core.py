@@ -530,13 +530,33 @@ def get_active_display_info(ttl: float = 0.0) -> Dict[str, Any]:
 def get_internal_display() -> Tuple[str, str]:
     """
     Specifically returns the internal eDP panel output name and its active ICC profile path.
-    Guarantees returning (internal_name, icc_path) regardless of primary external displays.
+    Guarantees returning (internal_name, icc_path) regardless of primary external displays
+    or whether the internal eDP panel is currently disabled in clamshell/external-only mode.
     """
     info = get_active_display_info()
     for d in info.get("displays", []):
         if d.get("is_internal"):
             return d.get("output_name", "eDP-1"), d.get("icc_profile_path", "")
+
+    # Fallback: query kscreen-doctor -j for connected (even if disabled) eDP outputs
+    if shutil.which("kscreen-doctor"):
+        try:
+            proc = subprocess.run(["kscreen-doctor", "-j"], capture_output=True, text=True, timeout=1)
+            if proc.returncode == 0:
+                data = json.loads(proc.stdout)
+                for out in data.get("outputs", []):
+                    name = out.get("name", "")
+                    if out.get("connected") and name.startswith("eDP"):
+                        return name, out.get("iccProfilePath") or ""
+        except Exception:
+            pass
     return "eDP-1", ""
+
+
+def is_internal_display_enabled() -> bool:
+    """Returns True if an internal eDP panel is currently connected AND enabled in KScreen."""
+    info = get_active_display_info()
+    return any(d.get("is_internal") for d in info.get("displays", []))
 
 
 def get_active_display() -> Tuple[str, str]:

@@ -8,3 +8,6 @@ KERNEL=="event*", SUBSYSTEM=="input", ATTRS{name}=="ITE Tech. Inc. ITE Device(82
 
 # 2. Ideapad Extra Buttons (Fn+R → Keycode 562, Fn+L → Scancodes 0x012c/0x012b)
 KERNEL=="event*", SUBSYSTEM=="input", ATTRS{name}=="Ideapad extra buttons", MODE="0666"
+
+# 3. External & Built-in Keyboards (Zero-overhead EVIOCGKEY tap-vs-hold detection for lcopilot)
+KERNEL=="event*", SUBSYSTEM=="input", ENV{ID_INPUT_KEYBOARD}=="1", MODE="0666"

@@ -25,6 +25,7 @@ from legion_core import (
     ensure_gui_environment,
     get_panel_info,
     get_internal_display,
+    is_internal_display_enabled,
 )
 
 def resolve_profile_path(filename):
@@ -43,7 +44,7 @@ def resolve_profile_path(filename):
             return candidate
     return None
 
-def send_osd(profile):
+def send_osd(profile, standby=False):
     """Dispatches a desktop notification with the color profile badge."""
     ensure_gui_environment()
     icon_candidates = [
@@ -56,14 +57,17 @@ def send_osd(profile):
             icon = candidate
             break
 
+    title = f"{profile['title']} (eDP Standby)" if standby else profile["title"]
+    desc = f"Queued for Built-in OLED • External monitor uses native gamut" if standby else profile["desc"]
+
     cmd = [
         "notify-send",
         "-a", "Display Color Profile",
         "-i", icon,
         "-h", "string:x-canonical-private-synchronous:display-color",
         "-t", "1800",
-        profile["title"],
-        profile["desc"],
+        title,
+        desc,
     ]
     try:
         subprocess.run(cmd, check=False)
@@ -116,6 +120,7 @@ def set_profile(target_key):
     output_name, _ = get_internal_display()
     if not output_name:
         output_name = "eDP-1"
+    edp_active = is_internal_display_enabled()
 
     cmd = ["kscreen-doctor", f"output.{output_name}.iccprofile.{file_path}"]
     try:
@@ -124,8 +129,9 @@ def set_profile(target_key):
         print(f"[ERROR] kscreen-doctor failed to apply profile: {e}", file=sys.stderr)
         sys.exit(1)
 
-    send_osd(match)
-    print(f"Applied Color Profile: \033[1;32m{match['name']}\033[0m ({match['title']})")
+    send_osd(match, standby=not edp_active)
+    state_tag = f" ({output_name} Standby — External Only)" if not edp_active else f" ({output_name})"
+    print(f"Applied Color Profile: \033[1;32m{match['name']}\033[0m ({match['title']}){state_tag}")
     print(f"  Target File : {file_path}")
     print(f"  Output Port : {output_name}")
 
