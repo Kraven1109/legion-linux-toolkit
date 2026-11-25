@@ -672,15 +672,15 @@ class WaylandIdleDpmsGuard:
     def _on_wake(self, was_asleep: bool):
         self._cancel_reoff_timer()
         self._set_external_drm_status_pin(False)
-        # Immediate non-blocking restore attempt (handles displays whose DDC/CI stayed online);
-        # if DDC/CI is still handshaking (post-DPMS / S3 resume), org.kde.ScreenBrightness.DisplayAdded
-        # will fire the instant it becomes ready and complete the restore with zero polling.
-        if self._dimmed_saved:
-            threading.Thread(target=self.restore_external_dim, daemon=True).start()
-        # Also inspect currently tracked wl_outputs in case wl_output.mode already arrived before DPMS On
+        # First check whether any external wl_output woke in VGA fallback (<=1024px) and
+        # needs an off->detect EDID reprobe BEFORE attempting brightness restore!
+        # Otherwise restoring brightness on the dying pre-reprobe handle (e.g. display9)
+        # pops _dimmed_saved prematurely right before the reprobe creates display10 at 2400.
         if was_asleep and self._pinned_widths:
             for oid in list(self._oid_to_name.keys()):
                 self._check_vga_fallback_for_output(oid)
+        if self._dimmed_saved and not self.is_reprobing:
+            threading.Thread(target=self.restore_external_dim, daemon=True).start()
 
     def _evaluate_dpms_state(self):
         if not self._dpms_modes:
@@ -918,9 +918,10 @@ class WaylandIdleDpmsGuard:
         """
         Event-driven single-pass restore triggered either immediately on wake or the exact
         millisecond org.kde.ScreenBrightness.DisplayAdded fires after DDC/CI handshake finishes.
-        Zero blind retry loops or hardcoded sleep windows.
+        Refuses to run while an EDID reprobe (off->detect) is in flight so it never wastes the
+        saved brightness on a transient pre-reprobe handle.
         """
-        if self.is_dim_idle or self.is_sleeping_or_idle:
+        if self.is_dim_idle or self.is_sleeping_or_idle or self.is_reprobing:
             return
         if not self._restore_lock.acquire(blocking=False):
             return
@@ -945,10 +946,12 @@ class WaylandIdleDpmsGuard:
                     if abs(cur_br - orig_br) <= 100:
                         restored_labels.append(label)
                     elif _set_screen_brightness_silent(obj_name, orig_br):
-                        # Single brief read-back check to confirm DDC/CI accepted the write
+                        # Confirm both that DDC/CI converged AND that no reprobe replaced the handle
                         time.sleep(0.35)
+                        if self.is_reprobing:
+                            return
                         chk_list = _get_external_screen_brightness_displays()
-                        chk = next((d for d in chk_list if d[0] == obj_name or d[1] == label), None)
+                        chk = next((d for d in chk_list if d[0] == obj_name), None)
                         if chk is not None and abs(chk[2] - orig_br) <= 100:
                             print(f"[DISPLAY/IDLE] Restored external {obj_name} ({label}) brightness ➔ {orig_br}", flush=True)
                             restored_labels.append(label)
@@ -1041,7 +1044,7 @@ class WaylandIdleDpmsGuard:
                     threading.Thread(target=self._apply_external_dim, daemon=True).start()
                 elif opcode == 1:  # resumed
                     self.is_dim_idle = False
-                    if not self.dpms_all_off:
+                    if not self.dpms_all_off and not self.is_reprobing:
                         threading.Thread(target=self.restore_external_dim, daemon=True).start()
             elif obj_id == self.off_notif_id:
                 if opcode == 0:  # idled
@@ -2341,7 +2344,7 @@ def main():
                     else:
                         for iface, member, arg0 in sigs:
                             if iface == "org.kde.ScreenBrightness" and member == "DisplayAdded":
-                                if _idle_guard._dimmed_saved and not _idle_guard.is_dim_idle and not _idle_guard.is_sleeping_or_idle:
+                                if _idle_guard._dimmed_saved and not _idle_guard.is_dim_idle and not _idle_guard.is_sleeping_or_idle and not _idle_guard.is_reprobing:
                                     threading.Thread(
                                         target=_idle_guard.restore_external_dim,
                                         args=(arg0,),
@@ -2499,6 +2502,10 @@ def main():
                                 if _deferred_drm_recovery:
                                     print("[DISPLAY] External display reconnected ➔ clearing deferred recovery", flush=True)
                                     _deferred_drm_recovery = False
+                                # If the final display already registered before clear_reprobing(),
+                                # trigger one immediate restore check now; otherwise DisplayAdded will handle it.
+                                if _idle_guard._dimmed_saved and not _idle_guard.is_dim_idle:
+                                    threading.Thread(target=_idle_guard.restore_external_dim, daemon=True).start()
                         elif _idle_guard.is_sleeping_or_idle and not is_display_sleeping():
                             _idle_guard.enforce_dpms_off_if_idle(reason="DRM_WAKE_DURING_IDLE")
                         last_external_connected = curr_external
