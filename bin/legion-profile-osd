@@ -684,10 +684,11 @@ class WaylandIdleDpmsGuard:
                 except Exception as e:
                     print(f"[DISPLAY/IDLE] EDID reprobe error on {name}: {e}", flush=True)
 
-            # Wait for libddcutil (~4.5s post-connect settling) and restore original brightness reliably
+            # Wait for libddcutil post-connect settling and restore original brightness reliably
+            # (after S3 resume + login screen, external DP-1 DDC/CI can take ~12-15s to come online)
             time.sleep(3.5)
             if not self.is_dim_idle and not self.is_sleeping_or_idle:
-                self._restore_external_dim(retries=6)
+                self._restore_external_dim(retries=12)
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -752,10 +753,10 @@ class WaylandIdleDpmsGuard:
                     _set_screen_brightness_silent(obj_name, target)
                     print(f"[DISPLAY/IDLE] Dimmed external {obj_name} ({label}): {br} ➔ {target}", flush=True)
 
-    def _restore_external_dim(self, retries: int = 6):
+    def _restore_external_dim(self, retries: int = 12):
         """
         Restores external display brightness by matching Display Label (surviving PowerDevil
-        restarts or DDC re-enumeration where display1 may become display2/display3).
+        restarts or DDC re-enumeration where display4 may become display7 after S3 resume).
         Serialized via _restore_lock so concurrent wake timers never send redundant DDC writes.
         Verifies actual DBus brightness convergence before clearing saved state.
         """
@@ -2130,6 +2131,10 @@ def main():
                     print("[DISPLAY] External display reconnected/woke ➔ clearing deferred recovery", flush=True)
                     _deferred_drm_recovery = False
                     last_external_connected = True
+                    if _idle_guard._dimmed_saved and not _idle_guard.is_dim_idle:
+                        t_res = threading.Timer(1.5, _idle_guard._restore_external_dim)
+                        t_res.daemon = True
+                        t_res.start()
                 elif time.monotonic() >= _idle_guard._suppress_unplug_until and is_internal_edp_on() and not is_session_locked():
                     # Post-wake window elapsed, internal panel is active & unlocked, external display confirmed gone
                     print("[DISPLAY] User resumed on internal panel after external disconnect ➔ executing deferred recovery", flush=True)
@@ -2298,9 +2303,16 @@ def main():
                                 # USB-C HDMI adapter reconnected after dropping HPD during DPMS sleep:
                                 # keep screen asleep while still in DPMS sleep / user idle.
                                 _idle_guard.enforce_dpms_off_if_idle(reason="RECONNECT_DURING_IDLE")
-                            elif _deferred_drm_recovery:
-                                print("[DISPLAY] External display reconnected ➔ clearing deferred recovery", flush=True)
-                                _deferred_drm_recovery = False
+                            else:
+                                if _deferred_drm_recovery:
+                                    print("[DISPLAY] External display reconnected ➔ clearing deferred recovery", flush=True)
+                                    _deferred_drm_recovery = False
+                                # If external display just came back online (e.g. after S3 resume + login)
+                                # while a dimmed brightness restore is still pending, schedule a restore now!
+                                if _idle_guard._dimmed_saved and not _idle_guard.is_dim_idle:
+                                    t_res = threading.Timer(1.5, _idle_guard._restore_external_dim)
+                                    t_res.daemon = True
+                                    t_res.start()
                         elif _idle_guard.is_sleeping_or_idle and not is_display_sleeping():
                             # Any stray DRM event that woke an output while still in DPMS sleep -> re-assert DPMS Off
                             _idle_guard.enforce_dpms_off_if_idle(reason="DRM_WAKE_DURING_IDLE")
