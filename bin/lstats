@@ -262,7 +262,6 @@ def make_trend_visual(
         v_lo, v_hi = _scale_window(tail)
         slots: List[Optional[float]] = [None] * (max_pts - len(tail)) + tail
         raw_cells: List[Tuple[Optional[str], Optional[float]]] = []
-        filled_indices: List[int] = []
         for ci in range(plot_w):
             p_l = slots[ci * 2]
             p_r = slots[ci * 2 + 1]
@@ -279,20 +278,15 @@ def make_trend_visual(
 
                 ch = chr(0x2800 | _BRAILLE_LEFT[_lvl(p_l)] | _BRAILLE_RIGHT[_lvl(p_r)])
                 rep_v = p_r if p_r is not None else p_l
-                filled_indices.append(ci)
                 raw_cells.append((ch, rep_v))
 
         out_parts: List[str] = []
-        last_filled = filled_indices[-1] if filled_indices else -1
-        for ci, (ch, rep_v) in enumerate(raw_cells):
+        for ch, rep_v in raw_cells:
             if ch is None or rep_v is None:
                 out_parts.append(c("·", Ansi.DIM))
             else:
                 s_col = color_fn(rep_v) if color_fn else color_style
-                if ci == last_filled:
-                    out_parts.append(c(ch, Ansi.BOLD, s_col))
-                else:
-                    out_parts.append(c(ch, s_col))
+                out_parts.append(c(ch, s_col))
         return "".join(out_parts) + trend
 
     # Default: "spark" (adaptive block sparkline)
@@ -300,8 +294,7 @@ def make_trend_visual(
     pad_len = max(0, plot_w - len(tail))
     v_lo, v_hi = _scale_window(tail)
     styled_bars: List[str] = []
-    n_tail = len(tail)
-    for i, v in enumerate(tail):
+    for v in tail:
         if v_lo is None or v_hi is None:
             norm_abs = max(0.0, min(1.0, (v - low) / span))
             idx = min(2, int(round(norm_abs * 3.0)))
@@ -310,10 +303,7 @@ def make_trend_visual(
             idx = min(len(SPARK_CHARS) - 1, int(round(norm * (len(SPARK_CHARS) - 1))))
         ch = SPARK_CHARS[idx]
         s_col = color_fn(v) if color_fn else color_style
-        if i == n_tail - 1:
-            styled_bars.append(c(ch, Ansi.BOLD, s_col))
-        else:
-            styled_bars.append(c(ch, s_col))
+        styled_bars.append(c(ch, s_col))
 
     pad_str = c("·" * pad_len, Ansi.DIM) if pad_len > 0 else ""
     return f"{pad_str}{''.join(styled_bars)}{trend}"
@@ -901,11 +891,14 @@ class DashboardRenderer:
             c_p_pct = (c_p / eff_pl * 100.0) if eff_pl > 0 else 0.0
             c_p_col = pct_color(c_p_pct)
             c_p_str = f"{c_p:.1f} W" if c_p < 100 else f"{c_p:.0f} W"
+            # Use a stable power ceiling (max of PL1/PL2) for historical color thresholds so older samples
+            # do not abruptly shift color when instantaneous draw crosses the PL1 <-> PL2 boundary.
+            c_p_color_ref = max(pl1_w or 0.0, pl2_w or 0.0) or eff_pl or 65.0
             c_p_bar = make_trend_visual(
                 list(hist.get("cpu_power", [c_p])),
-                0.0, max(eff_pl, pl2_w or 65.0), spark_w, c_p_col, watch_mode,
-                graph_mode=graph_mode, adaptive_mode="power", min_span=max(25.0, eff_pl * 0.55),
-                color_fn=lambda v: pct_color((v / eff_pl * 100.0) if eff_pl > 0 else 0.0),
+                0.0, c_p_color_ref, spark_w, c_p_col, watch_mode,
+                graph_mode=graph_mode, adaptive_mode="power", min_span=max(25.0, c_p_color_ref * 0.55),
+                color_fn=lambda v: pct_color((v / c_p_color_ref * 100.0) if c_p_color_ref > 0 else 0.0),
             )
             c_p_det = f"of {eff_pl:.0f}W {pl_tag} ({c_p_pct:.0f}%)" if right_w >= 17 else f"{eff_pl:.0f}W {pl_tag} ({c_p_pct:.0f}%)"
         else:
