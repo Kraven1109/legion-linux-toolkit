@@ -283,18 +283,13 @@ def make_trend_visual(
                 raw_cells.append((ch, rep_v))
 
         out_parts: List[str] = []
-        n_filled = len(filled_indices)
-        first_filled = filled_indices[0] if filled_indices else plot_w
-        dim_cutoff = first_filled + int(n_filled * 0.4) if n_filled >= 4 else -1
         last_filled = filled_indices[-1] if filled_indices else -1
         for ci, (ch, rep_v) in enumerate(raw_cells):
             if ch is None or rep_v is None:
                 out_parts.append(c("·", Ansi.DIM))
             else:
                 s_col = color_fn(rep_v) if color_fn else color_style
-                if ci < dim_cutoff:
-                    out_parts.append(c(ch, Ansi.DIM, s_col))
-                elif ci == last_filled:
+                if ci == last_filled:
                     out_parts.append(c(ch, Ansi.BOLD, s_col))
                 else:
                     out_parts.append(c(ch, s_col))
@@ -315,9 +310,7 @@ def make_trend_visual(
             idx = min(len(SPARK_CHARS) - 1, int(round(norm * (len(SPARK_CHARS) - 1))))
         ch = SPARK_CHARS[idx]
         s_col = color_fn(v) if color_fn else color_style
-        if n_tail >= 4 and i < n_tail * 0.4:
-            styled_bars.append(c(ch, Ansi.DIM, s_col))
-        elif i == n_tail - 1:
+        if i == n_tail - 1:
             styled_bars.append(c(ch, Ansi.BOLD, s_col))
         else:
             styled_bars.append(c(ch, s_col))
