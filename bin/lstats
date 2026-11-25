@@ -889,14 +889,14 @@ class DashboardRenderer:
 
         if c_p is not None:
             c_p_pct = (c_p / eff_pl * 100.0) if eff_pl > 0 else 0.0
-            c_p_col = pct_color(c_p_pct)
+            # Use the sustained PL1 limit as the consistent color reference for both the CPU wattage readout
+            # and sparkline history so 54.9W / 55W PL1 (100%) stays color-matched without jumping at PL1<->PL2.
+            c_p_color_ref = (pl1_w if (pl1_w and pl1_w > 0) else eff_pl) or 55.0
+            c_p_col = pct_color((c_p / c_p_color_ref * 100.0) if c_p_color_ref > 0 else 0.0)
             c_p_str = f"{c_p:.1f} W" if c_p < 100 else f"{c_p:.0f} W"
-            # Use a stable power ceiling (max of PL1/PL2) for historical color thresholds so older samples
-            # do not abruptly shift color when instantaneous draw crosses the PL1 <-> PL2 boundary.
-            c_p_color_ref = max(pl1_w or 0.0, pl2_w or 0.0) or eff_pl or 65.0
             c_p_bar = make_trend_visual(
                 list(hist.get("cpu_power", [c_p])),
-                0.0, c_p_color_ref, spark_w, c_p_col, watch_mode,
+                0.0, max(c_p_color_ref, pl2_w or 65.0), spark_w, c_p_col, watch_mode,
                 graph_mode=graph_mode, adaptive_mode="power", min_span=max(25.0, c_p_color_ref * 0.55),
                 color_fn=lambda v: pct_color((v / c_p_color_ref * 100.0) if c_p_color_ref > 0 else 0.0),
             )
