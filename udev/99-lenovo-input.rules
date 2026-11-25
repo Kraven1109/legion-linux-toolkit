@@ -11,3 +11,7 @@ KERNEL=="event*", SUBSYSTEM=="input", ATTRS{name}=="Ideapad extra buttons", MODE
 
 # 3. External & Built-in Keyboards (Zero-overhead EVIOCGKEY tap-vs-hold detection for lcopilot)
 KERNEL=="event*", SUBSYSTEM=="input", ENV{ID_INPUT_KEYBOARD}=="1", MODE="0666"
+
+# 4. External DRM Connectors (DP / HDMI): allow legion-profile-osd to temporarily pin status='on'
+# during DPMS Off (and release back to 'detect' on wake) even if GPU drivers load after systemd-tmpfiles.
+ACTION=="add", SUBSYSTEM=="drm", KERNEL=="card*-DP-*|card*-HDMI-*", RUN+="/bin/chmod 0666 /sys%p/status"

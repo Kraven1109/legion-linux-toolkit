@@ -91,6 +91,7 @@ legion-linux-toolkit/
 │   └── legion-profile-osd.service
 ├── tmpfiles.d/              # Boot-time permission configurations (/etc/tmpfiles.d/)
 │   ├── lenovo_conservation.conf
+│   ├── lenovo_drm_dpms.conf
 │   ├── lenovo_platform_profile.conf
 │   └── lenovo_rapl_mmio.conf
 ├── udev/                    # Udev rules for sudo-less hardware evdev access (/etc/udev/rules.d/)

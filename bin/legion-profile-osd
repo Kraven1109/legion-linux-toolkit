@@ -33,6 +33,8 @@ import re
 import tempfile
 import signal
 import socket
+import ctypes
+import json
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 if SCRIPT_DIR not in sys.path:
@@ -45,6 +47,7 @@ from legion_core import (
     ICON_DIR,
     IPC_SOCKET_PATH,
     ensure_gui_environment,
+    is_ac_online,
     load_config,
     sync_rapl_mmio,
 )
@@ -119,10 +122,32 @@ def check_external_displays_connected() -> bool:
 
 def is_display_sleeping() -> bool:
     """
-    Checks if connected internal laptop screen(s) have entered DPMS sleep or screens are blanked.
-    Strictly filters by status == 'connected' to prevent disconnected/phantom connectors
-    (e.g. inactive dGPU card0-eDP-2) from falsely triggering display-sleep guards.
+    Checks if the session's active display(s) have entered DPMS sleep / screen blanking.
+    Evaluates ALL connected DRM connectors:
+    - If ANY connected connector is currently DPMS 'On', the display session is awake (False).
+    - If ALL connected connectors are DPMS != 'On' (Off/Standby/Suspend), the session is asleep (True).
+    This properly handles External-Only / Clamshell mode where eDP-1 is 'connected' + 'dpms=Off'
+    while DP-1 is 'On', and avoids false wakeups when DP-1 drops HPD during DPMS sleep.
     """
+    connected_any = False
+    for p in glob.glob("/sys/class/drm/card*-*"):
+        try:
+            status_p = os.path.join(p, "status")
+            dpms_p = os.path.join(p, "dpms")
+            if os.path.isfile(status_p) and os.path.isfile(dpms_p):
+                with open(status_p, "r") as f_st:
+                    if f_st.read().strip().lower() == "connected":
+                        connected_any = True
+                        with open(dpms_p, "r") as f_dp:
+                            if f_dp.read().strip().lower() == "on":
+                                return False
+        except Exception:
+            pass
+    return connected_any
+
+
+def is_internal_edp_on() -> bool:
+    """Returns True if any connected internal eDP connector is currently powered on (DPMS On)."""
     for p in glob.glob("/sys/class/drm/*-eDP-*"):
         try:
             status_p = os.path.join(p, "status")
@@ -131,7 +156,7 @@ def is_display_sleeping() -> bool:
                 with open(status_p, "r") as f_st:
                     if f_st.read().strip().lower() == "connected":
                         with open(dpms_p, "r") as f_dp:
-                            if f_dp.read().strip().lower() != "on":
+                            if f_dp.read().strip().lower() == "on":
                                 return True
         except Exception:
             pass
@@ -153,26 +178,773 @@ def is_session_locked() -> bool:
 # Tracks deferred PowerDevil backlight recovery if an external display was disconnected while sleeping/locked
 _deferred_drm_recovery = False
 
+
+def _get_powerdevil_profile() -> str:
+    """
+    Queries KDE PowerDevil's active power profile ('AC', 'Battery', 'LowBattery').
+    Falls back to sysfs AC online check if PowerDevil DBus is momentarily unavailable.
+    """
+    qdbus_bin = shutil.which("qdbus6")
+    if qdbus_bin:
+        try:
+            p = subprocess.run(
+                [qdbus_bin, "org.kde.Solid.PowerManagement", "/org/kde/Solid/PowerManagement",
+                 "org.kde.Solid.PowerManagement.currentProfile"],
+                capture_output=True, text=True, timeout=1.0,
+            )
+            prof = p.stdout.strip()
+            if prof in ("AC", "Battery", "LowBattery"):
+                return prof
+        except Exception:
+            pass
+    return "AC" if is_ac_online() else "Battery"
+
+
+def read_powerdevil_display_timeouts():
+    """
+    Reads the user's KDE Plasma Power Management GUI settings from ~/.config/powerdevilrc
+    for the active PowerDevil profile (AC, Battery, or LowBattery).
+    Returns (dim_timeout_sec, turnoff_timeout_sec) where 0 means disabled.
+    """
+    profile = _get_powerdevil_profile()
+    # KDE Plasma 6 PowerDevil built-in defaults when keys are omitted
+    dim_en = True
+    off_en = True
+    if profile == "AC":
+        dim_sec, off_sec = 300, 600
+    elif profile == "LowBattery":
+        dim_sec, off_sec = 60, 120
+    else:
+        dim_sec, off_sec = 120, 300
+
+    cfg_path = os.path.expanduser("~/.config/powerdevilrc")
+    if not os.path.isfile(cfg_path):
+        return (dim_sec if dim_en else 0), (off_sec if off_en else 0)
+
+    section_target = f"[{profile}][Display]"
+    in_sec = False
+    try:
+        with open(cfg_path, "r", encoding="utf-8", errors="ignore") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("["):
+                    in_sec = (line == section_target)
+                    continue
+                if not in_sec or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip()
+                if k == "DimDisplayWhenIdle":
+                    dim_en = (v.lower() == "true")
+                elif k == "DimDisplayIdleTimeoutSec":
+                    try:
+                        dim_sec = int(v)
+                    except ValueError:
+                        pass
+                elif k == "TurnOffDisplayWhenIdle":
+                    off_en = (v.lower() == "true")
+                elif k == "TurnOffDisplayIdleTimeoutSec":
+                    try:
+                        off_sec = int(v)
+                    except ValueError:
+                        pass
+    except Exception:
+        pass
+
+    return (dim_sec if (dim_en and dim_sec > 0) else 0), (off_sec if (off_en and off_sec > 0) else 0)
+
+
+def _get_external_screen_brightness_displays():
+    """Returns list of (dbus_obj_name, label, brightness, max_brightness) for external displays in org.kde.ScreenBrightness."""
+    res = []
+    qdbus_bin = shutil.which("qdbus6")
+    if not qdbus_bin:
+        return res
+    try:
+        p = subprocess.run(
+            [qdbus_bin, "org.kde.ScreenBrightness", "/org/kde/ScreenBrightness",
+             "org.freedesktop.DBus.Properties.Get", "org.kde.ScreenBrightness", "DisplaysDBusNames"],
+            capture_output=True, text=True, timeout=1.5,
+        )
+        names = [n.strip() for n in p.stdout.splitlines() if n.strip()]
+        for name in names:
+            p2 = subprocess.run(
+                [qdbus_bin, "org.kde.ScreenBrightness", f"/org/kde/ScreenBrightness/{name}",
+                 "org.freedesktop.DBus.Properties.GetAll", "org.kde.ScreenBrightness.Display"],
+                capture_output=True, text=True, timeout=1.5,
+            )
+            props = {}
+            for line in p2.stdout.splitlines():
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    props[k.strip()] = v.strip()
+            if props.get("IsInternal", "").lower() == "false":
+                br = int(props.get("Brightness", "0"))
+                mx = int(props.get("MaxBrightness", "10000"))
+                label = props.get("Label", name)
+                if mx > 0:
+                    res.append((name, label, br, mx))
+    except Exception:
+        pass
+    return res
+
+
+def _set_screen_brightness_silent(obj_name, value):
+    """Sets brightness silently via KDE org.kde.ScreenBrightness (flags=1 SuppressIndicator)."""
+    qdbus_bin = shutil.which("qdbus6")
+    if not qdbus_bin:
+        return False
+    try:
+        r = subprocess.run(
+            [qdbus_bin, "org.kde.ScreenBrightness", f"/org/kde/ScreenBrightness/{obj_name}",
+             "org.kde.ScreenBrightness.Display.SetBrightness", str(int(value)), "1"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2.0,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _is_powerdevil_inhibited() -> bool:
+    """Checks if any application holds a PowerManagement idle/screen inhibition."""
+    qdbus_bin = shutil.which("qdbus6")
+    if not qdbus_bin:
+        return False
+    try:
+        p = subprocess.run(
+            [qdbus_bin, "org.freedesktop.PowerManagement.Inhibit",
+             "/org/freedesktop/PowerManagement/Inhibit",
+             "org.freedesktop.PowerManagement.Inhibit.HasInhibit"],
+            capture_output=True, text=True, timeout=1.0,
+        )
+        return p.stdout.strip().lower() == "true"
+    except Exception:
+        return False
+
+
+class WaylandIdleDpmsGuard:
+    """
+    Pure-Python Wayland client for ext_idle_notifier_v1 + org_kde_kwin_dpms_manager.
+    Zero polling: integrates directly into the main daemon's select.poll() loop.
+    Solves two KDE Plasma 6 + USB-C HDMI adapter issues while honoring ~/.config/powerdevilrc:
+      1. External Display Dimming: dims external DDC/CI displays at DimDisplayIdleTimeoutSec
+         (for AC, Battery, and LowBattery profiles) and restores exact saved brightness on wake.
+      2. Authoritative KWin DPMS Pin & USB-C HPD Wake-Loop Guard: binds org_kde_kwin_dpms for
+         every wl_output (including dynamic hotplug outputs). Whenever all outputs enter DPMS
+         Off/Standby/Suspend — whether from idle timeout, lockscreen timeout ("When locked"),
+         or manual power action — pins external DRM connectors to 'on' until DPMS wakes,
+         preventing USB-C HDMI bridges from dropping HPD and triggering wake/placeholder loops.
+    """
+
+    def __init__(self):
+        self.sock = None
+        self.buf = b""
+        self.next_id = 4
+        self.seat_id = None
+        self.idle_mgr_id = None
+        self.dpms_mgr_id = None
+        self.dim_notif_id = None
+        self.off_notif_id = None
+        self.dim_sec = 0
+        self.off_sec = 0
+        self.is_dim_idle = False
+        self.is_off_idle = False
+        self.dpms_all_off = False
+        self._wl_outputs = {}    # {global_name: (wl_output_id, dpms_obj_id)}
+        self._dpms_modes = {}    # {dpms_obj_id: mode_int} (0=On, 1=Standby, 2=Suspend, 3=Off)
+        self._dimmed_saved = {}  # {label: (orig_brightness, dimmed_target)}
+        self._pinned_connectors = set()  # set of /sys/class/drm/.../status paths
+        self._pinned_resolutions = {}    # {connector_short_name: (width, height)}
+        self._suppress_unplug_until = 0.0
+        self._last_reoff_ts = 0.0
+        self._reoff_timer = None
+        self._pin_timer = None
+        self._lock = threading.Lock()
+        self._restore_lock = threading.Lock()
+
+    @property
+    def is_sleeping_or_idle(self) -> bool:
+        """True if KWin DPMS reports all outputs off OR compositor idle exceeded TurnOffDisplay."""
+        return self.dpms_all_off or self.is_off_idle
+
+    def _send(self, obj_id, opcode, payload=b""):
+        if not self.sock:
+            return
+        msg = struct.pack("<IHH", obj_id, opcode, 8 + len(payload)) + payload
+        self.sock.sendall(msg)
+
+    @staticmethod
+    def _wl_str(s):
+        b = s.encode("utf-8") + b"\x00"
+        return struct.pack("<I", len(b)) + b + b"\x00" * ((4 - len(b) % 4) % 4)
+
+    def _alloc_id(self):
+        oid = self.next_id
+        self.next_id += 1
+        return oid
+
+    def _bind_wl_output(self, global_name, ver):
+        if not self.dpms_mgr_id or global_name in self._wl_outputs:
+            return
+        oid = self._alloc_id()
+        did = self._alloc_id()
+        self._send(2, 0, struct.pack("<I", global_name) + self._wl_str("wl_output") + struct.pack("<II", min(ver, 4), oid))
+        self._send(self.dpms_mgr_id, 0, struct.pack("<II", did, oid))  # org_kde_kwin_dpms_manager.get(did, oid)
+        self._wl_outputs[global_name] = (oid, did)
+
+    def _unbind_wl_output(self, global_name):
+        entry = self._wl_outputs.pop(global_name, None)
+        if not entry:
+            return
+        oid, did = entry
+        self._dpms_modes.pop(did, None)
+        try:
+            self._send(did, 1)  # org_kde_kwin_dpms.release()
+            self._send(oid, 0)  # wl_output.release() (v3+)
+        except Exception:
+            pass
+
+    def _cancel_timer(self, attr_name):
+        t = getattr(self, attr_name, None)
+        if t:
+            try:
+                t.cancel()
+            except Exception:
+                pass
+            setattr(self, attr_name, None)
+
+    def _schedule_pin_on_sleep(self, delay: float = 0.8):
+        self._cancel_timer("_pin_timer")
+        def _do_pin():
+            if self.is_sleeping_or_idle:
+                self._set_external_drm_status_pin(True)
+        t = threading.Timer(delay, _do_pin)
+        t.daemon = True
+        self._pin_timer = t
+        t.start()
+
+    def _on_wake(self, was_asleep: bool):
+        self._cancel_timer("_pin_timer")
+        self._cancel_timer("_reoff_timer")
+        if was_asleep or self._pinned_connectors:
+            self._suppress_unplug_until = max(self._suppress_unplug_until, time.monotonic() + 12.0)
+        self._set_external_drm_status_pin(False)
+        if was_asleep:
+            t = threading.Timer(3.5, self._restore_external_dim)
+            t.daemon = True
+            t.start()
+        elif self._dimmed_saved:
+            threading.Thread(target=self._restore_external_dim, daemon=True).start()
+
+    def _evaluate_dpms_state(self):
+        if not self._dpms_modes:
+            return
+        all_off = all(mode != 0 for mode in self._dpms_modes.values())
+        if all_off and not self.dpms_all_off:
+            self.dpms_all_off = True
+            print("[DISPLAY/DPMS] KWin DPMS Off detected (idle / lockscreen / manual) ➔ arming anti-HPD-flap pin", flush=True)
+            self._schedule_pin_on_sleep(delay=0.8)
+        elif not all_off and self.dpms_all_off:
+            self.dpms_all_off = False
+            self.is_off_idle = False
+            self.is_dim_idle = False
+            print("[DISPLAY/DPMS] KWin DPMS On detected ➔ releasing connector pin & restoring display state", flush=True)
+            self._on_wake(was_asleep=True)
+
+    def connect(self):
+        self.close()
+        ensure_gui_environment()
+        xdg = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+        wdisp = os.environ.get("WAYLAND_DISPLAY")
+        sock_path = os.path.join(xdg, wdisp) if wdisp else None
+        if not sock_path or not os.path.exists(sock_path):
+            sock_path = None
+            try:
+                for f in sorted(os.listdir(xdg)):
+                    if f.startswith("wayland-") and not f.endswith(".lock"):
+                        sock_path = os.path.join(xdg, f)
+                        break
+            except Exception:
+                pass
+        if not sock_path or not os.path.exists(sock_path):
+            return False
+
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(2.0)
+        try:
+            s.connect(sock_path)
+            self.sock = s
+            self.buf = b""
+            self.next_id = 4
+            self._wl_outputs.clear()
+            self._dpms_modes.clear()
+            self.dpms_all_off = False
+            self._send(1, 1, struct.pack("<I", 2))  # wl_display.get_registry(2)
+            self._send(1, 0, struct.pack("<I", 3))  # wl_display.sync(3)
+
+            globals_map = {}
+            initial_outputs = []
+            done = False
+            while not done:
+                chunk = s.recv(4096)
+                if not chunk:
+                    raise OSError("Wayland socket closed during handshake")
+                self.buf += chunk
+                while len(self.buf) >= 8:
+                    obj_id, opcode, size = struct.unpack("<IHH", self.buf[:8])
+                    if len(self.buf) < size:
+                        break
+                    payload = self.buf[8:size]
+                    self.buf = self.buf[size:]
+                    if obj_id == 2 and opcode == 0:
+                        name, slen = struct.unpack("<II", payload[:8])
+                        iface = payload[8:8 + slen - 1].decode("utf-8", "ignore")
+                        ver_off = 8 + ((slen + 3) & ~3)
+                        ver = struct.unpack("<I", payload[ver_off:ver_off + 4])[0]
+                        if iface == "wl_output":
+                            initial_outputs.append((name, ver))
+                        else:
+                            globals_map[iface] = (name, ver)
+                    elif obj_id == 3 and opcode == 0:
+                        done = True
+
+            if "wl_seat" not in globals_map or "ext_idle_notifier_v1" not in globals_map:
+                self.close()
+                return False
+
+            seat_name, seat_ver = globals_map["wl_seat"]
+            idle_name, idle_ver = globals_map["ext_idle_notifier_v1"]
+            self.seat_id = self._alloc_id()
+            self.idle_mgr_id = self._alloc_id()
+            self._send(2, 0, struct.pack("<I", seat_name) + self._wl_str("wl_seat") + struct.pack("<II", min(seat_ver, 5), self.seat_id))
+            self._send(2, 0, struct.pack("<I", idle_name) + self._wl_str("ext_idle_notifier_v1") + struct.pack("<II", min(idle_ver, 1), self.idle_mgr_id))
+
+            # Bind org_kde_kwin_dpms_manager + every initial wl_output for authoritative DPMS tracking
+            dpms_hooked = False
+            if "org_kde_kwin_dpms_manager" in globals_map:
+                dm_name, dm_ver = globals_map["org_kde_kwin_dpms_manager"]
+                self.dpms_mgr_id = self._alloc_id()
+                self._send(2, 0, struct.pack("<I", dm_name) + self._wl_str("org_kde_kwin_dpms_manager") + struct.pack("<II", min(dm_ver, 1), self.dpms_mgr_id))
+                for oname, over in initial_outputs:
+                    self._bind_wl_output(oname, over)
+                dpms_hooked = True
+
+            s.setblocking(False)
+            self.configure_timeouts(force=True)
+            print(
+                f"[DISPLAY/IDLE] Hooked Wayland ext_idle_notifier_v1 (dim={self.dim_sec}s, off={self.off_sec}s)"
+                + (" + org_kde_kwin_dpms" if dpms_hooked else ""),
+                flush=True,
+            )
+            return True
+        except Exception as e:
+            print(f"[DISPLAY/IDLE] Notice: Wayland idle hook unavailable: {e}", flush=True)
+            self.close()
+            return False
+
+    def fileno(self):
+        return self.sock.fileno() if self.sock else -1
+
+    def close(self):
+        self._cancel_timer("_pin_timer")
+        self._cancel_timer("_reoff_timer")
+        self._set_external_drm_status_pin(False)
+        if self.sock:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+        self.sock = None
+        self.seat_id = None
+        self.idle_mgr_id = None
+        self.dpms_mgr_id = None
+        self.dim_notif_id = None
+        self.off_notif_id = None
+        self.is_dim_idle = False
+        self.is_off_idle = False
+        self.dpms_all_off = False
+        self._wl_outputs.clear()
+        self._dpms_modes.clear()
+
+    def configure_timeouts(self, force=False):
+        if not self.sock or not self.idle_mgr_id or not self.seat_id:
+            return
+        dim_s, off_s = read_powerdevil_display_timeouts()
+        if not force and dim_s == self.dim_sec and off_s == self.off_sec:
+            return
+        self.dim_sec, self.off_sec = dim_s, off_s
+        try:
+            # Release any pinned connectors and restore dimmed brightness ONLY if DPMS is not currently Off
+            # (fixes audit issue #1: changing AC/Battery or powerdevilrc while idle must never orphan a pinned connector)
+            if not self.dpms_all_off:
+                self._cancel_timer("_pin_timer")
+                self._cancel_timer("_reoff_timer")
+                if self._pinned_connectors:
+                    self._set_external_drm_status_pin(False)
+                if self._dimmed_saved:
+                    threading.Thread(target=self._restore_external_dim, daemon=True).start()
+
+            if self.dim_notif_id:
+                self._send(self.dim_notif_id, 0)  # ext_idle_notification_v1.destroy()
+                self.dim_notif_id = None
+            if self.off_notif_id:
+                self._send(self.off_notif_id, 0)
+                self.off_notif_id = None
+            self.is_dim_idle = False
+            self.is_off_idle = False
+
+            if dim_s > 0:
+                self.dim_notif_id = self._alloc_id()
+                # opcode 1 = get_idle_notification (respects Wayland video/game idle inhibitors)
+                self._send(self.idle_mgr_id, 1, struct.pack("<III", self.dim_notif_id, dim_s * 1000, self.seat_id))
+            if off_s > 0:
+                self.off_notif_id = self._alloc_id()
+                self._send(self.idle_mgr_id, 1, struct.pack("<III", self.off_notif_id, off_s * 1000, self.seat_id))
+            if not force:
+                print(f"[DISPLAY/IDLE] Reloaded powerdevilrc timeouts (dim={dim_s}s, off={off_s}s)", flush=True)
+        except Exception as e:
+            print(f"[DISPLAY/IDLE] Failed updating Wayland idle timers: {e}", flush=True)
+
+    def _snapshot_connector_resolutions(self):
+        """Captures current active resolution (width, height) per enabled external connector before DPMS sleep."""
+        res = {}
+        try:
+            ensure_gui_environment()
+            p = subprocess.run(["kscreen-doctor", "-j"], capture_output=True, text=True, timeout=1.5)
+            if p.returncode == 0:
+                data = json.loads(p.stdout)
+                for o in data.get("outputs", []):
+                    name = o.get("name", "")
+                    if not o.get("connected") or not o.get("enabled") or name.startswith("eDP"):
+                        continue
+                    cid = str(o.get("currentModeId", ""))
+                    for m in o.get("modes", []):
+                        if str(m.get("id", "")) == cid:
+                            sz = m.get("size", {})
+                            w, h = int(sz.get("width", 0)), int(sz.get("height", 0))
+                            if w > 0 and h > 0:
+                                res[name] = (w, h)
+                            break
+        except Exception:
+            pass
+        return res
+
+    def _reprobe_fallback_modes_after_wake(self, released_paths):
+        """
+        After releasing DRM status pin ('on' -> 'detect') on wake, checks whether KWin fell back
+        to a safe 640x480/800x600/1024x768 VGA mode (because EDID was unreadable while the
+        monitor was in DPMS standby). If so, triggers a single clean 'off' -> 'detect' hotplug
+        cycle so KWin reloads the full EDID mode table (e.g. 2560x1440 @ 120/144Hz).
+        """
+        def _worker():
+            time.sleep(0.8)
+            if self.is_off_idle:
+                return
+            ensure_gui_environment()
+            need_reprobe = []
+            try:
+                p = subprocess.run(["kscreen-doctor", "-j"], capture_output=True, text=True, timeout=2.0)
+                if p.returncode == 0:
+                    data = json.loads(p.stdout)
+                    for o in data.get("outputs", []):
+                        name = o.get("name", "")
+                        if not o.get("connected") or not o.get("enabled") or name.startswith("eDP"):
+                            continue
+                        modes = o.get("modes", [])
+                        max_w = max((int(m.get("size", {}).get("width", 0)) for m in modes), default=0)
+                        prev_w = self._pinned_resolutions.get(name, (0, 0))[0]
+                        # Fallback VGA table has max_w <= 1024 (640x480..1024x768) while pre-sleep was >= 1280
+                        if max_w <= 1024 and (prev_w >= 1280 or len(modes) <= 6):
+                            for sp in released_paths:
+                                if os.path.basename(os.path.dirname(sp)).endswith(f"-{name}"):
+                                    need_reprobe.append((name, sp))
+                                    break
+            except Exception:
+                return
+
+            if not need_reprobe or self.is_sleeping_or_idle:
+                return
+
+            # Suppress handle_drm_hotplug() during our intentional off -> detect EDID reprobe
+            # and the subsequent ~10s USB-C HDMI handshake window so PowerDevil is NOT restarted!
+            self._suppress_unplug_until = max(self._suppress_unplug_until, time.monotonic() + 14.0)
+
+            for name, sp in need_reprobe:
+                try:
+                    if os.access(sp, os.W_OK):
+                        print(f"[DISPLAY/IDLE] Detected VGA fallback mode on {name} after wake ➔ forcing EDID reprobe", flush=True)
+                        with open(sp, "w") as f:
+                            f.write("off")
+                        time.sleep(0.20)
+                        with open(sp, "w") as f:
+                            f.write("detect")
+                except Exception as e:
+                    print(f"[DISPLAY/IDLE] EDID reprobe error on {name}: {e}", flush=True)
+
+            # Wait for libddcutil (~4.5s post-connect settling) and restore original brightness reliably
+            time.sleep(3.5)
+            if not self.is_dim_idle and not self.is_sleeping_or_idle:
+                self._restore_external_dim(retries=6)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _set_external_drm_status_pin(self, pin: bool):
+        """
+        Zero-HPD-flap kernel connector pin during DPMS Off:
+        If external DRM status sysfs nodes are writable (via udev / tmpfiles.d),
+        pins connected external connectors to 'on' while in DPMS Off and releases
+        them back to 'detect' immediately on wake or daemon exit.
+        """
+        if pin:
+            with self._lock:
+                already_pinned = set(self._pinned_connectors)
+            if not already_pinned:
+                self._pinned_resolutions = self._snapshot_connector_resolutions()
+            for p in sorted(glob.glob("/sys/class/drm/card*-*/status")):
+                if "-eDP-" in p or p in already_pinned:
+                    continue
+                try:
+                    if os.access(p, os.W_OK):
+                        with open(p, "r") as f:
+                            st = f.read().strip().lower()
+                        if st == "connected":
+                            with open(p, "w") as f:
+                                f.write("on")
+                            with self._lock:
+                                self._pinned_connectors.add(p)
+                            print(f"[DISPLAY/IDLE] Pinned {os.path.basename(os.path.dirname(p))} during DPMS sleep (anti-HPD-flap)", flush=True)
+                except Exception:
+                    pass
+        else:
+            with self._lock:
+                released = list(self._pinned_connectors)
+                self._pinned_connectors.clear()
+            for p in released:
+                try:
+                    if os.access(p, os.W_OK):
+                        with open(p, "w") as f:
+                            f.write("detect")
+                        print(f"[DISPLAY/IDLE] Released {os.path.basename(os.path.dirname(p))} to 'detect' on wake", flush=True)
+                except Exception:
+                    pass
+            if released:
+                self._reprobe_fallback_modes_after_wake(released)
+
+    def _apply_external_dim(self):
+        if _is_powerdevil_inhibited():
+            return
+        if not check_external_displays_connected():
+            return
+        ext_displays = _get_external_screen_brightness_displays()
+        if not ext_displays:
+            return
+        with self._lock:
+            if self._dimmed_saved:
+                return
+            for obj_name, label, br, mx in ext_displays:
+                # Only dim if currently above 25% of max brightness (skip if already dimmed)
+                target = max(int(mx * 0.15), int(br * 0.30))
+                if br > target + int(mx * 0.05):
+                    self._dimmed_saved[label] = (br, target)
+                    _set_screen_brightness_silent(obj_name, target)
+                    print(f"[DISPLAY/IDLE] Dimmed external {obj_name} ({label}): {br} ➔ {target}", flush=True)
+
+    def _restore_external_dim(self, retries: int = 6):
+        """
+        Restores external display brightness by matching Display Label (surviving PowerDevil
+        restarts or DDC re-enumeration where display1 may become display2/display3).
+        Serialized via _restore_lock so concurrent wake timers never send redundant DDC writes.
+        Verifies actual DBus brightness convergence before clearing saved state.
+        """
+        if not self._restore_lock.acquire(blocking=False):
+            return
+        try:
+            with self._lock:
+                if not self._dimmed_saved:
+                    return
+                saved = dict(self._dimmed_saved)
+
+            for attempt in range(max(1, retries)):
+                if self.is_dim_idle or self.is_sleeping_or_idle:
+                    return
+                ext_displays = _get_external_screen_brightness_displays()
+                restored_labels = []
+                for label, (orig_br, _target) in saved.items():
+                    match = next((d for d in ext_displays if d[1] == label), None)
+                    if match is None and len(ext_displays) == 1 and len(saved) == 1:
+                        match = ext_displays[0]
+                    if match is not None:
+                        obj_name, _lbl, cur_br, _mx = match
+                        if abs(cur_br - orig_br) <= 100:
+                            restored_labels.append(label)
+                        else:
+                            _set_screen_brightness_silent(obj_name, orig_br)
+                            # Verify after brief DDC write settle that brightness actually converged
+                            time.sleep(0.6)
+                            check_list = _get_external_screen_brightness_displays()
+                            chk = next((d for d in check_list if d[1] == label), None)
+                            if chk is not None and abs(chk[2] - orig_br) <= 100:
+                                print(f"[DISPLAY/IDLE] Restored external {obj_name} ({label}) brightness ➔ {orig_br}", flush=True)
+                                restored_labels.append(label)
+
+                with self._lock:
+                    for lbl in restored_labels:
+                        self._dimmed_saved.pop(lbl, None)
+                    if not self._dimmed_saved:
+                        return
+                    saved = dict(self._dimmed_saved)
+
+                if attempt < retries - 1:
+                    time.sleep(1.5)
+        finally:
+            self._restore_lock.release()
+
+    def enforce_dpms_off_if_idle(self, reason="HPD_FLAP"):
+        """
+        If the compositor confirms displays are in DPMS sleep or user is idle past TurnOffDisplay,
+        re-applies `kscreen-doctor --dpms off` to counter USB-C HDMI adapter HPD drop/replug
+        wake-loops without breaking real user wakeups.
+        """
+        if not self.is_sleeping_or_idle:
+            return
+        now = time.monotonic()
+        if now - self._last_reoff_ts < 1.2:
+            return
+        self._last_reoff_ts = now
+
+        def _do_reoff():
+            if not self.is_sleeping_or_idle:
+                return
+            ensure_gui_environment()
+            try:
+                subprocess.run(["kscreen-doctor", "--dpms", "off"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2.0)
+                print(f"[DISPLAY/IDLE] Re-asserted DPMS Off while still asleep ({reason})", flush=True)
+            except Exception:
+                pass
+
+        self._cancel_timer("_reoff_timer")
+        self._reoff_timer = threading.Timer(0.12, _do_reoff)
+        self._reoff_timer.daemon = True
+        self._reoff_timer.start()
+
+    def process_events(self):
+        """Reads and dispatches pending Wayland registry, DPMS, and idle events. Returns False if socket closed."""
+        if not self.sock:
+            return False
+        while True:
+            try:
+                chunk = self.sock.recv(4096)
+                if not chunk:
+                    return False
+                self.buf += chunk
+            except BlockingIOError:
+                break
+            except Exception:
+                return False
+
+        while len(self.buf) >= 8:
+            obj_id, opcode, size = struct.unpack("<IHH", self.buf[:8])
+            if len(self.buf) < size:
+                break
+            payload = self.buf[8:size]
+            self.buf = self.buf[size:]
+
+            if obj_id == 2:  # wl_registry hotplug events
+                if opcode == 0 and len(payload) >= 12:  # global
+                    name, slen = struct.unpack("<II", payload[:8])
+                    iface = payload[8:8 + slen - 1].decode("utf-8", "ignore")
+                    ver_off = 8 + ((slen + 3) & ~3)
+                    if iface == "wl_output" and len(payload) >= ver_off + 4:
+                        ver = struct.unpack("<I", payload[ver_off:ver_off + 4])[0]
+                        self._bind_wl_output(name, ver)
+                elif opcode == 1 and len(payload) >= 4:  # global_remove
+                    name = struct.unpack("<I", payload[:4])[0]
+                    self._unbind_wl_output(name)
+            elif obj_id in self._dpms_modes or any(did == obj_id for _, did in self._wl_outputs.values()):
+                # org_kde_kwin_dpms events: 0=supported(u32), 1=mode(u32), 2=done()
+                if opcode == 1 and len(payload) >= 4:
+                    self._dpms_modes[obj_id] = struct.unpack("<I", payload[:4])[0]
+                elif opcode == 2:
+                    self._evaluate_dpms_state()
+            elif obj_id == self.dim_notif_id:
+                if opcode == 0:  # idled
+                    self.is_dim_idle = True
+                    threading.Thread(target=self._apply_external_dim, daemon=True).start()
+                elif opcode == 1:  # resumed
+                    self.is_dim_idle = False
+                    if not self.dpms_all_off:
+                        threading.Thread(target=self._restore_external_dim, daemon=True).start()
+            elif obj_id == self.off_notif_id:
+                if opcode == 0:  # idled
+                    self.is_off_idle = True
+                    # Fallback pin timer in case org_kde_kwin_dpms is unavailable
+                    if not self.dpms_mgr_id:
+                        self._schedule_pin_on_sleep(delay=1.5)
+                elif opcode == 1:  # resumed
+                    was_off = self.is_off_idle or self.dpms_all_off
+                    self.is_off_idle = False
+                    self.dpms_all_off = False
+                    self._on_wake(was_asleep=was_off)
+        return True
+
+
+def setup_powerdevilrc_inotify():
+    """Creates a non-blocking libc inotify fd watching ~/.config for powerdevilrc edits."""
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        in_fd = libc.inotify_init1(0o0004000 | 0o2000000)  # IN_NONBLOCK | IN_CLOEXEC
+        if in_fd < 0:
+            return None
+        cfg_dir = os.path.expanduser("~/.config").encode("utf-8")
+        # IN_CLOSE_WRITE (0x8) | IN_MOVED_TO (0x80) | IN_CREATE (0x100)
+        wd = libc.inotify_add_watch(in_fd, cfg_dir, 0x00000008 | 0x00000080 | 0x00000100)
+        if wd < 0:
+            os.close(in_fd)
+            return None
+        return in_fd
+    except Exception:
+        return None
+
+
+_idle_guard = WaylandIdleDpmsGuard()
+
+
 def handle_drm_hotplug(force: bool = False):
     """
     Called when an external display disconnect is detected.
     Restarts plasma-powerdevil.service after a brief settling delay to rebind
     KDE Plasma 6's backlight controller back to the internal panel.
-    Suppressed if the display is in DPMS sleep or session is locked to prevent wake-up loops;
-    in that case, recovery is deferred until the session wakes up and unlocks.
+    Suppressed if the display is in DPMS sleep, user is compositor-idle past TurnOffDisplay,
+    or session is locked; in that case, recovery is deferred until the user genuinely resumes.
     """
     global _deferred_drm_recovery
 
-    # Guard: Do NOT restart PowerDevil if session is locked or screens are asleep (DPMS Off).
-    # When an external monitor enters DPMS standby, USB-C/HDMI adapters drop HPD, causing DRM to report
-    # disconnected. Restarting PowerDevil during DPMS sleep wakes the monitors and causes an infinite wake loop.
-    if not force and (is_display_sleeping() or is_session_locked()):
-        print("[DISPLAY] External display disconnect during DPMS sleep / screen lock ➔ deferring PowerDevil restart until wake", flush=True)
+    # Guard 1: During intentional wake/EDID reprobe window, defer recovery instead of dropping it
+    # (fixes audit issue #2: if the user actually unplugged the cable while asleep, recovery will
+    # run once the suppression window expires and confirms the external monitor is truly gone).
+    if not force and time.monotonic() < _idle_guard._suppress_unplug_until:
+        print("[DISPLAY] Deferring disconnect evaluation until post-wake settle window finishes", flush=True)
         _deferred_drm_recovery = True
         return
 
+    # Guard 2: Do NOT restart PowerDevil if displays are in DPMS Off, user is idle past TurnOffDisplay,
+    # or session is locked. USB-C HDMI adapters drop HPD ~9s after DPMS Off.
+    if not force and (_idle_guard.is_sleeping_or_idle or is_display_sleeping() or is_session_locked()):
+        print("[DISPLAY] External display disconnect during DPMS sleep / user idle ➔ deferring PowerDevil restart until wake", flush=True)
+        _deferred_drm_recovery = True
+        if _idle_guard.is_sleeping_or_idle:
+            _idle_guard.enforce_dpms_off_if_idle(reason="DISCONNECT_DURING_IDLE")
+        return
+
     def _worker():
-        time.sleep(1.0)
+        # Wait 2.5s before restarting PowerDevil so brief USB-C HPD glitches (<2s) never bounce PowerDevil
+        time.sleep(2.5)
+        if not force and (_idle_guard.is_sleeping_or_idle or check_external_displays_connected()):
+            print("[DISPLAY] External display recovered within settle window ➔ skipping PowerDevil restart", flush=True)
+            return
         ensure_gui_environment()
 
         try:
@@ -1305,12 +2077,24 @@ def main():
     except Exception as e:
         print(f"[INIT] Notice: Could not bind IPC socket: {e}", flush=True)
 
+    # 6. Register Wayland ext_idle_notifier_v1 & ~/.config/powerdevilrc inotify watch
+    wl_fd = -1
+    if _idle_guard.connect():
+        wl_fd = _idle_guard.fileno()
+        poller.register(wl_fd, select.POLLIN | select.POLLERR | select.POLLHUP)
+
+    cfg_inotify_fd = setup_powerdevilrc_inotify()
+    if cfg_inotify_fd is not None:
+        poller.register(cfg_inotify_fd, select.POLLIN | select.POLLERR)
+
     last_toggle_time = 0
     last_fn_l_time = 0
     last_fn_n_time = 0
     last_tap_time = 0
     copilot_is_hold = False
     last_scancode = 0
+
+    wl_retry_after = 0.0
 
     def _handle_sigterm(_signum, _frame):
         raise SystemExit(0)
@@ -1320,28 +2104,73 @@ def main():
     global _deferred_drm_recovery
     try:
         while True:
-            # Sleep indefinitely in kernel wait queue (0% CPU), or 1s timeout if deferred recovery is pending
-            timeout = 1000 if _deferred_drm_recovery else None
+            # Sleep indefinitely in kernel wait queue (0% CPU); use a bounded timeout only when
+            # deferred DRM recovery is pending or Wayland socket needs a reconnect retry.
+            now_mono = time.monotonic()
+            need_poll_wake = (_deferred_drm_recovery and not _idle_guard.is_sleeping_or_idle) or (wl_fd < 0 and wl_retry_after > 0)
+            timeout = 1000 if need_poll_wake else None
             events = poller.poll(timeout)
             reap_zombies()
 
-            # Check deferred recovery: runs if screen woke up / unlocked after an external disconnect
-            if _deferred_drm_recovery:
+            # Reconnect Wayland socket cleanly if KWin restarted/reloaded
+            if wl_fd < 0 and wl_retry_after > 0 and time.monotonic() >= wl_retry_after:
+                if _idle_guard.connect():
+                    wl_fd = _idle_guard.fileno()
+                    poller.register(wl_fd, select.POLLIN | select.POLLERR | select.POLLHUP)
+                    wl_retry_after = 0.0
+                else:
+                    wl_retry_after = time.monotonic() + 5.0
+
+            # Check deferred recovery: runs ONLY after post-wake settle expires, session is awake,
+            # internal eDP is On, and external display is confirmed gone.
+            if _deferred_drm_recovery and not _idle_guard.is_sleeping_or_idle:
                 curr_ext = check_external_displays_connected()
                 if curr_ext:
                     # External display reconnected or woke up (was never physically unplugged)
                     print("[DISPLAY] External display reconnected/woke ➔ clearing deferred recovery", flush=True)
                     _deferred_drm_recovery = False
                     last_external_connected = True
-                elif not is_display_sleeping() and not is_session_locked():
-                    # Session is awake and unlocked, and external display is confirmed disconnected
-                    print("[DISPLAY] Session awake and unlocked after external disconnect ➔ executing deferred recovery", flush=True)
+                elif time.monotonic() >= _idle_guard._suppress_unplug_until and is_internal_edp_on() and not is_session_locked():
+                    # Post-wake window elapsed, internal panel is active & unlocked, external display confirmed gone
+                    print("[DISPLAY] User resumed on internal panel after external disconnect ➔ executing deferred recovery", flush=True)
                     _deferred_drm_recovery = False
                     handle_drm_hotplug(force=True)
 
             for fd, event in events:
+                # Handle Wayland ext_idle_notifier_v1 + org_kde_kwin_dpms events
+                if wl_fd >= 0 and fd == wl_fd:
+                    if not _idle_guard.process_events():
+                        try:
+                            poller.unregister(wl_fd)
+                        except Exception:
+                            pass
+                        _idle_guard.close()
+                        wl_fd = -1
+                        if _idle_guard.connect():
+                            wl_fd = _idle_guard.fileno()
+                            poller.register(wl_fd, select.POLLIN | select.POLLERR | select.POLLHUP)
+                        else:
+                            wl_retry_after = time.monotonic() + 3.0
+
+                # Handle ~/.config/powerdevilrc live edits (GUI Power Management changes)
+                elif cfg_inotify_fd is not None and fd == cfg_inotify_fd:
+                    should_reload = False
+                    while True:
+                        try:
+                            raw = os.read(cfg_inotify_fd, 4096)
+                            if not raw:
+                                break
+                            if b"powerdevilrc" in raw:
+                                should_reload = True
+                        except BlockingIOError:
+                            break
+                        except Exception:
+                            break
+                    if should_reload:
+                        _idle_guard.configure_timeouts()
+
                 # Handle Profile change (Fn+Q)
-                if profile_file and fd == profile_file.fileno():
+                elif profile_file and fd == profile_file.fileno():
                     profile_file.seek(0)
                     curr = profile_file.read().strip()
                     if curr and curr != last_profile_state:
@@ -1456,6 +2285,7 @@ def main():
 
                     if has_psy_event:
                         apply_rapl_mmio(source="UEVENT")
+                        _idle_guard.configure_timeouts()
 
                     if has_drm_event:
                         curr_external = check_external_displays_connected()
@@ -1464,9 +2294,16 @@ def main():
                             print("[DISPLAY] DRM event: External display unplugged ➔ evaluating PowerDevil recovery", flush=True)
                             handle_drm_hotplug()
                         elif not last_external_connected and curr_external:
-                            if _deferred_drm_recovery:
+                            if _idle_guard.is_sleeping_or_idle:
+                                # USB-C HDMI adapter reconnected after dropping HPD during DPMS sleep:
+                                # keep screen asleep while still in DPMS sleep / user idle.
+                                _idle_guard.enforce_dpms_off_if_idle(reason="RECONNECT_DURING_IDLE")
+                            elif _deferred_drm_recovery:
                                 print("[DISPLAY] External display reconnected ➔ clearing deferred recovery", flush=True)
                                 _deferred_drm_recovery = False
+                        elif _idle_guard.is_sleeping_or_idle and not is_display_sleeping():
+                            # Any stray DRM event that woke an output while still in DPMS sleep -> re-assert DPMS Off
+                            _idle_guard.enforce_dpms_off_if_idle(reason="DRM_WAKE_DURING_IDLE")
                         last_external_connected = curr_external
 
                 # Handle local IPC triggers (e.g. lcopilot for external keyboards)
@@ -1497,6 +2334,12 @@ def main():
     except (KeyboardInterrupt, SystemExit):
         pass
     finally:
+        _idle_guard.close()
+        if cfg_inotify_fd is not None:
+            try:
+                os.close(cfg_inotify_fd)
+            except Exception:
+                pass
         if ipc_sock:
             try:
                 ipc_sock.close()

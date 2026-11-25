@@ -70,10 +70,10 @@ if [[ $EUID -ne 0 ]]; then
         sudo systemd-tmpfiles --create "/etc/tmpfiles.d/$(basename "$conf")"
     done
 
-    # /dev/input/ devices: ITE Keyboard (Copilot) + Ideapad Hotkeys (Fn+R, Fn+L)
+    # /dev/input/ devices & external DRM connector status nodes
     if [[ -d "$DIR/udev" ]]; then
         sudo cp -v "$DIR"/udev/*.rules /etc/udev/rules.d/
-        sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=input
+        sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=input && sudo udevadm trigger --subsystem-match=drm
     fi
 else
     cp -v "$DIR"/tmpfiles.d/*.conf /etc/tmpfiles.d/
@@ -83,7 +83,7 @@ else
 
     if [[ -d "$DIR/udev" ]]; then
         cp -v "$DIR"/udev/*.rules /etc/udev/rules.d/
-        udevadm control --reload-rules && udevadm trigger --subsystem-match=input
+        udevadm control --reload-rules && udevadm trigger --subsystem-match=input && udevadm trigger --subsystem-match=drm
     fi
 fi
 

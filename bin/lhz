@@ -314,6 +314,34 @@ fix_display() {
         fi
     fi
 
+    # 1b. Check if any external display fell back to VGA safe-mode (<=1024px) after DPMS wake
+    # and force a clean DRM off -> detect EDID reprobe if status sysfs is writable.
+    if command -v jq >/dev/null 2>&1; then
+        local kjson fallback_outs
+        kjson=$(get_kscreen_json)
+        if [[ -n "$kjson" ]]; then
+            fallback_outs=$(jq -r '
+                .outputs[]
+                | select(.connected and .enabled and (.name | startswith("eDP") | not))
+                | select(([.modes[].size.width] | max // 0) <= 1024)
+                | .name
+            ' <<< "$kjson" 2>/dev/null || true)
+            for fout in $fallback_outs; do
+                for sp in /sys/class/drm/card*-"${fout}"/status; do
+                    if [[ -w "$sp" ]]; then
+                        echo "  • Detected VGA fallback mode on ${fout} — forcing kernel EDID reprobe..."
+                        echo "off" > "$sp" 2>/dev/null || true
+                        sleep 0.25
+                        echo "detect" > "$sp" 2>/dev/null || true
+                        sleep 1.2
+                        KSCREEN_JSON_CACHE=""
+                        break
+                    fi
+                done
+            done
+        fi
+    fi
+
     # 2. Restart or start PowerDevil to rebind backlight controller after display hotplug/unplug
     echo "  • Restarting plasma-powerdevil.service..."
     systemctl --user restart plasma-powerdevil.service 2>/dev/null || true
