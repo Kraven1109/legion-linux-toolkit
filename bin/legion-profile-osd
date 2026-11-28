@@ -34,6 +34,7 @@ import tempfile
 import signal
 import socket
 import ctypes
+import json
 
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 if SCRIPT_DIR not in sys.path:
@@ -522,10 +523,12 @@ class WaylandIdleDpmsGuard:
       2. Authoritative KWin DPMS Pinning: tracks org_kde_kwin_dpms on all wl_outputs (idle,
          lockscreen "When locked", or manual DPMS Off). Pins external DRM status nodes to 'on'
          on DPMS Off and releases back to 'detect' on DPMS On (or daemon exit / config reload).
-      3. Zero-Subprocess VGA Fallback Recovery: tracks each wl_output's connector name and active
-         resolution directly via wl_output v4 events. If an external output wakes into VGA safe-mode
-         (<=1024px vs pre-sleep >=1280px), triggers a single off->detect EDID reprobe, guarded by
-         an explicit state set (_reprobing_connectors) cleared when DRM reconnects.
+      3. Dynamic EDID & Mode-Table Fallback Recovery: tracks each wl_output's connector name and
+         pre-sleep active width + EDID presence without hardcoded resolution thresholds. On wake,
+         detects genuine EDID loss (edid=0B when EDID was previously present), KWin mode-table
+         staleness (kwin_max_w < kernel progressive sysfs_max_w), or actual active-width drop
+         below pre-sleep width, triggering a single off->detect EDID reprobe guarded by
+         _reprobing_connectors.
     """
 
     def __init__(self):
@@ -549,7 +552,7 @@ class WaylandIdleDpmsGuard:
         self._dpms_modes = {}       # {dpms_obj_id: mode_int} (0=On, 1=Standby, 2=Suspend, 3=Off)
         self._dimmed_saved = {}     # {label: orig_brightness}
         self._pinned_connectors = set()    # {/sys/class/drm/.../status}
-        self._pinned_widths = {}           # {connector_name: pre_sleep_width_px}
+        self._pinned_state = {}            # {connector_name: (pre_sleep_wl_width, had_edid_bool)}
         self._reprobing_connectors = set() # {connector_name} currently undergoing off->detect
         self._wake_guard_until = 0.0       # short safety ceiling for _reprobing_connectors
         self._last_reoff_ts = 0.0
@@ -661,7 +664,8 @@ class WaylandIdleDpmsGuard:
                 try:
                     with open(modes_p, "r") as f:
                         for line in f:
-                            m = re.match(r"^(\d+)x\d+", line.strip())
+                            # Match progressive modes only (exclude interlaced 'WxHi' modes KWin may filter)
+                            m = re.match(r"^(\d+)x\d+$", line.strip())
                             if m:
                                 max_w = max(max_w, int(m.group(1)))
                 except Exception:
@@ -673,13 +677,13 @@ class WaylandIdleDpmsGuard:
         with self._lock:
             if name in self._reprobing_connectors:
                 return
-            self._pinned_widths.pop(name, None)
+            self._pinned_state.pop(name, None)
             self._reprobing_connectors.add(name)
             self._wake_guard_until = time.monotonic() + 10.0
 
         def _do_reprobe():
             try:
-                print(f"[DISPLAY/IDLE] {name} woke in VGA fallback ({reason}) ➔ forcing EDID reprobe", flush=True)
+                print(f"[DISPLAY/IDLE] {name} woke in fallback state ({reason}) ➔ forcing EDID reprobe", flush=True)
                 with open(status_path, "w") as f:
                     f.write("off")
                 time.sleep(0.25)
@@ -692,14 +696,22 @@ class WaylandIdleDpmsGuard:
 
         threading.Thread(target=_do_reprobe, daemon=True).start()
 
-    def _check_vga_fallback_for_connector(self, name: str, wl_width: int = 0, allow_clear_on_wl_only: bool = False):
+    def _check_vga_fallback_for_connector(
+        self,
+        name: str,
+        wl_width: int = 0,
+        kwin_max_w: int = 0,
+        allow_clear: bool = False,
+    ):
         """
-        Event-driven + sysfs-verified VGA fallback detector (0 subprocesses).
-        Checks BOTH wl_output active width AND kernel sysfs (edid size + modes max width):
-        - Never clears _pinned_widths on a stale pre-sleep wl_output width when kernel EDID/modes
-          still show VGA safe-mode (0-byte EDID or max_mode_w <= 1024px).
-        - Works even if the connector was unbound/rebound across DPMS sleep (e.g. previous reprobe)
-          and wl_output.mode never re-emits after wake.
+        Dynamic, resolution-agnostic EDID & mode-table fallback detector (no hardcoded pixel thresholds).
+        Works identically across 4K, 1440p, 1080p, 720p, native XGA (1024x768), SVGA (800x600),
+        no-EDID analog VGA dongles, and intentional low-res/4:3 mirror selections.
+
+        Triggers a single off->detect EDID reprobe ONLY when objective hardware/compositor state proves fallback:
+          1. EDID disappeared during sleep: edid_len == 0 (when display had EDID pre-sleep, or unknown).
+          2. KWin mode table is stale vs kernel EDID: edid_len >= 128 and 0 < kwin_max_w < sysfs_max_w.
+          3. Active output width actually dropped below recorded pre-sleep active width: 0 < wl_width < prev_w.
         """
         if self.is_sleeping_or_idle:
             return
@@ -708,35 +720,35 @@ class WaylandIdleDpmsGuard:
         with self._lock:
             if name in self._reprobing_connectors:
                 return
-            prev_w = self._pinned_widths.get(name, 0)
+            pinned = self._pinned_state.get(name)
+
+        prev_w, prev_had_edid = pinned if pinned is not None else (0, True)
 
         status_path, edid_len, max_mode_w = self._read_sysfs_connector_health(name)
         if not status_path:
             return
 
-        # Authoritative fallback signals:
-        # 1) Kernel DRM sysfs reports 0-byte EDID or only VGA modes (<=1024px)
-        # 2) KWin wl_output v4 reports active width <=1024px while either pre-sleep width >=1280px
-        #    OR kernel sysfs already has high-res modes (meaning kernel re-read EDID on 'detect'
-        #    while KWin remained stuck on its stale 5-mode 640x480 VGA table — exact 13:43 bug!)
-        sysfs_vga = (edid_len == 0) or (0 < max_mode_w <= 1024)
-        wl_vga = (0 < wl_width <= 1024) and (prev_w >= 1280 or max_mode_w >= 1280 or sysfs_vga)
+        edid_lost = (edid_len == 0) and prev_had_edid
+        kwin_stale = (edid_len >= 128) and (0 < kwin_max_w < max_mode_w)
+        res_dropped = (prev_w > 0) and (0 < wl_width < prev_w)
 
-        if sysfs_vga or wl_vga:
-            if sysfs_vga and wl_width > 0:
-                reason = f"wl={wl_width}px, edid={edid_len}B, max_mode={max_mode_w}px"
-            elif sysfs_vga:
-                reason = f"edid={edid_len}B, max_mode={max_mode_w}px"
-            else:
-                reason = f"wl_stuck={wl_width}px vs sysfs_max={max_mode_w}px (prev={prev_w}px)"
-            self._trigger_edid_reprobe(name, status_path, reason)
+        if edid_lost or kwin_stale or res_dropped:
+            reasons = []
+            if edid_lost:
+                reasons.append(f"edid=0B, sysfs_max={max_mode_w}px")
+            if kwin_stale:
+                reasons.append(f"kwin_max={kwin_max_w}px < sysfs_max={max_mode_w}px")
+            if res_dropped:
+                reasons.append(f"active={wl_width}px < pre_sleep={prev_w}px")
+            self._trigger_edid_reprobe(name, status_path, "; ".join(reasons))
             return
 
-        # Only clear _pinned_widths once BOTH kernel sysfs AND KWin wl_output confirm high-res (>=1280px).
-        # Never clear _pinned_widths while wl_output is still unknown (0) or stuck in VGA (<=1024px).
-        if max_mode_w >= 1280 and edid_len >= 128 and wl_width >= 1280:
+        # Only clear _pinned_state once deferred wake verification confirms KWin + sysfs agree
+        # (so stale pre-sleep wl_output widths at t=0 cannot clear pre-sleep baseline prematurely,
+        # while subsequent manual user resolution changes while awake never false-trigger).
+        if allow_clear:
             with self._lock:
-                self._pinned_widths.pop(name, None)
+                self._pinned_state.pop(name, None)
 
     def _check_vga_fallback_for_output(self, oid):
         name = self._oid_to_name.get(oid, "")
@@ -744,6 +756,39 @@ class WaylandIdleDpmsGuard:
         if not name or name.startswith("eDP"):
             return
         self._check_vga_fallback_for_connector(name, wl_width=width)
+
+    @staticmethod
+    def _query_kwin_output_modes() -> dict:
+        """
+        Queries KWin's current output mode table once via clean JSON (`kscreen-doctor -j`).
+        Returns {connector_name: (current_width_px, max_mode_width_px)} for connected enabled external outputs.
+        """
+        result = {}
+        try:
+            ensure_gui_environment()
+            p = subprocess.run(["kscreen-doctor", "-j"], capture_output=True, text=True, timeout=1.5)
+            if p.returncode != 0 or not p.stdout:
+                return result
+            data = json.loads(p.stdout)
+            for out in data.get("outputs", []):
+                cname = out.get("name", "")
+                if not cname or cname.startswith("eDP"):
+                    continue
+                if not (out.get("connected") and out.get("enabled")):
+                    continue
+                cur_id = str(out.get("currentModeId", ""))
+                cur_w = 0
+                max_w = 0
+                for mode in out.get("modes", []):
+                    w = int(mode.get("size", {}).get("width", 0) or 0)
+                    if w > max_w:
+                        max_w = w
+                    if str(mode.get("id", "")) == cur_id:
+                        cur_w = w
+                result[cname] = (cur_w, max_w)
+        except Exception:
+            pass
+        return result
 
     def _on_wake(self, was_asleep: bool):
         self._cancel_reoff_timer()
@@ -764,41 +809,29 @@ class WaylandIdleDpmsGuard:
                     self._check_vga_fallback_for_connector(cname)
 
             # Deferred verification: covers BOTH races after unpinning:
-            #  a) kernel takes ~0.3-1.0s to finish detect/modeset
-            #  b) kernel recovers EDID on 'detect' (sysfs=2560px) while KWin stays stuck on its
-            #     cached 640x480 mode table without sending a new wl_output.mode (13:43 bug!)
-            verify_names = set(released_names) | set(self._pinned_widths.keys()) | checked
+            #  a) kernel takes ~0.3-0.9s to finish detect/modeset
+            #  b) kernel recovers EDID on 'detect' while KWin stays stuck on its cached
+            #     no-EDID fallback mode table without emitting a new wl_output.mode event
+            with self._lock:
+                pinned_names = set(self._pinned_state.keys())
+            verify_names = set(released_names) | pinned_names | checked
             if verify_names and not self.is_reprobing:
                 def _deferred_verify():
                     if self.is_sleeping_or_idle or self.is_reprobing:
                         return
+                    kwin_modes = self._query_kwin_output_modes()
                     for cname in sorted(verify_names):
                         oid_w = next(
                             (self._oid_to_width.get(o, 0) for o, n in list(self._oid_to_name.items()) if n == cname),
                             0,
                         )
-                        self._check_vga_fallback_for_connector(cname, wl_width=oid_w)
-                    # Final safety net: if _oid_to_width wasn't populated (e.g. wl_output recreated
-                    # or stale), confirm directly via kscreen-doctor -o (only once per wake!) whether
-                    # KWin is stuck on <=1024px active mode while sysfs has >=1280px.
-                    if not self.is_reprobing and not self.is_sleeping_or_idle:
-                        try:
-                            ensure_gui_environment()
-                            p = subprocess.run(["kscreen-doctor", "-o"], capture_output=True, text=True, timeout=1.5)
-                            if p.returncode == 0:
-                                cur_out = None
-                                for line in p.stdout.splitlines():
-                                    m_out = re.match(r"^Output:\s+\d+\s+(\S+)", line)
-                                    if m_out:
-                                        cur_out = m_out.group(1)
-                                    elif cur_out in verify_names and "Modes:" in line:
-                                        m_cur = re.search(r"\d+:(\d+)x\d+@[0-9.]+\*", line)
-                                        if m_cur:
-                                            kwin_w = int(m_cur.group(1))
-                                            if 0 < kwin_w <= 1024:
-                                                self._check_vga_fallback_for_connector(cur_out, wl_width=kwin_w)
-                        except Exception:
-                            pass
+                        kwin_cur_w, kwin_max_w = kwin_modes.get(cname, (0, 0))
+                        self._check_vga_fallback_for_connector(
+                            cname,
+                            wl_width=kwin_cur_w or oid_w,
+                            kwin_max_w=kwin_max_w,
+                            allow_clear=True,
+                        )
                     if self._dimmed_saved and not self.is_dim_idle and not self.is_sleeping_or_idle and not self.is_reprobing:
                         threading.Thread(target=self.restore_external_dim, daemon=True).start()
 
@@ -995,22 +1028,23 @@ class WaylandIdleDpmsGuard:
             with self._lock:
                 already_pinned = set(self._pinned_connectors)
             if not already_pinned:
-                widths = {
+                wl_widths = {
                     self._oid_to_name[oid]: w
                     for oid, w in self._oid_to_width.items()
                     if oid in self._oid_to_name and not self._oid_to_name[oid].startswith("eDP") and w > 0
                 }
-                # Fallback to sysfs modes if wl_output v4 name/width wasn't populated yet
+                state = {}
                 for p in sorted(glob.glob("/sys/class/drm/card*-*/status")):
                     if "-eDP-" in p:
                         continue
                     cname = os.path.basename(os.path.dirname(p)).split("-", 1)[-1]
-                    if cname not in widths:
-                        _, _, max_w = self._read_sysfs_connector_health(cname)
-                        if max_w > 0:
-                            widths[cname] = max_w
+                    sp, edid_len, _ = self._read_sysfs_connector_health(cname)
+                    if sp:
+                        # Record true wl_output active width (0 if unknown — never guessed from max_mode)
+                        # and whether the connector actually exposed an EDID before sleep.
+                        state[cname] = (wl_widths.get(cname, 0), edid_len >= 128)
                 with self._lock:
-                    self._pinned_widths = widths
+                    self._pinned_state = state
             for p in sorted(glob.glob("/sys/class/drm/card*-*/status")):
                 if "-eDP-" in p or p in already_pinned:
                     continue

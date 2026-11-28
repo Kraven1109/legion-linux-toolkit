@@ -314,22 +314,39 @@ fix_display() {
         fi
     fi
 
-    # 1b. Check if any external display fell back to VGA safe-mode (<=1024px) after DPMS wake
-    # and force a clean DRM off -> detect EDID reprobe if status sysfs is writable.
+    # 1b. Dynamic EDID & mode-table mismatch check for connected external outputs (no hardcoded pixel thresholds).
+    # Forces a clean DRM off -> detect EDID reprobe ONLY when kernel EDID is missing (0 bytes)
+    # OR KWin's max available mode width is strictly smaller than kernel sysfs progressive max width
+    # (preserving native XGA 1024x768 / SVGA 800x600 projectors with valid EDIDs).
     if command -v jq >/dev/null 2>&1; then
-        local kjson fallback_outs
+        local kjson ext_entries fout kwin_max_w
         kjson=$(get_kscreen_json)
         if [[ -n "$kjson" ]]; then
-            fallback_outs=$(jq -r '
+            ext_entries=$(jq -r '
                 .outputs[]
                 | select(.connected and .enabled and (.name | startswith("eDP") | not))
-                | select(([.modes[].size.width] | max // 0) <= 1024)
-                | .name
+                | "\(.name)\t\([.modes[].size.width] | max // 0)"
             ' <<< "$kjson" 2>/dev/null || true)
-            for fout in $fallback_outs; do
+            while IFS=$'\t' read -r fout kwin_max_w; do
+                [[ -z "$fout" ]] && continue
                 for sp in /sys/class/drm/card*-"${fout}"/status; do
-                    if [[ -w "$sp" ]]; then
-                        echo "  • Detected VGA fallback mode on ${fout} — forcing kernel EDID reprobe..."
+                    [[ -w "$sp" ]] || continue
+                    [[ "$(cat "$sp" 2>/dev/null)" == "connected" ]] || continue
+                    local conn_dir edid_len=0 sysfs_max_w=0 reason=""
+                    conn_dir="$(dirname "$sp")"
+                    if [[ -f "${conn_dir}/edid" ]]; then
+                        edid_len=$(wc -c < "${conn_dir}/edid" 2>/dev/null || echo 0)
+                    fi
+                    if [[ -f "${conn_dir}/modes" ]]; then
+                        sysfs_max_w=$(awk -F'x' '/^[0-9]+x[0-9]+$/ { if ($1+0 > m) m=$1+0 } END { print m+0 }' "${conn_dir}/modes" 2>/dev/null || echo 0)
+                    fi
+                    if (( edid_len == 0 )); then
+                        reason="missing EDID (0B)"
+                    elif (( edid_len >= 128 && kwin_max_w > 0 && kwin_max_w < sysfs_max_w )); then
+                        reason="KWin mode table stale (${kwin_max_w}px < sysfs ${sysfs_max_w}px)"
+                    fi
+                    if [[ -n "$reason" ]]; then
+                        echo "  • Detected EDID/mode fallback on ${fout} (${reason}) — forcing kernel EDID reprobe..."
                         echo "off" > "$sp" 2>/dev/null || true
                         sleep 0.25
                         echo "detect" > "$sp" 2>/dev/null || true
@@ -338,7 +355,7 @@ fix_display() {
                         break
                     fi
                 done
-            done
+            done <<< "$ext_entries"
         fi
     fi
 
