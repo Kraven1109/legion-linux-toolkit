@@ -340,6 +340,150 @@ def temp_color(t: float, comp: str = "cpu") -> str:
         return Ansi.BRIGHT_GREEN
 
 
+class ProcessTelemetry:
+    """
+    Lightweight pure-Python /proc scanner for Top-5 resource/power consumers.
+    - Reads /proc/<pid>/stat via os.scandir() (~1.5-2.5ms per scan) with TTL caching.
+    - Groups multi-process apps (browsers, Electron, compilers) by app name while retaining
+      the PID of the heaviest process so the user can immediately `kill <PID>` or `pkill`.
+    - Merges per-PID VRAM (MiB) passively from NvmlTelemetry's existing query (never wakes dGPU).
+    """
+
+    def __init__(self):
+        self._clk_tck = float(os.sysconf("SC_CLK_TCK")) if hasattr(os, "sysconf") else 100.0
+        self._page_mib = (float(os.sysconf("SC_PAGE_SIZE")) if hasattr(os, "sysconf") else 4096.0) / (1024.0 * 1024.0)
+        self._num_cpus = float(max(1, os.cpu_count() or 1))
+        self._prev_ticks: Dict[int, int] = {}
+        self._prev_time: Optional[float] = None
+        self._last_scan_time: float = 0.0
+        self._cached_raw: List[Dict[str, Any]] = []
+        self._my_pid = os.getpid()
+
+    @staticmethod
+    def _friendly_app_name(comm: str) -> str:
+        """Normalizes noisy thread/helper comm names into clean groupable application names."""
+        c_low = comm.lower()
+        if c_low in ("msedge", "chrome", "chromium", "brave", "vivaldi-bin") or c_low.startswith("msedge"):
+            return "msedge" if "edge" in c_low else comm
+        if c_low in ("isolated web co", "webextensions", "privileged cont", "rdd process", "socket process", "utility process"):
+            return "firefox"
+        if c_low.startswith("firefox"):
+            return "firefox"
+        if c_low.startswith("antigravity"):
+            return "antigravity"
+        if c_low.startswith("language_server"):
+            return "language_server"
+        if c_low.startswith("kwin_wayland"):
+            return "kwin_wayland"
+        return comm
+
+    def sample(self, gpu_procs: Optional[Dict[str, int]] = None, ttl: float = 0.0) -> List[Dict[str, Any]]:
+        """
+        Scans /proc once (respecting TTL cache) and returns grouped process entries:
+        [{name, pid, cpu_pct, ram_mib, vram_mib, procs}].
+        """
+        now = time.monotonic()
+        if ttl > 0.0 and self._cached_raw and (now - self._last_scan_time) < ttl:
+            return self._cached_raw
+
+        vram_by_pid: Dict[int, int] = {}
+        if gpu_procs:
+            for k, v in gpu_procs.items():
+                try:
+                    vram_by_pid[int(k)] = int(v)
+                except Exception:
+                    pass
+
+        dt = (now - self._prev_time) if self._prev_time is not None else 0.0
+        has_prev = self._prev_time is not None and dt >= 0.05
+        new_ticks: Dict[int, int] = {}
+        groups: Dict[str, Dict[str, Any]] = {}
+
+        try:
+            with os.scandir("/proc") as it:
+                for entry in it:
+                    name_s = entry.name
+                    if not name_s[0].isdigit():
+                        continue
+                    try:
+                        pid = int(name_s)
+                    except ValueError:
+                        continue
+                    if pid == self._my_pid:
+                        continue
+                    try:
+                        with open(f"/proc/{pid}/stat", "r") as sf:
+                            raw = sf.read()
+                        lp = raw.find("(")
+                        rp = raw.rfind(")")
+                        if lp == -1 or rp == -1:
+                            continue
+                        comm = raw[lp + 1 : rp]
+                        rest = raw[rp + 2 :].split()
+                        if len(rest) < 22:
+                            continue
+                        # Skip kernel threads (rss == 0 and vsize == 0)
+                        rss_pages = int(rest[21])
+                        vsize = int(rest[20])
+                        if rss_pages == 0 and vsize == 0:
+                            continue
+                        ticks = int(rest[11]) + int(rest[12])  # utime + stime
+                        new_ticks[pid] = ticks
+
+                        cpu_pct = 0.0
+                        if has_prev:
+                            prev_t = self._prev_ticks.get(pid)
+                            if prev_t is not None and ticks >= prev_t:
+                                # Normalize by logical CPU count (Solaris/System-wide scale 0-100%)
+                                # so Top-5 CPU% aligns 1:1 with the COMPUTE & MEMORY card above.
+                                cpu_pct = ((ticks - prev_t) / (self._clk_tck * dt * self._num_cpus)) * 100.0
+                        ram_mib = rss_pages * self._page_mib
+                        vram_mib = vram_by_pid.get(pid, 0)
+
+                        app = self._friendly_app_name(comm)
+                        grp = groups.get(app)
+                        weight = cpu_pct * 10.0 + (vram_mib / 64.0) + (ram_mib / 512.0)
+                        if grp is None:
+                            groups[app] = {
+                                "name": app,
+                                "pid": pid,
+                                "cpu_pct": cpu_pct,
+                                "ram_mib": ram_mib,
+                                "vram_mib": vram_mib,
+                                "procs": 1,
+                                "_top_weight": weight,
+                            }
+                        else:
+                            grp["cpu_pct"] += cpu_pct
+                            grp["ram_mib"] += ram_mib
+                            grp["vram_mib"] += vram_mib
+                            grp["procs"] += 1
+                            if weight > grp["_top_weight"]:
+                                grp["_top_weight"] = weight
+                                grp["pid"] = pid
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+        self._prev_ticks = new_ticks
+        self._prev_time = now
+        self._last_scan_time = now
+
+        result = []
+        for g in groups.values():
+            result.append({
+                "name": g["name"],
+                "pid": g["pid"],
+                "cpu_pct": round(g["cpu_pct"], 1),
+                "ram_mib": round(g["ram_mib"], 1),
+                "vram_mib": int(g["vram_mib"]),
+                "procs": g["procs"],
+            })
+        self._cached_raw = result
+        return result
+
+
 # --- High-Level Telemetry Aggregator ---
 
 class TelemetryCollector:
@@ -353,6 +497,7 @@ class TelemetryCollector:
         self._cpu_model: str = "Intel Processor"
         self._logical_cores: int = 0
         self._freq_nodes: List[str] = sorted(glob.glob("/sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq"))
+        self.procs = ProcessTelemetry()
         self.history: Dict[str, Deque[float]] = {
             "cpu_temp": deque(maxlen=24),
             "gpu_temp": deque(maxlen=24),
@@ -562,7 +707,12 @@ class TelemetryCollector:
 
         return res
 
-    def collect_all(self, sample_interval: float = 0.05, force_display: bool = False) -> Dict[str, Any]:
+    def collect_all(
+        self,
+        sample_interval: float = 0.05,
+        force_display: bool = False,
+        include_procs: bool = False,
+    ) -> Dict[str, Any]:
         """Aggregates full system metrics tree and records rolling history."""
         is_watch = sample_interval == 0.0
         display_ttl = 0.0 if (force_display or not is_watch) else 2.0
@@ -576,6 +726,11 @@ class TelemetryCollector:
         nvme_temps = [d["composite_c"] for d in nvme_drives if d.get("composite_c") is not None] or get_nvme_temps()
         bat_info = get_battery_info(ttl=bat_ttl)
         bat_info["ac_online"] = is_ac_online()
+        top_procs = (
+            self.procs.sample(gpu_procs=gpu_info.get("gpu_procs"), ttl=2.0 if is_watch else 0.0)
+            if include_procs
+            else []
+        )
 
         if cpu_info.get("temperature_c") is not None:
             self.history["cpu_temp"].append(float(cpu_info["temperature_c"]))
@@ -619,6 +774,7 @@ class TelemetryCollector:
             "storage": {"nvme_temps_c": nvme_temps, "drives": nvme_drives},
             "power_battery": bat_info,
             "display": self.get_display_info(ttl=display_ttl),
+            "top_procs": top_procs,
         }
 
     def close(self):
@@ -669,6 +825,8 @@ class DashboardRenderer:
         watch_mode: bool = False,
         status_msg: str = "",
         graph_mode: str = "spark",
+        show_procs: bool = False,
+        proc_sort: str = "cpu",
     ) -> str:
         hist = history or {}
         # Prefer 2x2 side-by-side grid at >= 86 cols (or >= 76 cols when terminal height < 28 rows)
@@ -1251,6 +1409,103 @@ class DashboardRenderer:
         card_title_disp = f"DISPLAYS ({d_mode.upper()} {d_count}X)" if d_count > 1 else "DISPLAY & CALIBRATION"
         card_display = DashboardRenderer._build_card(card_title_disp, disp_rows, card_w)
 
+        # ── Optional Card 5: TOP 5 CONSUMERS (Full-width bottom row) ──────────
+        card_procs: Optional[List[str]] = None
+        if show_procs:
+            raw_procs = data.get("top_procs") or []
+            sort_key_map = {
+                "cpu": lambda x: (x.get("cpu_pct", 0.0), x.get("vram_mib", 0), x.get("ram_mib", 0.0)),
+                "ram": lambda x: (x.get("ram_mib", 0.0), x.get("cpu_pct", 0.0), x.get("vram_mib", 0)),
+                "vram": lambda x: (x.get("vram_mib", 0), x.get("cpu_pct", 0.0), x.get("ram_mib", 0.0)),
+            }
+            sort_fn = sort_key_map.get(proc_sort, sort_key_map["cpu"])
+            top5 = sorted(raw_procs, key=sort_fn, reverse=True)[:5]
+
+            p_inner_w = total_w - 4
+            proc_rows: List[str] = []
+            tot_ram_mib = max(1024.0, float(mem.get("total_gib") or 62.2) * 1024.0)
+            tot_vram_mib = max(1024.0, float(v_tot_mib or 24576.0))
+            # Show inline proportional bar between app name and PID when width allows
+            show_bar = p_inner_w >= 86
+            bar_w = 12 if p_inner_w >= 106 else (8 if p_inner_w >= 92 else 6)
+
+            for idx in range(5):
+                if idx < len(top5):
+                    pr = top5[idx]
+                    p_name = pr.get("name", "unknown")
+                    p_pid = pr.get("pid", 0)
+                    p_cpu = float(pr.get("cpu_pct", 0.0))
+                    p_ram_mib = float(pr.get("ram_mib", 0.0))
+                    p_vram_mib = int(pr.get("vram_mib", 0))
+                    p_cnt = int(pr.get("procs", 1))
+
+                    # System-wide 0-100% CPU scale (matches COMPUTE & MEMORY card)
+                    cpu_col = Ansi.BRIGHT_RED if p_cpu >= 25.0 else (Ansi.BRIGHT_YELLOW if p_cpu >= 10.0 else (Ansi.BRIGHT_CYAN if p_cpu >= 2.0 else Ansi.BRIGHT_GREEN))
+                    ram_col = Ansi.BRIGHT_RED if p_ram_mib >= 8192 else (Ansi.BRIGHT_YELLOW if p_ram_mib >= 3072 else Ansi.WHITE)
+                    vram_col = Ansi.BRIGHT_RED if p_vram_mib >= 8192 else (Ansi.BRIGHT_YELLOW if p_vram_mib >= 2048 else Ansi.BRIGHT_MAGENTA)
+
+                    cpu_s = f"{p_cpu:5.1f}%"
+                    ram_s = f"{p_ram_mib / 1024.0:5.1f} GiB" if p_ram_mib >= 1024 else f"{p_ram_mib:5.0f} MiB"
+                    if gpu_asleep or gpu_idling:
+                        vram_cell = c(f"{'Sleep':>9}", Ansi.DIM)
+                    elif p_vram_mib > 0:
+                        v_s = f"{p_vram_mib / 1024.0:5.1f} GiB" if p_vram_mib >= 1024 else f"{p_vram_mib:5d} MiB"
+                        vram_cell = c(f"{v_s:>9}", Ansi.BOLD, vram_col)
+                    else:
+                        vram_cell = c(f"{'—':>9}", Ansi.DIM)
+
+                    rank_cell = c(f"{idx + 1}.", Ansi.DIM)
+                    pid_cell = c(f"{p_pid:>7d}", Ansi.BRIGHT_CYAN)
+                    cpu_cell = c(cpu_s, Ansi.BOLD, cpu_col)
+                    ram_cell = c(f"{ram_s:>9}", ram_col)
+                    cnt_tag = c(f" ({p_cnt}p)", Ansi.DIM) if p_cnt > 1 else ""
+
+                    # Build visual bar for the actively sorted resource (placed right after app name, before PID)
+                    if show_bar:
+                        if proc_sort == "ram":
+                            b_pct = (p_ram_mib / tot_ram_mib) * 100.0
+                            b_vis = make_bar(b_pct, width=bar_w, color_override=ram_col if ram_col != Ansi.WHITE else Ansi.BRIGHT_CYAN)
+                        elif proc_sort == "vram":
+                            if gpu_asleep or gpu_idling:
+                                b_vis = c("·" * bar_w, Ansi.DIM)
+                            else:
+                                b_pct = (p_vram_mib / tot_vram_mib) * 100.0
+                                b_vis = make_bar(b_pct, width=bar_w, color_override=vram_col)
+                        else:
+                            b_vis = make_bar(p_cpu, width=bar_w, color_override=cpu_col)
+                    else:
+                        b_vis = ""
+
+                    if p_inner_w >= 86:
+                        sep = c(" │ ", Ansi.DIM)
+                        meta_tail = f"{b_vis}  {c('PID', Ansi.DIM)} {pid_cell}{sep}{c('CPU', Ansi.DIM)} {cpu_cell}{sep}{c('RAM', Ansi.DIM)} {ram_cell}{sep}{c('VRAM', Ansi.DIM)} {vram_cell}"
+                        name_w = max(12, p_inner_w - 3 - visible_width(meta_tail) - 2 - visible_width(cnt_tag))
+                        name_cell = fit_cell(c(p_name, Ansi.BOLD, Ansi.WHITE), name_w)
+                        proc_rows.append(f"{rank_cell} {name_cell}{cnt_tag}  {meta_tail}")
+                    elif p_inner_w >= 66:
+                        sep = c(" · ", Ansi.DIM)
+                        meta_tail = f"{c('PID', Ansi.DIM)} {pid_cell}{sep}{c('CPU', Ansi.DIM)} {cpu_cell}{sep}{c('RAM', Ansi.DIM)} {ram_cell}"
+                        if p_vram_mib > 0:
+                            meta_tail += f"{sep}{c('V', Ansi.DIM)} {vram_cell}"
+                        name_w = max(10, p_inner_w - 3 - visible_width(meta_tail) - 1)
+                        name_cell = fit_cell(c(p_name, Ansi.BOLD, Ansi.WHITE), name_w)
+                        proc_rows.append(f"{rank_cell} {name_cell} {meta_tail}")
+                    else:
+                        meta_tail = f"{pid_cell} {cpu_cell} {ram_cell}"
+                        name_w = max(8, p_inner_w - 3 - visible_width(meta_tail) - 1)
+                        name_cell = fit_cell(c(p_name, Ansi.BOLD, Ansi.WHITE), name_w)
+                        proc_rows.append(f"{rank_cell} {name_cell} {meta_tail}")
+                else:
+                    proc_rows.append(c(f"{idx + 1}. —", Ansi.DIM))
+
+            sort_lbl = proc_sort.upper()
+            rt_hint = (
+                f"{c('Sort:', Ansi.DIM)} {c(sort_lbl, Ansi.BOLD, Ansi.BRIGHT_CYAN)} {c('· [o] Cycle · [e] Hide', Ansi.DIM)}"
+                if watch_mode and p_inner_w >= 68
+                else (f"{c('Sort:', Ansi.DIM)} {c(sort_lbl, Ansi.BOLD, Ansi.BRIGHT_CYAN)}" if p_inner_w >= 46 else "")
+            )
+            card_procs = DashboardRenderer._build_card("TOP 5 CONSUMERS", proc_rows, total_w, right_title=rt_hint)
+
         # ── Assemble Grid ─────────────────────────────────────────────────────
         lines: List[str] = [header_line]
         if two_col:
@@ -1263,12 +1518,14 @@ class DashboardRenderer:
             lines.extend(card_power)
             lines.extend(card_compute)
             lines.extend(card_display)
+        if card_procs:
+            lines.extend(card_procs)
 
         # ── Footer / Interactive Controls Bar ─────────────────────────────────
         if watch_mode:
             has_internal_active = any(d.get("is_internal") for d in displays)
             r_label_wide = "240/60Hz" if has_internal_active else "Hz Cycle"
-            if total_w >= 96:
+            if total_w >= 104:
                 keys = [
                     ("[p]", "Profile"),
                     ("[1-4]", "Mode"),
@@ -1276,11 +1533,13 @@ class DashboardRenderer:
                     ("[r]", r_label_wide),
                     ("[l]", "Color"),
                     ("[g]", "Graph"),
+                    ("[e]", "Top5"),
+                    ("[o]", f"Sort:{proc_sort.upper()}" if show_procs else "Sort"),
                     ("[s]", "Shell"),
                     ("[q]", "Quit"),
                 ]
                 sep_k = "  "
-            else:
+            elif total_w >= 86:
                 keys = [
                     ("[p]", "Prof"),
                     ("[1-4]", "Mode"),
@@ -1288,8 +1547,23 @@ class DashboardRenderer:
                     ("[r]", "Hz"),
                     ("[l]", "ICC"),
                     ("[g]", "Grp"),
+                    ("[e]", "Top5"),
+                    ("[o]", "Sort"),
                     ("[s]", "Sh"),
                     ("[q]", "Quit"),
+                ]
+                sep_k = " "
+            else:
+                keys = [
+                    ("[p]", "P"),
+                    ("[1-4]", "M"),
+                    ("[c]", "80%"),
+                    ("[r]", "Hz"),
+                    ("[l]", "C"),
+                    ("[g]", "G"),
+                    ("[e]", "Top"),
+                    ("[s]", "Sh"),
+                    ("[q]", "Q"),
                 ]
                 sep_k = " "
             ctrl_left = " " + sep_k.join(f"{c(k, Ansi.BOLD, Ansi.BRIGHT_CYAN)} {c(v, Ansi.DIM)}" for k, v in keys)
@@ -1482,7 +1756,12 @@ def _dispatch_tui_action(key: bytes) -> Tuple[str, bool]:
 
 # --- Interactive Live Watch Loop ---
 
-def run_watch_mode(telemetry: TelemetryCollector, interval: float = 1.0, graph_mode: str = "spark"):
+def run_watch_mode(
+    telemetry: TelemetryCollector,
+    interval: float = 1.0,
+    graph_mode: str = "spark",
+    show_procs_pref: Optional[bool] = None,
+):
     """Runs a real-time terminal dashboard with flicker-free updates and clean screen isolation."""
     is_tty = sys.stdin.isatty() and sys.stdout.isatty()
     stdin_fd = sys.stdin.fileno() if is_tty else None
@@ -1497,6 +1776,10 @@ def run_watch_mode(telemetry: TelemetryCollector, interval: float = 1.0, graph_m
     graph_labels = {"spark": "Sparkline", "braille": "Braille", "gauge": "Gauge"}
     if graph_mode not in graph_modes:
         graph_mode = "spark"
+    proc_sorts = ("cpu", "ram", "vram")
+    proc_sort = "cpu"
+    # None = auto (show Top-5 panel automatically when terminal height >= 24 rows, auto-hide on compact panes)
+    show_procs_override: Optional[bool] = show_procs_pref
 
     pipe_r = None
     pipe_w = None
@@ -1565,7 +1848,20 @@ def run_watch_mode(telemetry: TelemetryCollector, interval: float = 1.0, graph_m
                 sys.stdout.flush()
             else:
                 active_toast = status_msg if time.monotonic() < status_until else ""
-                data = telemetry.collect_all(sample_interval=0.0, force_display=force_display)
+                # Show Top-5 card automatically whenever vertical space fits (>=23 rows in 2x2 mode,
+                # >=37 rows in stacked 1-col mode) regardless of width — it adapts columns cleanly down to 58 cols!
+                two_col_est = term_cols >= 86 or (term_cols >= 76 and term_rows < 28)
+                min_rows_with_top5 = 23 if two_col_est else 37
+                if show_procs_override is None:
+                    show_procs_now = term_rows >= min_rows_with_top5
+                else:
+                    show_procs_now = show_procs_override and (term_rows >= min_rows_with_top5)
+
+                data = telemetry.collect_all(
+                    sample_interval=0.0,
+                    force_display=force_display,
+                    include_procs=show_procs_now,
+                )
                 force_display = False
                 output = DashboardRenderer.render(
                     data,
@@ -1575,6 +1871,8 @@ def run_watch_mode(telemetry: TelemetryCollector, interval: float = 1.0, graph_m
                     watch_mode=True,
                     status_msg=active_toast,
                     graph_mode=graph_mode,
+                    show_procs=show_procs_now,
+                    proc_sort=proc_sort,
                 )
 
                 if is_tty:
@@ -1662,6 +1960,25 @@ def run_watch_mode(telemetry: TelemetryCollector, interval: float = 1.0, graph_m
                             cur_idx = graph_modes.index(graph_mode)
                             graph_mode = graph_modes[(cur_idx + 1) % len(graph_modes)]
                             status_msg = f"Graph: {graph_labels[graph_mode]}"
+                            status_until = time.monotonic() + 2.2
+                            break
+                        elif data_bytes in (b"e", b"E"):
+                            two_col_now = term_cols >= 86 or (term_cols >= 76 and term_rows < 28)
+                            cur_vis = show_procs_override if show_procs_override is not None else (term_rows >= (23 if two_col_now else 37))
+                            show_procs_override = not cur_vis
+                            if show_procs_override:
+                                telemetry.procs._last_scan_time = 0.0
+                                status_msg = f"Top 5: ON ({proc_sort.upper()})"
+                            else:
+                                status_msg = "Top 5: OFF"
+                            status_until = time.monotonic() + 2.2
+                            break
+                        elif data_bytes in (b"o", b"O"):
+                            s_idx = proc_sorts.index(proc_sort)
+                            proc_sort = proc_sorts[(s_idx + 1) % len(proc_sorts)]
+                            if show_procs_override is False:
+                                show_procs_override = True
+                            status_msg = f"Top 5 Sort: {proc_sort.upper()}"
                             status_until = time.monotonic() + 2.2
                             break
                         elif data_bytes in (b"p", b"P", b"1", b"2", b"3", b"4", b"c", b"C", b"r", b"R", b"l", b"L"):
@@ -1758,6 +2075,11 @@ Examples:
         help="Watch-mode graph style: spark (block sparkline), braille (high-density wave), or gauge (bar)",
     )
     parser.add_argument(
+        "-e", "--top",
+        action="store_true",
+        help="Include Top-5 resource consumers panel in snapshot/JSON or force-enable in watch mode",
+    )
+    parser.add_argument(
         "--no-color",
         action="store_true",
         help="Disable ANSI color output",
@@ -1772,18 +2094,37 @@ Examples:
     telemetry = TelemetryCollector()
     try:
         if args.json:
-            data = telemetry.collect_all(sample_interval=0.05)
+            data = telemetry.collect_all(sample_interval=0.05, include_procs=args.top)
             print(json.dumps(data, indent=2))
         elif args.short:
             data = telemetry.collect_all(sample_interval=0.05)
             print(ShortRenderer.render(data))
         elif args.watch is not None:
             interval = max(0.2, float(args.watch))
-            run_watch_mode(telemetry, interval=interval, graph_mode=args.graph)
+            run_watch_mode(
+                telemetry,
+                interval=interval,
+                graph_mode=args.graph,
+                show_procs_pref=True if args.top else None,
+            )
         else:
-            data = telemetry.collect_all(sample_interval=0.05)
             ts = shutil.get_terminal_size(fallback=(104, 28))
-            print(DashboardRenderer.render(data, width=ts.columns, height=ts.lines, history=telemetry.history, watch_mode=False))
+            two_col_snap = ts.columns >= 86 or (ts.columns >= 76 and ts.lines < 28)
+            show_top = args.top or (ts.lines >= (23 if two_col_snap else 37))
+            if show_top:
+                # Prime /proc ticks before the 50ms CPU sample window so snapshot shows real CPU%
+                telemetry.procs.sample(ttl=0.0)
+            data = telemetry.collect_all(sample_interval=0.05, include_procs=show_top)
+            print(
+                DashboardRenderer.render(
+                    data,
+                    width=ts.columns,
+                    height=ts.lines,
+                    history=telemetry.history,
+                    watch_mode=False,
+                    show_procs=show_top,
+                )
+            )
     finally:
         telemetry.close()
 

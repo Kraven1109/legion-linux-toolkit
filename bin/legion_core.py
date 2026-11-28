@@ -1861,6 +1861,7 @@ def _nvml_worker_main(cmd_r: int, res_w: int) -> None:
                 "clock_graphics_mhz": None,
                 "clock_memory_mhz": None,
                 "has_active_app": False,
+                "gpu_procs": {},
             }
 
             if nvml_ok and dev:
@@ -1896,28 +1897,33 @@ def _nvml_worker_main(cmd_r: int, res_w: int) -> None:
                     if nvml.nvmlDeviceGetClockInfo(dev, 2, ctypes.byref(clk_mem)) == 0:
                         res["clock_memory_mhz"] = int(clk_mem.value)
 
-                    # Detect non-compositor apps using dGPU
+                    # Collect per-PID VRAM usage (MiB) and detect non-compositor apps using dGPU
+                    gpu_procs: Dict[str, int] = {}
                     for fn in proc_fns:
                         try:
-                            cnt = ctypes.c_uint(32)
-                            arr = (_NvmlProcInfo * 32)()
+                            cnt = ctypes.c_uint(64)
+                            arr = (_NvmlProcInfo * 64)()
                             if fn(dev, ctypes.byref(cnt), arr) == 0:
-                                for idx in range(min(cnt.value, 32)):
-                                    p_id = arr[idx].pid
-                                    try:
-                                        with open(f"/proc/{p_id}/comm", "r") as pf:
-                                            p_comm = pf.read().strip()
-                                        if p_comm not in _NVML_IGNORE_COMMS:
+                                for idx in range(min(cnt.value, 64)):
+                                    p_id = int(arr[idx].pid)
+                                    raw_mem = int(arr[idx].usedGpuMemory)
+                                    # NVML returns 0xFFFFFFFFFFFFFFFF (NVML_VALUE_NOT_AVAILABLE) when unavailable
+                                    mib = int(raw_mem // (1024 * 1024)) if raw_mem < (1 << 50) else 0
+                                    pid_key = str(p_id)
+                                    if mib > gpu_procs.get(pid_key, 0):
+                                        gpu_procs[pid_key] = mib
+                                    if not res["has_active_app"]:
+                                        try:
+                                            with open(f"/proc/{p_id}/comm", "r") as pf:
+                                                p_comm = pf.read().strip()
+                                            if p_comm not in _NVML_IGNORE_COMMS:
+                                                res["has_active_app"] = True
+                                        except Exception:
+                                            # Unreadable /proc/<pid>/comm (e.g. another UID like ollama) -> active app
                                             res["has_active_app"] = True
-                                            break
-                                    except Exception:
-                                        # Unreadable /proc/<pid>/comm (e.g. another UID like ollama) -> active app
-                                        res["has_active_app"] = True
-                                        break
                         except Exception:
                             pass
-                        if res["has_active_app"]:
-                            break
+                    res["gpu_procs"] = gpu_procs
                 except Exception:
                     pass
 
@@ -2135,6 +2141,7 @@ class NvmlTelemetry:
             "utilization_mem": 0,
             "clock_graphics_mhz": 0,
             "clock_memory_mhz": 0,
+            "gpu_procs": {},
             "state": state,
         }
 
