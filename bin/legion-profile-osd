@@ -596,9 +596,11 @@ class WaylandIdleDpmsGuard:
         self._pre_sleep_edp_names = []        # connected internal eDP names captured pre-sleep
         self._topology_guard_until = 0.0      # grace window for late external reconnect after S3/reprobe
         self._last_reoff_ts = 0.0
+        self._last_dim_reset_ts = 0.0
         self._reoff_timer = None
         self._wake_verify_timer = None
         self._topology_restore_timer = None
+        self._s3_dpms_wake_timer = None
         self._lock = threading.Lock()
         self._restore_lock = threading.Lock()
 
@@ -710,6 +712,60 @@ class WaylandIdleDpmsGuard:
             except Exception:
                 pass
             self._topology_restore_timer = None
+
+    def _cancel_s3_dpms_wake_timer(self):
+        if self._s3_dpms_wake_timer:
+            try:
+                self._s3_dpms_wake_timer.cancel()
+            except Exception:
+                pass
+            self._s3_dpms_wake_timer = None
+
+    @staticmethod
+    def _is_lid_open() -> bool:
+        """Reads /proc/acpi/button/lid/*/state (0 subprocesses). Returns True if open or no lid sensor."""
+        paths = sorted(glob.glob("/proc/acpi/button/lid/*/state"))
+        if not paths:
+            return True
+        for p in paths:
+            try:
+                with open(p, "r") as f:
+                    if "open" in f.read().lower():
+                        return True
+            except Exception:
+                return True
+        return False
+
+    def _ensure_dpms_on_after_s3(self) -> bool:
+        """
+        Recovers displays if KWin remains stuck in DPMS Off after S3 resume (e.g. after ACPI lid
+        firmware quirk or pre-suspend DPMS Off). Never wakes a closed laptop with no external display.
+        """
+        if self._in_s3_sleep or not self._dpms_modes:
+            return False
+        if not all(mode != 0 for mode in self._dpms_modes.values()):
+            return False
+        lid_open = self._is_lid_open()
+        ext_conn = check_external_displays_connected()
+        if not lid_open and not ext_conn:
+            return False
+        ensure_gui_environment()
+        try:
+            res = subprocess.run(
+                ["kscreen-doctor", "--dpms", "on"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2.0,
+            )
+            if res.returncode == 0:
+                print(
+                    f"[DISPLAY/S3] KWin remained in DPMS Off after S3 resume (lid_open={lid_open}, ext={ext_conn}) ➔ asserted DPMS On",
+                    flush=True,
+                )
+                return True
+        except Exception as e:
+            print(f"[DISPLAY/S3] Failed asserting DPMS On after S3 resume: {e}", flush=True)
+        return False
 
     def _detect_external_only_topology(self):
         """
@@ -854,16 +910,31 @@ class WaylandIdleDpmsGuard:
 
             if preserve_ext_only:
                 # KWin may auto-enable eDP-* during the 0.6s 'off' gap; once the external display
-                # comes back with a healthy EDID, restore External-Only topology cleanly.
+                # comes back with a healthy EDID, restore External-Only topology and clear any stuck dimming.
                 def _post_reprobe_restore():
                     with self._lock:
                         self._reprobing_connectors.discard(name)
                     self._maybe_restore_external_only_topology(allow_clear=True)
+                    _, stuck_dimmed = self._query_kwin_output_health()
+                    if stuck_dimmed:
+                        self._clear_stuck_kwin_dimming_if_needed(stuck_dimmed)
                     if self._dimmed_saved and not self.is_dim_idle and not self.is_sleeping_or_idle and not self.is_reprobing:
                         threading.Thread(target=self.restore_external_dim, daemon=True).start()
 
                 self._cancel_topology_restore_timer()
                 self._topology_restore_timer = threading.Timer(1.5, _post_reprobe_restore)
+                self._topology_restore_timer.daemon = True
+                self._topology_restore_timer.start()
+            else:
+                def _post_reprobe_dim_check():
+                    with self._lock:
+                        self._reprobing_connectors.discard(name)
+                    _, stuck_dimmed = self._query_kwin_output_health()
+                    if stuck_dimmed:
+                        self._clear_stuck_kwin_dimming_if_needed(stuck_dimmed)
+
+                self._cancel_topology_restore_timer()
+                self._topology_restore_timer = threading.Timer(1.5, _post_reprobe_dim_check)
                 self._topology_restore_timer.daemon = True
                 self._topology_restore_timer.start()
 
@@ -929,45 +1000,98 @@ class WaylandIdleDpmsGuard:
                 self._pinned_state.pop(name, None)
 
     @staticmethod
-    def _query_kwin_no_edid_connectors() -> set:
+    def _query_kwin_output_health():
         """
-        Detects connected external outputs whose active KWin UUID in ~/.config/kwinoutputconfig.json
-        lacks both edidHash and edidIdentifier (phantom no-EDID output created during a transient wake,
-        which prevents PowerDevil from matching libddcutil DDC/CI brightness).
+        Single `kscreen-doctor -o` inspection returning (no_edid_conns, stuck_dimmed_conns):
+          - no_edid_conns: set of external connectors whose active KWin UUID in ~/.config/kwinoutputconfig.json
+            lacks both edidHash and edidIdentifier (phantom no-EDID output breaking DDC/CI matching).
+          - stuck_dimmed_conns: {output_name: dimming_pct} for enabled outputs whose KWin dimming factor
+            is stuck below 100% (e.g. 'dimming to 30%') after wake / reprobe.
         """
         no_edid = set()
+        stuck_dimmed = {}
         try:
-            cfg_path = os.path.expanduser("~/.config/kwinoutputconfig.json")
-            if not os.path.isfile(cfg_path):
-                return no_edid
             ensure_gui_environment()
             p = subprocess.run(["kscreen-doctor", "-o"], capture_output=True, text=True, timeout=1.5)
             if p.returncode != 0 or not p.stdout:
-                return no_edid
+                return no_edid, stuck_dimmed
             active_uuids = {}
+            cur_out = ""
+            cur_enabled = False
             for raw_line in p.stdout.splitlines():
                 line = re.sub(r"\x1b\[[0-9;]*m", "", raw_line).strip()
                 m = re.match(r"^Output:\s+\d+\s+(\S+)\s+([0-9a-fA-F-]{8,})$", line)
-                if m and not m.group(1).startswith("eDP"):
-                    active_uuids[m.group(1)] = m.group(2)
-            if not active_uuids:
-                return no_edid
-            with open(cfg_path, "r") as f:
-                cfg = json.load(f)
-            uuid_meta = {}
-            for blk in cfg:
-                if blk.get("name") == "outputs":
-                    for item in blk.get("data", []):
-                        uid = item.get("uuid")
-                        if uid:
-                            uuid_meta[uid] = item
-            for cname, uid in active_uuids.items():
-                meta = uuid_meta.get(uid)
-                if meta is not None and not meta.get("edidHash") and not meta.get("edidIdentifier"):
-                    no_edid.add(cname)
+                if m:
+                    cur_out = m.group(1)
+                    cur_enabled = False
+                    if not cur_out.startswith("eDP"):
+                        active_uuids[cur_out] = m.group(2)
+                    continue
+                if cur_out:
+                    if line == "enabled":
+                        cur_enabled = True
+                    elif line == "disabled":
+                        cur_enabled = False
+                    elif cur_enabled:
+                        dm = re.search(r"Brightness control:.*dimming to (\d+)%", line)
+                        if dm:
+                            pct = int(dm.group(1))
+                            if 0 < pct < 100:
+                                stuck_dimmed[cur_out] = pct
+            cfg_path = os.path.expanduser("~/.config/kwinoutputconfig.json")
+            if active_uuids and os.path.isfile(cfg_path):
+                with open(cfg_path, "r") as f:
+                    cfg = json.load(f)
+                uuid_meta = {}
+                for blk in cfg:
+                    if blk.get("name") == "outputs":
+                        for item in blk.get("data", []):
+                            uid = item.get("uuid")
+                            if uid:
+                                uuid_meta[uid] = item
+                for cname, uid in active_uuids.items():
+                    meta = uuid_meta.get(uid)
+                    if meta is not None and not meta.get("edidHash") and not meta.get("edidIdentifier"):
+                        no_edid.add(cname)
         except Exception:
             pass
-        return no_edid
+        return no_edid, stuck_dimmed
+
+    @classmethod
+    def _query_kwin_no_edid_connectors(cls) -> set:
+        """Backward-compatible wrapper returning connected external outputs bound to phantom no-EDID UUIDs."""
+        return cls._query_kwin_output_health()[0]
+
+    def _clear_stuck_kwin_dimming_if_needed(self, stuck_dimmed: dict) -> bool:
+        """
+        Clears KWin's stuck post-wake idle dimming factor (e.g. 'dimming to 30%') by restarting
+        plasma-powerdevil.service once when the user is awake and not idle-dimmed.
+        """
+        if not stuck_dimmed or self.is_dim_idle or self.is_sleeping_or_idle or self._in_s3_sleep or self.is_reprobing:
+            return False
+        now = time.monotonic()
+        with self._lock:
+            if now - self._last_dim_reset_ts < 15.0:
+                return False
+            self._last_dim_reset_ts = now
+        detail = ", ".join(f"{k}={v}%" for k, v in sorted(stuck_dimmed.items()))
+        ensure_gui_environment()
+        try:
+            res = subprocess.run(
+                ["systemctl", "--user", "restart", "plasma-powerdevil.service"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5.0,
+            )
+            if res.returncode == 0:
+                print(
+                    f"[DISPLAY/IDLE] Detected stuck KWin dimming after wake ({detail}) ➔ restarted plasma-powerdevil",
+                    flush=True,
+                )
+                return True
+        except Exception as e:
+            print(f"[DISPLAY/IDLE] Failed clearing stuck KWin dimming ({detail}): {e}", flush=True)
+        return False
 
     def _check_vga_fallback_for_output(self, oid):
         name = self._oid_to_name.get(oid, "")
@@ -1132,6 +1256,7 @@ class WaylandIdleDpmsGuard:
             self._cancel_reoff_timer()
             self._cancel_wake_verify_timer()
             self._cancel_topology_restore_timer()
+            self._cancel_s3_dpms_wake_timer()
             self._capture_pre_sleep_state(force=False)
             released = self._set_external_drm_status_pin(False, reason="S3 suspend")
             ext_only = self._pre_sleep_external_only
@@ -1150,6 +1275,10 @@ class WaylandIdleDpmsGuard:
                 if self._pre_sleep_external_only is True:
                     self._topology_guard_until = time.monotonic() + 10.0
             print("[DISPLAY/S3] PrepareForSleep(false) ➔ resuming display & topology verification", flush=True)
+            self._cancel_s3_dpms_wake_timer()
+            self._s3_dpms_wake_timer = threading.Timer(0.8, self._ensure_dpms_on_after_s3)
+            self._s3_dpms_wake_timer.daemon = True
+            self._s3_dpms_wake_timer.start()
             self._on_wake(was_asleep=True, s3_resume=True)
 
     def _on_wake(self, was_asleep: bool, s3_resume: bool = False):
@@ -1185,7 +1314,7 @@ class WaylandIdleDpmsGuard:
                     if self.is_sleeping_or_idle or self._in_s3_sleep or self.is_reprobing:
                         return
                     kwin_modes, enabled_edps = self._query_kwin_outputs_snapshot()
-                    no_edid_conns = self._query_kwin_no_edid_connectors()
+                    no_edid_conns, stuck_dimmed = self._query_kwin_output_health()
                     for cname in sorted(verify_names | set(kwin_modes.keys())):
                         oid_w = next(
                             (self._oid_to_width.get(o, 0) for o, n in list(self._oid_to_name.items()) if n == cname),
@@ -1205,6 +1334,8 @@ class WaylandIdleDpmsGuard:
                             enabled_edps=enabled_edps,
                             allow_clear=True,
                         )
+                        if stuck_dimmed:
+                            self._clear_stuck_kwin_dimming_if_needed(stuck_dimmed)
                     if self._dimmed_saved and not self.is_dim_idle and not self.is_sleeping_or_idle and not self.is_reprobing:
                         threading.Thread(target=self.restore_external_dim, daemon=True).start()
 
@@ -1220,19 +1351,22 @@ class WaylandIdleDpmsGuard:
             return
         all_off = all(mode != 0 for mode in self._dpms_modes.values())
         if all_off and not self.dpms_all_off:
+            if self._in_s3_sleep or self.in_s3_resume_window:
+                print("[DISPLAY/DPMS] Transient KWin DPMS Off during S3 suspend/resume ➔ skipping DRM pin", flush=True)
+                return
             self._cancel_wake_verify_timer()
             self.dpms_all_off = True
-            if self._in_s3_sleep:
-                print("[DISPLAY/DPMS] KWin DPMS Off during S3 suspend ➔ skipping DRM pin", flush=True)
-            else:
-                print("[DISPLAY/DPMS] KWin DPMS Off detected ➔ pinning external DRM connectors", flush=True)
-                self._set_external_drm_status_pin(True)
+            print("[DISPLAY/DPMS] KWin DPMS Off detected ➔ pinning external DRM connectors", flush=True)
+            self._set_external_drm_status_pin(True)
         elif not all_off and self.dpms_all_off:
+            self._cancel_s3_dpms_wake_timer()
             self.dpms_all_off = False
             self.is_off_idle = False
             self.is_dim_idle = False
             print("[DISPLAY/DPMS] KWin DPMS On detected ➔ releasing connector pin", flush=True)
             self._on_wake(was_asleep=True)
+        elif not all_off:
+            self._cancel_s3_dpms_wake_timer()
 
     def connect(self):
         self.close()
@@ -1335,6 +1469,7 @@ class WaylandIdleDpmsGuard:
         self._cancel_reoff_timer()
         self._cancel_wake_verify_timer()
         self._cancel_topology_restore_timer()
+        self._cancel_s3_dpms_wake_timer()
         self._set_external_drm_status_pin(False)
         if self.sock:
             try:
