@@ -314,13 +314,23 @@ fix_display() {
         fi
     fi
 
-    # 1b. Dynamic EDID & mode-table mismatch check for connected external outputs (no hardcoded pixel thresholds).
-    # Forces a clean DRM off -> detect EDID reprobe ONLY when kernel EDID is missing (0 bytes)
-    # OR KWin's max available mode width is strictly smaller than kernel sysfs progressive max width
-    # (preserving native XGA 1024x768 / SVGA 800x600 projectors with valid EDIDs).
+    # 1b. Dynamic EDID, mode-table, and KWin phantom no-EDID UUID check for connected external outputs.
+    # Forces a clean DRM off -> 0.6s -> detect EDID reprobe ONLY when:
+    #   - kernel EDID is missing (0 bytes), OR
+    #   - KWin's max available mode width is strictly smaller than kernel sysfs progressive max width, OR
+    #   - kernel exposes a valid EDID (>= 128B) while KWin bound the output to a phantom no-EDID UUID
+    #     in ~/.config/kwinoutputconfig.json (which breaks libddcutil DDC/CI brightness matching).
+    # Preserves native XGA 1024x768 / SVGA 800x600 projectors and External-Display-Only topology.
+    local reprobed_any=0
+    local was_ext_only=0
+    if ! is_internal_enabled "$edp"; then
+        was_ext_only=1
+    fi
     if command -v jq >/dev/null 2>&1; then
-        local kjson ext_entries fout kwin_max_w
+        local kjson ext_entries fout kwin_max_w kwin_o_clean kwin_cfg
         kjson=$(get_kscreen_json)
+        kwin_o_clean=$(kscreen-doctor -o 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' || true)
+        kwin_cfg="$HOME/.config/kwinoutputconfig.json"
         if [[ -n "$kjson" ]]; then
             ext_entries=$(jq -r '
                 .outputs[]
@@ -329,6 +339,18 @@ fix_display() {
             ' <<< "$kjson" 2>/dev/null || true)
             while IFS=$'\t' read -r fout kwin_max_w; do
                 [[ -z "$fout" ]] && continue
+                local active_uuid="" kwin_missing_edid=0
+                active_uuid=$(awk -v o="$fout" '$1=="Output:" && $3==o {print $4; exit}' <<< "$kwin_o_clean" 2>/dev/null || true)
+                if [[ -n "$active_uuid" && -f "$kwin_cfg" ]]; then
+                    local has_edid_meta
+                    has_edid_meta=$(jq -r --arg u "$active_uuid" '
+                        [.[] | select(.name=="outputs") | .data[] | select(.uuid==$u)] | first
+                        | if . == null then "unknown"
+                          elif ((.edidHash // "") == "" and (.edidIdentifier // "") == "") then "missing"
+                          else "present" end
+                    ' "$kwin_cfg" 2>/dev/null || echo "unknown")
+                    [[ "$has_edid_meta" == "missing" ]] && kwin_missing_edid=1
+                fi
                 for sp in /sys/class/drm/card*-"${fout}"/status; do
                     [[ -w "$sp" ]] || continue
                     [[ "$(cat "$sp" 2>/dev/null)" == "connected" ]] || continue
@@ -344,18 +366,33 @@ fix_display() {
                         reason="missing EDID (0B)"
                     elif (( edid_len >= 128 && kwin_max_w > 0 && kwin_max_w < sysfs_max_w )); then
                         reason="KWin mode table stale (${kwin_max_w}px < sysfs ${sysfs_max_w}px)"
+                    elif (( edid_len >= 128 && kwin_missing_edid == 1 )); then
+                        reason="KWin bound to no-EDID UUID (${active_uuid}) despite ${edid_len}B sysfs EDID"
                     fi
                     if [[ -n "$reason" ]]; then
                         echo "  • Detected EDID/mode fallback on ${fout} (${reason}) — forcing kernel EDID reprobe..."
                         echo "off" > "$sp" 2>/dev/null || true
-                        sleep 0.25
+                        sleep 0.6
                         echo "detect" > "$sp" 2>/dev/null || true
-                        sleep 1.2
+                        sleep 1.5
                         KSCREEN_JSON_CACHE=""
+                        reprobed_any=1
                         break
                     fi
                 done
             done <<< "$ext_entries"
+        fi
+    fi
+
+    # Restore External-Display-Only topology if KWin auto-enabled internal eDP during the reprobe gap
+    if (( reprobed_any == 1 && was_ext_only == 1 )) && command -v jq >/dev/null 2>&1; then
+        local post_json ext_alive_cnt
+        post_json=$(get_kscreen_json)
+        ext_alive_cnt=$(jq -r '[.outputs[] | select(.connected and .enabled and (.name | startswith("eDP") | not))] | length' <<< "$post_json" 2>/dev/null || echo "0")
+        if (( ext_alive_cnt > 0 )) && is_internal_enabled "$edp"; then
+            echo "  • Restoring External-Only topology (disabling ${edp})..."
+            kscreen-doctor "output.${edp}.disable" >/dev/null 2>&1 || true
+            KSCREEN_JSON_CACHE=""
         fi
     fi
 
@@ -412,6 +449,22 @@ fix_display() {
         done
     fi
 
+    local ext_bright_summary=""
+    if command -v qdbus6 >/dev/null 2>&1; then
+        local dname dlabel dis_int dbr dmax dpct
+        for dname in $(qdbus6 org.kde.ScreenBrightness /org/kde/ScreenBrightness org.freedesktop.DBus.Properties.Get org.kde.ScreenBrightness DisplaysDBusNames 2>/dev/null || true); do
+            dis_int=$(qdbus6 org.kde.ScreenBrightness "/org/kde/ScreenBrightness/${dname}" org.freedesktop.DBus.Properties.Get org.kde.ScreenBrightness.Display IsInternal 2>/dev/null || true)
+            [[ "$dis_int" == "false" ]] || continue
+            dlabel=$(qdbus6 org.kde.ScreenBrightness "/org/kde/ScreenBrightness/${dname}" org.freedesktop.DBus.Properties.Get org.kde.ScreenBrightness.Display Label 2>/dev/null || true)
+            dbr=$(qdbus6 org.kde.ScreenBrightness "/org/kde/ScreenBrightness/${dname}" org.freedesktop.DBus.Properties.Get org.kde.ScreenBrightness.Display Brightness 2>/dev/null || true)
+            dmax=$(qdbus6 org.kde.ScreenBrightness "/org/kde/ScreenBrightness/${dname}" org.freedesktop.DBus.Properties.Get org.kde.ScreenBrightness.Display MaxBrightness 2>/dev/null || true)
+            if [[ "$dbr" =~ ^[0-9]+$ && "$dmax" =~ ^[0-9]+$ && "$dmax" -gt 0 ]]; then
+                dpct=$(( dbr * 100 / dmax ))
+                ext_bright_summary+="${dlabel} (${dpct}%)  "
+            fi
+        done
+    fi
+
     local target_out
     target_out=$(get_target_output)
     local rate
@@ -421,6 +474,9 @@ fix_display() {
     if [[ -n "$bl_cur" && -n "$bl_max" && "$bl_max" -gt 0 ]]; then
         local pct=$(( bl_cur * 100 / bl_max ))
         echo -e "  Hardware Backlight: \033[1;32m${bl_cur}/${bl_max} (${pct}%)\033[0m [${bl_name}]"
+    fi
+    if [[ -n "$ext_bright_summary" ]]; then
+        echo -e "  External DDC/CI:    \033[1;32m${ext_bright_summary}\033[0m"
     fi
     if [[ -n "$dbus_val" ]]; then
         echo -e "  PowerDevil DBus:    \033[1;32m${dbus_val}/${dbus_max:-10000} (Active & Synced)\033[0m"
